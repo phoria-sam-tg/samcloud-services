@@ -17,13 +17,15 @@ Endpoints:
 import os
 import json
 import time
+import hashlib
 import logging
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional
 
 from .manager import ModelManager, Backend
@@ -39,6 +41,96 @@ log = logging.getLogger("model-service")
 
 SC_TOKEN = os.environ.get("SC_TOKEN", "sc_agent_448090436817362f5250c0d0f83bef53")
 SERVICE_PORT = int(os.environ.get("SERVICE_PORT", "8800"))
+SC_VERIFY_URL = os.environ.get(
+    "SC_VERIFY_URL", "https://stg.samtg.xyz:9443/api/v1/auth/verify"
+)
+SC_REQUIRED_SCOPE = os.environ.get("SC_REQUIRED_SCOPE", "device:slice-test")
+AUTH_CACHE_TTL = 300  # 5 minutes
+AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "true").lower() == "true"
+
+# Paths that don't require auth
+AUTH_EXEMPT_PATHS = {"/health"}
+
+
+class SamcloudAuthMiddleware(BaseHTTPMiddleware):
+    """Verify caller identity via SAMcloud token verification.
+
+    Forwards the caller's Bearer token to SAMcloud GET /auth/verify,
+    caches results for AUTH_CACHE_TTL seconds, and rejects
+    unauthenticated or out-of-scope requests.
+    """
+
+    def __init__(self, app, verify_url: str, required_scope: str):
+        super().__init__(app)
+        self.verify_url = verify_url
+        self.required_scope = required_scope
+        self._cache: dict[str, tuple[float, dict]] = {}  # token_hash -> (expiry, identity)
+
+    def _cache_key(self, token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+    def _get_cached(self, token: str) -> Optional[dict]:
+        key = self._cache_key(token)
+        entry = self._cache.get(key)
+        if entry and entry[0] > time.time():
+            return entry[1]
+        if entry:
+            del self._cache[key]
+        return None
+
+    def _set_cached(self, token: str, identity: dict):
+        key = self._cache_key(token)
+        self._cache[key] = (time.time() + AUTH_CACHE_TTL, identity)
+
+    async def dispatch(self, request: Request, call_next):
+        if not AUTH_ENABLED or request.url.path in AUTH_EXEMPT_PATHS:
+            return await call_next(request)
+
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Missing Authorization: Bearer <token>"},
+            )
+
+        token = auth_header  # Forward full "Bearer xxx" header
+
+        # Check cache
+        cached = self._get_cached(token)
+        if cached:
+            request.state.caller = cached
+            return await call_next(request)
+
+        # Verify with SAMcloud
+        try:
+            url = self.verify_url
+            if self.required_scope:
+                url += f"?scope={self.required_scope}"
+            async with httpx.AsyncClient(verify=False, timeout=10) as client:
+                resp = await client.get(url, headers={"Authorization": token})
+        except Exception as e:
+            log.warning(f"SAMcloud verify failed: {e}")
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "Auth service unavailable"},
+            )
+
+        if resp.status_code == 401:
+            return JSONResponse(status_code=401, content={"detail": "Invalid token"})
+        if resp.status_code == 403:
+            return JSONResponse(status_code=403, content={"detail": "Token valid but out of scope"})
+        if resp.status_code != 200:
+            return JSONResponse(
+                status_code=502,
+                content={"detail": f"Auth service returned {resp.status_code}"},
+            )
+
+        identity = resp.json()
+        self._set_cached(token, identity)
+        request.state.caller = identity
+        log.info(f"Verified caller: {identity.get('username')} ({identity.get('role')})")
+
+        return await call_next(request)
 
 mgr: Optional[ModelManager] = None
 
@@ -74,6 +166,12 @@ app = FastAPI(
     title="Model Service",
     description="Unified model serving with SAMcloud resource leasing",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    SamcloudAuthMiddleware,
+    verify_url=SC_VERIFY_URL,
+    required_scope=SC_REQUIRED_SCOPE,
 )
 
 

@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("model-service")
 
-SC_TOKEN = os.environ.get("SC_TOKEN", "sc_agent_448090436817362f5250c0d0f83bef53")
+SC_TOKEN = os.environ.get("SC_TOKEN", "")
 SERVICE_PORT = int(os.environ.get("SERVICE_PORT", "8800"))
 SC_VERIFY_URL = os.environ.get(
     "SC_VERIFY_URL", "https://stg.samtg.xyz:9443/api/v1/auth/verify"

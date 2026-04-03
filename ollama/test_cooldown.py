@@ -10,6 +10,7 @@ Flow:
   4. Verify it was unloaded and lease released
 """
 
+import os
 import sys
 import time
 import json
@@ -17,7 +18,7 @@ import json
 from samcloud import SamcloudClient
 from ollama_client import OllamaClient
 
-SC_TOKEN = "sc_agent_448090436817362f5250c0d0f83bef53"
+SC_TOKEN = os.environ.get("SC_TOKEN", "")
 RESOURCE_ID = "slice-test/gpu-0"
 SERVICE_ID = "slice-test/ollama-manager"
 TEST_MODEL = "qwen2.5:1.5b"

@@ -28,7 +28,7 @@ from .samcloud import SamcloudClient
 log = logging.getLogger("model-manager")
 
 RESOURCE_ID = "slice-test/gpu-0"
-SERVICE_ID = "slice-test/ollama-manager"  # pending rename to model-service (ticket #65)
+SERVICE_ID = "slice-test/model-service"
 COOLDOWN_SECONDS = 300  # 5 min idle before unload
 LEASE_TTL = 3600  # 1 hour default lease
 LEASE_RENEW_AT = 0.5  # renew when 50% of TTL has elapsed

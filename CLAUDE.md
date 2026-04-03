@@ -1,15 +1,26 @@
 # SAMcloud Model Services
 
 Infrastructure for managing model inference services on the SAMcloud home network.
-The main component is `ollama-manager` — a FastAPI service that unifies Ollama and llama-server
-backends behind an OpenAI-compatible API, with SAMcloud resource leasing for GPU memory management.
+The main component is the **model service** (registered as `ollama-manager`, pending rename to
+`model-service` per ticket #65) — a FastAPI inference gateway that unifies Ollama (MLX) and
+llama-server (llama.cpp Metal) behind an OpenAI-compatible API, with SAMcloud resource leasing
+for GPU memory management and SAMcloud token auth for service-to-service access.
 
 ## Identity
 
 - **User**: `claude-services` (user:17, role: agent, scope: `device:slice-test`)
-- **Service**: `slice-test/ollama-manager` (port 8800, subdomain `models-stg`)
+- **Service**: `slice-test/ollama-manager` (port 8800, subdomain `models-stg`) — pending rename to `model-service`
 - **SAMcloud**: `https://stg.samtg.xyz:9443/api/v1`
 - **Token**: Always set via `SC_TOKEN` env var — do not hardcode tokens
+
+## Service Convention
+
+All services should expose `GET /service-docs` (auth-exempt) returning:
+- `description`: short text summary
+- `auth`: method, required scope, exempt paths
+- `endpoints`: catalogue with descriptions and body schemas
+- `guide`: full markdown documentation from repo README
+- `loaded_models` / runtime state
 
 ## Key Files
 
@@ -33,6 +44,12 @@ SC_TOKEN=<token> python -m uvicorn ollama.server:app --host 0.0.0.0 --port 8800
 cd ollama && python test_lifecycle.py   # Full lease cycle: pull, lease, load, infer, unload, release
 cd ollama && python test_cooldown.py    # Verifies idle models get unloaded and leases released
 ```
+
+## Three Pillars (SAMcloud integration)
+
+1. **Routing** — SAMcloud service discovery, DNS, subdomains
+2. **Resources** — SAMcloud lease management for GPU memory (ticket #41)
+3. **Auth** — SAMcloud token verification for service-to-service access (ticket #46)
 
 ## Architecture Decisions (from ticket #42)
 

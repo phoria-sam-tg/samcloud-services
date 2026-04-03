@@ -49,7 +49,7 @@ AUTH_CACHE_TTL = 300  # 5 minutes
 AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "true").lower() == "true"
 
 # Paths that don't require auth
-AUTH_EXEMPT_PATHS = {"/health"}
+AUTH_EXEMPT_PATHS = {"/health", "/service-docs"}
 
 
 class SamcloudAuthMiddleware(BaseHTTPMiddleware):
@@ -208,6 +208,106 @@ class CompletionRequest(BaseModel):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "model-service", "models": len(mgr.models)}
+
+
+@app.get("/service-docs", response_class=JSONResponse)
+async def service_docs():
+    """Public service documentation for discovery by agents and consumers.
+    Returns structured docs with a full markdown guide based on the repo README."""
+    loaded = {}
+    if mgr:
+        loaded = {
+            name: {
+                "backend": mm.backend.value,
+                "memory_mb": mm.memory_mb,
+            }
+            for name, mm in mgr.models.items()
+        }
+
+    # Read the repo docs for the full guide
+    guide_md = ""
+    docs_path = os.path.join(os.path.dirname(__file__), "README.md")
+    try:
+        with open(docs_path) as f:
+            guide_md = f.read()
+    except FileNotFoundError:
+        guide_md = "(docs not found on disk)"
+
+    return {
+        "name": "model-service",
+        "description": (
+            "Unified inference gateway for slice-test. "
+            "Wraps Ollama (MLX) and llama-server (llama.cpp Metal) behind "
+            "a single OpenAI-compatible API. Manages GPU memory via SAMcloud "
+            "resource leasing — models spin up on demand and unload after 5 min idle. "
+            "Requires SAMcloud token (Bearer) for authenticated access."
+        ),
+        "auth": {
+            "method": "SAMcloud token verification",
+            "header": "Authorization: Bearer <your-sc-token>",
+            "required_scope": SC_REQUIRED_SCOPE,
+            "exempt_paths": list(AUTH_EXEMPT_PATHS),
+        },
+        "endpoints": {
+            "POST /v1/chat/completions": {
+                "description": "OpenAI-compatible chat completion",
+                "auth": True,
+                "body": {"model": "<name>", "messages": [{"role": "user", "content": "..."}], "stream": True},
+                "notes": "Model name uses partial matching (e.g. 'qwen3-32b' matches 'Qwen3-32B-Q6_K')",
+            },
+            "POST /v1/completions": {
+                "description": "OpenAI-compatible text completion",
+                "auth": True,
+                "body": {"model": "<name>", "prompt": "...", "stream": True},
+            },
+            "GET /models": {
+                "description": "List managed and available models",
+                "auth": True,
+            },
+            "GET /status": {
+                "description": "Full status — backends, models, leases, resource utilisation",
+                "auth": True,
+            },
+            "POST /models/load": {
+                "description": "Load a model (pulls if needed, requests GPU lease)",
+                "auth": True,
+                "body": {"model": "<name>", "backend": "auto|ollama|llama-server"},
+            },
+            "POST /models/unload": {
+                "description": "Unload a model (releases GPU lease)",
+                "auth": True,
+                "body": {"model": "<name>", "force": False},
+            },
+            "GET /health": {
+                "description": "Health check",
+                "auth": False,
+            },
+            "GET /service-docs": {
+                "description": "This endpoint — public service documentation",
+                "auth": False,
+            },
+        },
+        "backends": {
+            "ollama": {
+                "version": "0.19.0",
+                "features": ["mlx", "apple-silicon", "flash-attention"],
+                "port": 11434,
+            },
+            "llama-server": {
+                "version": "b8500",
+                "features": ["metal", "flash-attention", "quantized-kv-cache"],
+                "port": 8000,
+            },
+        },
+        "loaded_models": loaded,
+        "model_matching": "Case-insensitive partial match. Use 'qwen3-32b' or 'qwen3.5' as shortnames.",
+        "samcloud": {
+            "service_id": "slice-test/model-service",
+            "resource": "slice-test/gpu-0",
+            "device": "slice-test",
+        },
+        "guide": guide_md,
+    }
 
 
 @app.get("/status")

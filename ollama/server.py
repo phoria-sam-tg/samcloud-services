@@ -398,15 +398,51 @@ async def chat_completions(req: ChatRequest):
         raise HTTPException(status_code=404, detail=f"Model '{req.model}' not loaded")
 
     if mm.backend == Backend.OLLAMA:
-        # Route to Ollama
+        # Route to Ollama native /api/chat with think:false to avoid
+        # the Ollama 0.19 bug where /v1/ ignores think parameter and
+        # returns empty content with all output in reasoning field.
+        # We translate the native response to OpenAI format ourselves.
         if req.stream:
             def stream():
-                for chunk in mgr.ollama.chat(mm.name, req.messages):
-                    yield json.dumps(chunk) + "\n"
-            return StreamingResponse(stream(), media_type="application/x-ndjson")
+                for chunk in mgr.ollama.chat(mm.name, req.messages, think=False):
+                    # Translate Ollama native -> OpenAI SSE format
+                    delta = {}
+                    if "message" in chunk and chunk["message"].get("content"):
+                        delta["content"] = chunk["message"]["content"]
+                    if chunk.get("done"):
+                        yield "data: " + json.dumps({
+                            "choices": [{"delta": {}, "finish_reason": "stop"}]
+                        }) + "\n\n"
+                        yield "data: [DONE]\n\n"
+                    elif delta:
+                        yield "data: " + json.dumps({
+                            "choices": [{"delta": delta, "finish_reason": None}],
+                            "model": mm.name,
+                        }) + "\n\n"
+            return StreamingResponse(stream(), media_type="text/event-stream")
         else:
-            chunks = list(mgr.ollama.chat(mm.name, req.messages))
-            return chunks[-1] if chunks else {}
+            # Non-streaming: collect full response via native API
+            full_content = ""
+            usage = {}
+            for chunk in mgr.ollama.chat(mm.name, req.messages, think=False):
+                if "message" in chunk:
+                    full_content += chunk["message"].get("content", "")
+                if chunk.get("done"):
+                    usage = {
+                        "prompt_tokens": chunk.get("prompt_eval_count", 0),
+                        "completion_tokens": chunk.get("eval_count", 0),
+                        "total_tokens": (chunk.get("prompt_eval_count", 0) +
+                                         chunk.get("eval_count", 0)),
+                    }
+            return {
+                "choices": [{
+                    "message": {"role": "assistant", "content": full_content},
+                    "finish_reason": "stop",
+                    "index": 0,
+                }],
+                "model": mm.name,
+                "usage": usage,
+            }
 
     elif mm.backend == Backend.LLAMA:
         # Forward to llama-server's OpenAI-compatible endpoint

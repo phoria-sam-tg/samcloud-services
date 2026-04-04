@@ -65,8 +65,9 @@ class OllamaClient:
                 if line.strip():
                     yield json.loads(line)
 
-    def load_model(self, model: str, keep_alive: str = "1h") -> dict:
-        """Load a model into memory without generating (warm-up)."""
+    def load_model(self, model: str, keep_alive: str | int = "1h") -> dict:
+        """Load a model into memory without generating (warm-up).
+        keep_alive: duration string ("1h", "30m") or -1 for indefinite."""
         r = self._http.post(
             "/api/generate",
             json={"model": model, "prompt": "", "keep_alive": keep_alive},

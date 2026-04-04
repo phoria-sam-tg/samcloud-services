@@ -32,6 +32,7 @@ SERVICE_ID = "slice-test/model-service"
 COOLDOWN_SECONDS = 300  # 5 min idle before unload
 LEASE_TTL = 3600  # 1 hour default lease
 LEASE_RENEW_AT = 0.5  # renew when 50% of TTL has elapsed
+OLLAMA_KEEP_ALIVE = -1  # indefinite — our lease system manages memory, not Ollama's timer
 
 
 class Backend(str, Enum):
@@ -93,6 +94,12 @@ class ModelManager:
             name = m.get("name", "unknown")
             size_mb = int(m.get("size", 0) / 1024 / 1024)
             if name not in self.models:
+                # Pin the model so Ollama doesn't unload it on its own timer
+                try:
+                    self.ollama.load_model(name, keep_alive=OLLAMA_KEEP_ALIVE)
+                    log.info(f"Pinned Ollama model {name} (keep_alive={OLLAMA_KEEP_ALIVE})")
+                except Exception as e:
+                    log.warning(f"Failed to pin {name}: {e}")
                 mm = ManagedModel(
                     name=name,
                     backend=Backend.OLLAMA,
@@ -213,9 +220,9 @@ class ModelManager:
         # Request lease
         lease_id = self._request_lease(model_name, memory_mb)
 
-        # Load
-        log.info(f"Loading {model_name} into Ollama...")
-        self.ollama.load_model(model_name)
+        # Load with indefinite keep_alive — our lease system manages memory
+        log.info(f"Loading {model_name} into Ollama (keep_alive={OLLAMA_KEEP_ALIVE})...")
+        self.ollama.load_model(model_name, keep_alive=OLLAMA_KEEP_ALIVE)
 
         # Get actual VRAM from Ollama ps
         actual_mb = memory_mb
@@ -320,6 +327,27 @@ class ModelManager:
         if model_name in self.models:
             self.models[model_name].last_used = time.time()
             self.models[model_name].request_count += 1
+
+    def ensure_running(self, model_name: str) -> bool:
+        """Check if an Ollama model is actually running. Reload if dropped."""
+        if model_name not in self.models:
+            return False
+        mm = self.models[model_name]
+        if mm.backend != Backend.OLLAMA:
+            return True  # llama-server managed separately
+        # Check if Ollama still has it loaded
+        running = [m.get("name", "") for m in self.ollama.list_running()]
+        if mm.name in running or any(mm.name in r for r in running):
+            return True
+        # Model was dropped by Ollama — reload it
+        log.warning(f"Model {mm.name} dropped by Ollama — reloading (keep_alive={OLLAMA_KEEP_ALIVE})")
+        try:
+            self.ollama.load_model(mm.name, keep_alive=OLLAMA_KEEP_ALIVE)
+            log.info(f"Reloaded {mm.name}")
+            return True
+        except Exception as e:
+            log.error(f"Failed to reload {mm.name}: {e}")
+            return False
 
     def unload(self, model_name: str, force: bool = False) -> dict:
         """Unload/stop a model and release its lease."""

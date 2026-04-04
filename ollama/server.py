@@ -377,18 +377,24 @@ async def unload_model(req: UnloadRequest):
 
 
 def _resolve_model(model_name: str):
-    """Find which managed model matches the request and touch it."""
+    """Find which managed model matches the request, ensure it's running, and touch it."""
+    matched_name = None
     # Exact match
     if model_name in mgr.models:
-        mgr.touch(model_name)
-        return mgr.models[model_name]
-    # Partial match (e.g. "qwen3-32b" matches "Qwen3-32B-Q6_K")
-    lower = model_name.lower()
-    for name, mm in mgr.models.items():
-        if lower in name.lower():
-            mgr.touch(name)
-            return mm
-    return None
+        matched_name = model_name
+    else:
+        # Partial match (e.g. "qwen3-32b" matches "Qwen3-32B-Q6_K")
+        lower = model_name.lower()
+        for name in mgr.models:
+            if lower in name.lower():
+                matched_name = name
+                break
+    if not matched_name:
+        return None
+    # Ensure the model is actually running (auto-reload if Ollama dropped it)
+    mgr.ensure_running(matched_name)
+    mgr.touch(matched_name)
+    return mgr.models[matched_name]
 
 
 @app.post("/v1/chat/completions")

@@ -417,6 +417,7 @@ async def chat_completions(req: ChatRequest):
 
         if req.stream:
             def stream():
+                saw_tool_calls = False
                 for chunk in mgr.ollama.chat(mm.name, req.messages, **ollama_kwargs):
                     # Translate Ollama native -> OpenAI SSE format
                     delta = {}
@@ -424,9 +425,11 @@ async def chat_completions(req: ChatRequest):
                         delta["content"] = chunk["message"]["content"]
                     if "message" in chunk and chunk["message"].get("tool_calls"):
                         delta["tool_calls"] = chunk["message"]["tool_calls"]
+                        saw_tool_calls = True
                     if chunk.get("done"):
+                        finish = "tool_calls" if saw_tool_calls else "stop"
                         yield "data: " + json.dumps({
-                            "choices": [{"delta": {}, "finish_reason": "stop"}]
+                            "choices": [{"delta": {}, "finish_reason": finish}]
                         }) + "\n\n"
                         yield "data: [DONE]\n\n"
                     elif delta:

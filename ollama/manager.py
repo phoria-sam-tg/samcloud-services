@@ -208,6 +208,17 @@ class ModelManager:
 
         memory_mb = estimate_memory_mb(model_name)
 
+        # Unload other Ollama models first to prevent Ollama from
+        # silently evicting them (Ollama evicts to fit new models,
+        # ignoring keep_alive). We explicitly unload + release leases.
+        ollama_models = [
+            name for name, mm in self.models.items()
+            if mm.backend == Backend.OLLAMA
+        ]
+        for existing in ollama_models:
+            log.info(f"Unloading {existing} to make room for {model_name}")
+            self.unload(existing, force=True)
+
         # Pull if needed
         local = [m["name"] for m in self.ollama.list_models()]
         if model_name not in local and f"{model_name}:latest" not in local:

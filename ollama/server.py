@@ -194,6 +194,8 @@ class ChatRequest(BaseModel):
     stream: bool = True
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
+    tools: Optional[list[dict]] = None
+    tool_choice: Optional[str | dict] = None
 
 class CompletionRequest(BaseModel):
     model: str
@@ -408,13 +410,20 @@ async def chat_completions(req: ChatRequest):
         # the Ollama 0.19 bug where /v1/ ignores think parameter and
         # returns empty content with all output in reasoning field.
         # We translate the native response to OpenAI format ourselves.
+        # Pass tools through for structured tool_call support.
+        ollama_kwargs = {"think": False}
+        if req.tools:
+            ollama_kwargs["tools"] = req.tools
+
         if req.stream:
             def stream():
-                for chunk in mgr.ollama.chat(mm.name, req.messages, think=False):
+                for chunk in mgr.ollama.chat(mm.name, req.messages, **ollama_kwargs):
                     # Translate Ollama native -> OpenAI SSE format
                     delta = {}
                     if "message" in chunk and chunk["message"].get("content"):
                         delta["content"] = chunk["message"]["content"]
+                    if "message" in chunk and chunk["message"].get("tool_calls"):
+                        delta["tool_calls"] = chunk["message"]["tool_calls"]
                     if chunk.get("done"):
                         yield "data: " + json.dumps({
                             "choices": [{"delta": {}, "finish_reason": "stop"}]
@@ -429,10 +438,13 @@ async def chat_completions(req: ChatRequest):
         else:
             # Non-streaming: collect full response via native API
             full_content = ""
+            tool_calls = None
             usage = {}
-            for chunk in mgr.ollama.chat(mm.name, req.messages, think=False):
+            for chunk in mgr.ollama.chat(mm.name, req.messages, **ollama_kwargs):
                 if "message" in chunk:
                     full_content += chunk["message"].get("content", "")
+                    if chunk["message"].get("tool_calls"):
+                        tool_calls = chunk["message"]["tool_calls"]
                 if chunk.get("done"):
                     usage = {
                         "prompt_tokens": chunk.get("prompt_eval_count", 0),
@@ -440,10 +452,14 @@ async def chat_completions(req: ChatRequest):
                         "total_tokens": (chunk.get("prompt_eval_count", 0) +
                                          chunk.get("eval_count", 0)),
                     }
+            message = {"role": "assistant", "content": full_content}
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+            finish_reason = "tool_calls" if tool_calls else "stop"
             return {
                 "choices": [{
-                    "message": {"role": "assistant", "content": full_content},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": finish_reason,
                     "index": 0,
                 }],
                 "model": mm.name,
@@ -461,6 +477,10 @@ async def chat_completions(req: ChatRequest):
             payload["temperature"] = req.temperature
         if req.max_tokens is not None:
             payload["max_tokens"] = req.max_tokens
+        if req.tools:
+            payload["tools"] = req.tools
+        if req.tool_choice is not None:
+            payload["tool_choice"] = req.tool_choice
 
         if req.stream:
             async def stream():

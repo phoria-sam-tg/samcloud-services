@@ -396,6 +396,39 @@ def _fix_tool_calls(tool_calls: list[dict]) -> list[dict]:
     return fixed
 
 
+def _openai_messages_to_ollama(messages: list[dict]) -> list[dict]:
+    """Convert OpenAI-format messages to Ollama native format.
+    Key differences:
+    - tool_calls arguments: OpenAI=string, Ollama=object
+    - tool messages: OpenAI has tool_call_id, Ollama doesn't use it
+    """
+    converted = []
+    for msg in messages:
+        m = dict(msg)
+        # Convert tool_calls arguments from string to object
+        if "tool_calls" in m and m["tool_calls"]:
+            fixed_tcs = []
+            for tc in m["tool_calls"]:
+                tc = dict(tc)
+                if "function" in tc:
+                    fn = dict(tc["function"])
+                    if isinstance(fn.get("arguments"), str):
+                        try:
+                            fn["arguments"] = json.loads(fn["arguments"])
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    fn.pop("index", None)
+                    tc["function"] = fn
+                tc.pop("type", None)
+                tc.pop("id", None)
+                fixed_tcs.append(tc)
+            m["tool_calls"] = fixed_tcs
+        # Strip tool_call_id from tool messages (Ollama doesn't use it)
+        m.pop("tool_call_id", None)
+        converted.append(m)
+    return converted
+
+
 def _resolve_model(model_name: str):
     """Find which managed model matches the request, ensure it's running, and touch it."""
     matched_name = None
@@ -429,21 +462,19 @@ async def chat_completions(req: ChatRequest):
         # returns empty content with all output in reasoning field.
         # We translate the native response to OpenAI format ourselves.
         # Pass tools through for structured tool_call support.
-        # think:false is only needed for qwen3.5 models (Ollama 0.19+ bug
-        # where /v1/ dumps all output into reasoning field). But think:false
-        # also suppresses tool_calls in Ollama — so only apply it for
-        # qwen3.5 without tools. All other models: let them think normally.
+        # Route through native /api/chat (not /v1/) to avoid the Ollama bug
+        # where /v1/ puts content in the reasoning field. Via /api/chat,
+        # content is populated correctly alongside thinking.
+        # Convert OpenAI-format messages to Ollama native format.
+        ollama_messages = _openai_messages_to_ollama(req.messages)
         ollama_kwargs = {}
         if req.tools:
             ollama_kwargs["tools"] = req.tools
-        is_qwen35 = "qwen3.5" in mm.name.lower()
-        if is_qwen35 and not req.tools:
-            ollama_kwargs["think"] = False
 
         if req.stream:
             def stream():
                 saw_tool_calls = False
-                for chunk in mgr.ollama.chat(mm.name, req.messages, **ollama_kwargs):
+                for chunk in mgr.ollama.chat(mm.name, ollama_messages, **ollama_kwargs):
                     # Translate Ollama native -> OpenAI SSE format
                     delta = {}
                     if "message" in chunk and chunk["message"].get("content"):
@@ -468,7 +499,7 @@ async def chat_completions(req: ChatRequest):
             full_content = ""
             tool_calls = None
             usage = {}
-            for chunk in mgr.ollama.chat(mm.name, req.messages, **ollama_kwargs):
+            for chunk in mgr.ollama.chat(mm.name, ollama_messages, **ollama_kwargs):
                 if "message" in chunk:
                     full_content += chunk["message"].get("content", "")
                     if chunk["message"].get("tool_calls"):

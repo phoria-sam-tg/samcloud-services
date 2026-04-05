@@ -38,7 +38,12 @@ class OllamaClient:
     _http: httpx.Client = field(default=None, repr=False)
 
     def __post_init__(self):
-        self._http = httpx.Client(base_url=self.base_url, timeout=600)
+        # Pool limits prevent connection accumulation from abandoned streams
+        self._http = httpx.Client(
+            base_url=self.base_url,
+            timeout=600,
+            limits=httpx.Limits(max_connections=5, max_keepalive_connections=2),
+        )
 
     def version(self) -> str:
         r = self._http.get("/api/version")
@@ -86,11 +91,15 @@ class OllamaClient:
         r.raise_for_status()
         return r.json()
 
+    # 5 min read timeout for streaming — long enough for slow inference,
+    # short enough to not leak connections from abandoned requests.
+    _stream_timeout = httpx.Timeout(connect=10, read=300, write=10, pool=10)
+
     def generate(self, model: str, prompt: str, **kwargs) -> Iterator[dict]:
         """Generate completion, streaming."""
         payload = {"model": model, "prompt": prompt, "stream": True, **kwargs}
         with self._http.stream(
-            "POST", "/api/generate", json=payload, timeout=None
+            "POST", "/api/generate", json=payload, timeout=self._stream_timeout
         ) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
@@ -101,7 +110,7 @@ class OllamaClient:
         """Chat completion, streaming."""
         payload = {"model": model, "messages": messages, "stream": True, **kwargs}
         with self._http.stream(
-            "POST", "/api/chat", json=payload, timeout=None
+            "POST", "/api/chat", json=payload, timeout=self._stream_timeout
         ) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():

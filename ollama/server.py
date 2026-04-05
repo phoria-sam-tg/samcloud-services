@@ -474,25 +474,30 @@ async def chat_completions(req: ChatRequest):
         if req.stream:
             def stream():
                 saw_tool_calls = False
-                for chunk in mgr.ollama.chat(mm.name, ollama_messages, **ollama_kwargs):
-                    # Translate Ollama native -> OpenAI SSE format
-                    delta = {}
-                    if "message" in chunk and chunk["message"].get("content"):
-                        delta["content"] = chunk["message"]["content"]
-                    if "message" in chunk and chunk["message"].get("tool_calls"):
-                        delta["tool_calls"] = _fix_tool_calls(chunk["message"]["tool_calls"])
-                        saw_tool_calls = True
-                    if chunk.get("done"):
-                        finish = "tool_calls" if saw_tool_calls else "stop"
-                        yield "data: " + json.dumps({
-                            "choices": [{"delta": {}, "finish_reason": finish}]
-                        }) + "\n\n"
-                        yield "data: [DONE]\n\n"
-                    elif delta:
-                        yield "data: " + json.dumps({
-                            "choices": [{"delta": delta, "finish_reason": None}],
-                            "model": mm.name,
-                        }) + "\n\n"
+                try:
+                    for chunk in mgr.ollama.chat(mm.name, ollama_messages, **ollama_kwargs):
+                        # Translate Ollama native -> OpenAI SSE format
+                        delta = {}
+                        if "message" in chunk and chunk["message"].get("content"):
+                            delta["content"] = chunk["message"]["content"]
+                        if "message" in chunk and chunk["message"].get("tool_calls"):
+                            delta["tool_calls"] = _fix_tool_calls(chunk["message"]["tool_calls"])
+                            saw_tool_calls = True
+                        if chunk.get("done"):
+                            finish = "tool_calls" if saw_tool_calls else "stop"
+                            yield "data: " + json.dumps({
+                                "choices": [{"delta": {}, "finish_reason": finish}]
+                            }) + "\n\n"
+                            yield "data: [DONE]\n\n"
+                        elif delta:
+                            yield "data: " + json.dumps({
+                                "choices": [{"delta": delta, "finish_reason": None}],
+                                "model": mm.name,
+                            }) + "\n\n"
+                except GeneratorExit:
+                    log.info(f"Client disconnected during stream for {mm.name}")
+                except Exception as e:
+                    log.warning(f"Stream error for {mm.name}: {e}")
             return StreamingResponse(stream(), media_type="text/event-stream")
         else:
             # Non-streaming: collect full response via native API

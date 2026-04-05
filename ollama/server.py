@@ -431,31 +431,56 @@ def _openai_messages_to_ollama(messages: list[dict]) -> list[dict]:
 
 
 def _resolve_model(model_name: str):
-    """Find which managed model matches the request, ensure it's running, and touch it."""
+    """Find a managed model, or auto-load it. Never returns None for known models."""
+    # Check already-loaded models (exact then partial match)
     matched_name = None
-    # Exact match
     if model_name in mgr.models:
         matched_name = model_name
     else:
-        # Partial match (e.g. "qwen3-32b" matches "Qwen3-32B-Q6_K")
         lower = model_name.lower()
         for name in mgr.models:
             if lower in name.lower():
                 matched_name = name
                 break
-    if not matched_name:
-        return None
-    # Ensure the model is actually running (auto-reload if Ollama dropped it)
-    mgr.ensure_running(matched_name)
-    mgr.touch(matched_name)
-    return mgr.models[matched_name]
+
+    if matched_name:
+        mgr.ensure_running(matched_name)
+        mgr.touch(matched_name)
+        return mgr.models[matched_name]
+
+    # Model not loaded — try to auto-load it transparently.
+    # Check if it's a known Ollama model (already pulled).
+    lower = model_name.lower()
+    for m in mgr.ollama.list_models():
+        ollama_name = m["name"]
+        if lower in ollama_name.lower() or ollama_name.lower() in lower:
+            log.info(f"Auto-loading {ollama_name} (requested: {model_name})")
+            try:
+                mm = mgr.load_ollama_model(ollama_name)
+                return mm
+            except Exception as e:
+                log.error(f"Auto-load failed for {ollama_name}: {e}")
+                return None
+
+    # Check GGUF files
+    for m in mgr.llama.available_models():
+        if lower in m["name"].lower():
+            log.info(f"Auto-loading {m['file']} (requested: {model_name})")
+            try:
+                mm = mgr.load_llama_model(m["file"])
+                return mm
+            except Exception as e:
+                log.error(f"Auto-load failed for {m['name']}: {e}")
+                return None
+
+    return None
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest):
     mm = _resolve_model(req.model)
     if not mm:
-        raise HTTPException(status_code=404, detail=f"Model '{req.model}' not loaded")
+        raise HTTPException(status_code=404, detail=f"Model '{req.model}' not available (not pulled or no GGUF file)")
 
     if mm.backend == Backend.OLLAMA:
         # Route to Ollama native /api/chat with think:false to avoid
@@ -573,7 +598,7 @@ async def chat_completions(req: ChatRequest):
 async def completions(req: CompletionRequest):
     mm = _resolve_model(req.model)
     if not mm:
-        raise HTTPException(status_code=404, detail=f"Model '{req.model}' not loaded")
+        raise HTTPException(status_code=404, detail=f"Model '{req.model}' not available (not pulled or no GGUF file)")
 
     if mm.backend == Backend.OLLAMA:
         if req.stream:

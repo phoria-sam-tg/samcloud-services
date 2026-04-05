@@ -378,6 +378,24 @@ async def unload_model(req: UnloadRequest):
     return result
 
 
+def _fix_tool_calls(tool_calls: list[dict]) -> list[dict]:
+    """Convert Ollama tool_calls to OpenAI format.
+    Ollama returns arguments as a JSON object; OpenAI SDK expects a JSON string."""
+    fixed = []
+    for tc in tool_calls:
+        fc = dict(tc)
+        if "function" in fc:
+            fn = dict(fc["function"])
+            if isinstance(fn.get("arguments"), dict):
+                fn["arguments"] = json.dumps(fn["arguments"])
+            fn.pop("index", None)  # Ollama includes index, OpenAI doesn't
+            fc["function"] = fn
+        if "type" not in fc:
+            fc["type"] = "function"
+        fixed.append(fc)
+    return fixed
+
+
 def _resolve_model(model_name: str):
     """Find which managed model matches the request, ensure it's running, and touch it."""
     matched_name = None
@@ -431,7 +449,7 @@ async def chat_completions(req: ChatRequest):
                     if "message" in chunk and chunk["message"].get("content"):
                         delta["content"] = chunk["message"]["content"]
                     if "message" in chunk and chunk["message"].get("tool_calls"):
-                        delta["tool_calls"] = chunk["message"]["tool_calls"]
+                        delta["tool_calls"] = _fix_tool_calls(chunk["message"]["tool_calls"])
                         saw_tool_calls = True
                     if chunk.get("done"):
                         finish = "tool_calls" if saw_tool_calls else "stop"
@@ -464,7 +482,7 @@ async def chat_completions(req: ChatRequest):
                     }
             message = {"role": "assistant", "content": full_content}
             if tool_calls:
-                message["tool_calls"] = tool_calls
+                message["tool_calls"] = _fix_tool_calls(tool_calls)
             finish_reason = "tool_calls" if tool_calls else "stop"
             return {
                 "choices": [{

@@ -14,6 +14,7 @@ Endpoints:
   POST /v1/completions      - OpenAI-compatible completion
 """
 
+import asyncio
 import os
 import json
 import time
@@ -472,11 +473,10 @@ async def chat_completions(req: ChatRequest):
             ollama_kwargs["tools"] = req.tools
 
         if req.stream:
-            def stream():
+            async def stream():
                 saw_tool_calls = False
                 try:
-                    for chunk in mgr.ollama.chat(mm.name, ollama_messages, **ollama_kwargs):
-                        # Translate Ollama native -> OpenAI SSE format
+                    async for chunk in mgr.ollama.chat_stream(mm.name, ollama_messages, **ollama_kwargs):
                         delta = {}
                         if "message" in chunk and chunk["message"].get("content"):
                             delta["content"] = chunk["message"]["content"]
@@ -494,7 +494,7 @@ async def chat_completions(req: ChatRequest):
                                 "choices": [{"delta": delta, "finish_reason": None}],
                                 "model": mm.name,
                             }) + "\n\n"
-                except GeneratorExit:
+                except asyncio.CancelledError:
                     log.info(f"Client disconnected during stream for {mm.name}")
                 except Exception as e:
                     log.warning(f"Stream error for {mm.name}: {e}")

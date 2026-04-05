@@ -38,12 +38,8 @@ class OllamaClient:
     _http: httpx.Client = field(default=None, repr=False)
 
     def __post_init__(self):
-        # Pool limits prevent connection accumulation from abandoned streams
-        self._http = httpx.Client(
-            base_url=self.base_url,
-            timeout=600,
-            limits=httpx.Limits(max_connections=5, max_keepalive_connections=2),
-        )
+        # Used for non-streaming requests only (health, list, show, etc.)
+        self._http = httpx.Client(base_url=self.base_url, timeout=600)
 
     def version(self) -> str:
         r = self._http.get("/api/version")
@@ -91,8 +87,6 @@ class OllamaClient:
         r.raise_for_status()
         return r.json()
 
-    # 5 min read timeout for streaming — long enough for slow inference,
-    # short enough to not leak connections from abandoned requests.
     _stream_timeout = httpx.Timeout(connect=10, read=300, write=10, pool=10)
 
     def generate(self, model: str, prompt: str, **kwargs) -> Iterator[dict]:
@@ -107,7 +101,7 @@ class OllamaClient:
                     yield json.loads(line)
 
     def chat(self, model: str, messages: list[dict], **kwargs) -> Iterator[dict]:
-        """Chat completion, streaming."""
+        """Chat completion, streaming (sync, for non-streaming collection)."""
         payload = {"model": model, "messages": messages, "stream": True, **kwargs}
         with self._http.stream(
             "POST", "/api/chat", json=payload, timeout=self._stream_timeout
@@ -116,6 +110,44 @@ class OllamaClient:
             for line in resp.iter_lines():
                 if line.strip():
                     yield json.loads(line)
+
+    async def chat_stream(self, model: str, messages: list[dict], **kwargs):
+        """Chat completion, async streaming. Kills connection on cancel."""
+        import aiohttp
+        payload = {"model": model, "messages": messages, "stream": True, **kwargs}
+        session = aiohttp.ClientSession()
+        try:
+            async with session.post(
+                f"{self.base_url}/api/chat",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.content:
+                    line = line.decode().strip()
+                    if line:
+                        yield json.loads(line)
+        finally:
+            await session.close()
+
+    async def generate_stream(self, model: str, prompt: str, **kwargs):
+        """Generate completion, async streaming. Kills connection on cancel."""
+        import aiohttp
+        payload = {"model": model, "prompt": prompt, "stream": True, **kwargs}
+        session = aiohttp.ClientSession()
+        try:
+            async with session.post(
+                f"{self.base_url}/api/generate",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.content:
+                    line = line.decode().strip()
+                    if line:
+                        yield json.loads(line)
+        finally:
+            await session.close()
 
     def show_model(self, model: str) -> dict:
         """Get model metadata."""

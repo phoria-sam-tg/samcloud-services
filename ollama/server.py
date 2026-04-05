@@ -411,9 +411,16 @@ async def chat_completions(req: ChatRequest):
         # returns empty content with all output in reasoning field.
         # We translate the native response to OpenAI format ourselves.
         # Pass tools through for structured tool_call support.
-        ollama_kwargs = {"think": False}
+        # think:false is only needed for qwen3.5 models (Ollama 0.19+ bug
+        # where /v1/ dumps all output into reasoning field). But think:false
+        # also suppresses tool_calls in Ollama — so only apply it for
+        # qwen3.5 without tools. All other models: let them think normally.
+        ollama_kwargs = {}
         if req.tools:
             ollama_kwargs["tools"] = req.tools
+        is_qwen35 = "qwen3.5" in mm.name.lower()
+        if is_qwen35 and not req.tools:
+            ollama_kwargs["think"] = False
 
         if req.stream:
             def stream():

@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional
 
-from .manager import ModelManager, Backend
+from .manager import ModelManager, Backend, VLM_PORT
 from .samcloud import SamcloudClient
 from .ollama_client import OllamaClient
 from .llama_client import LlamaServerClient
@@ -570,6 +570,40 @@ async def chat_completions(req: ChatRequest):
             payload["tools"] = req.tools
         if req.tool_choice is not None:
             payload["tool_choice"] = req.tool_choice
+
+        if req.stream:
+            async def stream():
+                async with httpx.AsyncClient() as client:
+                    async with client.stream(
+                        "POST",
+                        f"http://127.0.0.1:{mm.port}/v1/chat/completions",
+                        json=payload,
+                        timeout=None,
+                    ) as resp:
+                        async for line in resp.aiter_lines():
+                            if line:
+                                yield line + "\n"
+            return StreamingResponse(stream(), media_type="text/event-stream")
+        else:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"http://127.0.0.1:{mm.port}/v1/chat/completions",
+                    json=payload,
+                    timeout=300,
+                )
+                return resp.json()
+
+    elif mm.backend == Backend.VLM:
+        # Forward to mlx-vlm's OpenAI-compatible endpoint
+        payload = {
+            "model": mm.name,
+            "messages": req.messages,
+            "stream": req.stream,
+        }
+        if req.temperature is not None:
+            payload["temperature"] = req.temperature
+        if req.max_tokens is not None:
+            payload["max_tokens"] = req.max_tokens
 
         if req.stream:
             async def stream():

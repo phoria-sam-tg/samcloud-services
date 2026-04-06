@@ -4,6 +4,7 @@ Unified Model Service Manager
 Manages ALL model backends on slice-test with SAMcloud resource leasing:
   - Ollama (pull/load/unload any HuggingFace or Ollama-hub model)
   - llama-server (llama.cpp - run GGUF models with full Metal acceleration)
+  - mlx-vlm (vision-language models on MLX - Gemma 4, Qwen2.5-VL, etc.)
 
 Lifecycle:
   1. Request comes in for a model
@@ -38,6 +39,13 @@ OLLAMA_KEEP_ALIVE = -1  # indefinite — our lease system manages memory, not Ol
 class Backend(str, Enum):
     OLLAMA = "ollama"
     LLAMA = "llama-server"
+    VLM = "mlx-vlm"
+
+VLM_PORT = 8801
+VLM_MODELS = {
+    "gemma-4": {"default": "mlx-community/gemma-4-31b-it-nvfp4", "memory_mb": 18700},
+    "qwen2.5-vl": {"default": "mlx-community/Qwen2.5-VL-7B-Instruct-4bit", "memory_mb": 5700},
+}
 
 
 @dataclass
@@ -113,6 +121,36 @@ class ModelManager:
                 self.models[name] = mm
                 adopted.append(mm)
                 log.info(f"Adopted Ollama model: {name} (~{mm.memory_mb}MB)")
+
+        # Discover mlx-vlm models
+        try:
+            import httpx
+            r = httpx.get(f"http://localhost:{VLM_PORT}/health", timeout=5)
+            if r.status_code == 200:
+                health = r.json()
+                loaded = health.get("loaded_model")
+                if loaded and loaded not in self.models:
+                    # Estimate memory from known VLM models
+                    mem = 18700  # default
+                    for prefix, info in VLM_MODELS.items():
+                        if prefix in loaded.lower():
+                            mem = info["memory_mb"]
+                            break
+                    mm = ManagedModel(
+                        name=loaded,
+                        backend=Backend.VLM,
+                        memory_mb=mem,
+                        lease_id=None,
+                        port=VLM_PORT,
+                        loaded_at=time.time(),
+                        last_used=time.time(),
+                        managed=False,
+                    )
+                    self.models[loaded] = mm
+                    adopted.append(mm)
+                    log.info(f"Adopted VLM model: {loaded} (~{mem}MB)")
+        except Exception as e:
+            log.info(f"No VLM server detected on port {VLM_PORT}: {e}")
 
         return adopted
 

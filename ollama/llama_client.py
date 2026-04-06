@@ -27,6 +27,13 @@ KNOWN_MODELS = {
         "family": "qwen3.5",
         "ctx_default": 12288,
     },
+    "qwen2.5-32b-agi-q4_k_m.gguf": {
+        "memory_mb": 20000,
+        "params": "32B",
+        "quant": "Q4_K_M",
+        "family": "qwen2.5-agi",
+        "ctx_default": 12288,
+    },
 }
 
 

@@ -397,6 +397,67 @@ def _fix_tool_calls(tool_calls: list[dict]) -> list[dict]:
     return fixed
 
 
+import re
+
+# Gemma 4 tool call format:
+#   <|tool_call>call:func_name{key:<|"|">value<|"|">, key2:<|"|">value2<|"|">}<tool_call|>
+_GEMMA_TC_RE = re.compile(
+    r'<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>',
+    re.DOTALL,
+)
+_GEMMA_ARG_RE = re.compile(
+    r'(\w+):\s*<\|"\|">(.*?)<\|"\|">',
+)
+_CALL_COUNTER = 0
+
+
+def _parse_gemma_tool_calls(content: str) -> tuple[str, list[dict]]:
+    """Parse Gemma 4 tool call tags from content into structured tool_calls.
+    Returns (remaining_content, tool_calls)."""
+    global _CALL_COUNTER
+    tool_calls = []
+    for match in _GEMMA_TC_RE.finditer(content):
+        func_name = match.group(1)
+        args_str = match.group(2)
+        arguments = {}
+        for arg_match in _GEMMA_ARG_RE.finditer(args_str):
+            arguments[arg_match.group(1)] = arg_match.group(2)
+        _CALL_COUNTER += 1
+        tool_calls.append({
+            "id": f"call_gemma_{_CALL_COUNTER}",
+            "type": "function",
+            "function": {
+                "name": func_name,
+                "arguments": json.dumps(arguments),
+            },
+        })
+    # Strip tool call tags from content
+    remaining = _GEMMA_TC_RE.sub("", content).strip()
+    return remaining, tool_calls
+
+
+def _tools_to_gemma_system(tools: list[dict]) -> str:
+    """Convert OpenAI tools array to a system prompt for Gemma 4."""
+    lines = ["You have access to the following tools:\n"]
+    for tool in tools:
+        fn = tool.get("function", {})
+        name = fn.get("name", "")
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {}).get("properties", {})
+        required = fn.get("parameters", {}).get("required", [])
+        param_parts = []
+        for pname, pinfo in params.items():
+            req = " (required)" if pname in required else ""
+            param_parts.append(f"{pname}: {pinfo.get('type', 'string')}{req}")
+        lines.append(f"- {name}: {desc}. Parameters: {{{', '.join(param_parts)}}}")
+    lines.append("")
+    lines.append('When you need to use a tool, output EXACTLY this format:')
+    lines.append('<|tool_call>call:function_name{param:<|"|">value<|"|">}<tool_call|>')
+    lines.append("")
+    lines.append("Do not wrap tool calls in markdown. Call tools directly.")
+    return "\n".join(lines)
+
+
 def _openai_messages_to_ollama(messages: list[dict]) -> list[dict]:
     """Convert OpenAI-format messages to Ollama native format.
     Key differences:
@@ -594,10 +655,22 @@ async def chat_completions(req: ChatRequest):
                 return resp.json()
 
     elif mm.backend == Backend.VLM:
-        # Forward to mlx-vlm's OpenAI-compatible endpoint
+        # Forward to mlx-vlm. mlx-vlm doesn't handle tools natively,
+        # so we inject tools into the system prompt and parse Gemma 4's
+        # tool call tags from the response content.
+        messages = list(req.messages)
+        if req.tools:
+            tool_system = _tools_to_gemma_system(req.tools)
+            # Prepend or merge with existing system message
+            if messages and messages[0].get("role") == "system":
+                messages[0] = dict(messages[0])
+                messages[0]["content"] = tool_system + "\n\n" + messages[0]["content"]
+            else:
+                messages.insert(0, {"role": "system", "content": tool_system})
+
         payload = {
             "model": mm.name,
-            "messages": req.messages,
+            "messages": messages,
             "stream": req.stream,
         }
         if req.temperature is not None:
@@ -606,18 +679,44 @@ async def chat_completions(req: ChatRequest):
             payload["max_tokens"] = req.max_tokens
 
         if req.stream:
-            async def stream():
+            # For streaming with tools, collect full response then parse
+            # (Gemma tool calls come as a single chunk, not incremental)
+            if req.tools:
                 async with httpx.AsyncClient() as client:
-                    async with client.stream(
-                        "POST",
+                    resp = await client.post(
                         f"http://127.0.0.1:{mm.port}/v1/chat/completions",
-                        json=payload,
-                        timeout=None,
-                    ) as resp:
-                        async for line in resp.aiter_lines():
-                            if line:
-                                yield line + "\n"
-            return StreamingResponse(stream(), media_type="text/event-stream")
+                        json={**payload, "stream": False},
+                        timeout=300,
+                    )
+                    data = resp.json()
+                    content = data["choices"][0]["message"].get("content", "")
+                    remaining, tool_calls = _parse_gemma_tool_calls(content)
+                    message = {"role": "assistant", "content": remaining}
+                    if tool_calls:
+                        message["tool_calls"] = tool_calls
+                    finish = "tool_calls" if tool_calls else "stop"
+                    # Emit as a single SSE event
+                    async def single_event():
+                        yield "data: " + json.dumps({
+                            "choices": [{"delta": message, "finish_reason": finish}],
+                            "model": mm.name,
+                            "usage": data.get("usage", {}),
+                        }) + "\n\n"
+                        yield "data: [DONE]\n\n"
+                    return StreamingResponse(single_event(), media_type="text/event-stream")
+            else:
+                async def stream():
+                    async with httpx.AsyncClient() as client:
+                        async with client.stream(
+                            "POST",
+                            f"http://127.0.0.1:{mm.port}/v1/chat/completions",
+                            json=payload,
+                            timeout=None,
+                        ) as resp:
+                            async for line in resp.aiter_lines():
+                                if line:
+                                    yield line + "\n"
+                return StreamingResponse(stream(), media_type="text/event-stream")
         else:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
@@ -625,7 +724,16 @@ async def chat_completions(req: ChatRequest):
                     json=payload,
                     timeout=300,
                 )
-                return resp.json()
+                data = resp.json()
+                # Parse Gemma tool calls from content
+                if req.tools:
+                    content = data["choices"][0]["message"].get("content", "")
+                    remaining, tool_calls = _parse_gemma_tool_calls(content)
+                    data["choices"][0]["message"]["content"] = remaining
+                    if tool_calls:
+                        data["choices"][0]["message"]["tool_calls"] = tool_calls
+                        data["choices"][0]["finish_reason"] = "tool_calls"
+                return data
 
 
 @app.post("/v1/completions")

@@ -5,7 +5,9 @@ import json
 from dataclasses import dataclass, field
 from typing import Optional, Iterator
 
-OLLAMA_BASE = "http://localhost:11434"
+from . import config
+
+OLLAMA_BASE = config.OLLAMA_BASE
 
 # Approximate VRAM requirements (MB) for common model sizes.
 # Ollama reports actual size once pulled - these are planning estimates.

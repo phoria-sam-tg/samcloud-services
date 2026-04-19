@@ -22,18 +22,19 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from . import config
 from .ollama_client import OllamaClient, estimate_memory_mb
 from .llama_client import LlamaServerClient, LlamaInstance
 from .samcloud import SamcloudClient
 
 log = logging.getLogger("model-manager")
 
-RESOURCE_ID = "slice-test/gpu-0"
-SERVICE_ID = "slice-test/model-service"
-COOLDOWN_SECONDS = 300  # 5 min idle before unload
-LEASE_TTL = 3600  # 1 hour default lease
-LEASE_RENEW_AT = 0.5  # renew when 50% of TTL has elapsed
-OLLAMA_KEEP_ALIVE = -1  # indefinite — our lease system manages memory, not Ollama's timer
+RESOURCE_ID = config.SC_RESOURCE_ID
+SERVICE_ID = config.SC_SERVICE_ID
+COOLDOWN_SECONDS = config.COOLDOWN_SECONDS
+LEASE_TTL = config.LEASE_TTL
+LEASE_RENEW_AT = config.LEASE_RENEW_AT
+OLLAMA_KEEP_ALIVE = config.OLLAMA_KEEP_ALIVE
 
 
 class Backend(str, Enum):
@@ -41,7 +42,7 @@ class Backend(str, Enum):
     LLAMA = "llama-server"
     VLM = "mlx-vlm"
 
-VLM_PORT = 8801
+VLM_PORT = config.VLM_PORT
 VLM_MODELS = {
     "gemma-4": {"default": "mlx-community/gemma-4-31b-it-nvfp4", "memory_mb": 18700},
     "qwen2.5-vl": {"default": "mlx-community/Qwen2.5-VL-7B-Instruct-4bit", "memory_mb": 5700},
@@ -73,11 +74,21 @@ class ModelManager:
     _health_task: Optional[asyncio.Task] = field(default=None, repr=False)
 
     def discover(self) -> list[ManagedModel]:
-        """Discover and adopt already-running model processes."""
+        """Discover and adopt already-running model processes.
+
+        Each backend is probed independently — if ollama isn't running we
+        still want to pick up llama-server and mlx-vlm. No backend being up
+        is a valid state for a fresh service start.
+        """
         adopted = []
 
         # Discover llama-server instances
-        for inst in self.llama.discover_running():
+        try:
+            instances = self.llama.discover_running()
+        except Exception as e:
+            log.info(f"llama-server discovery skipped: {e}")
+            instances = []
+        for inst in instances:
             h = self.llama.health(inst.port)
             if h.get("status") != "ok":
                 continue
@@ -98,7 +109,12 @@ class ModelManager:
             log.info(f"Adopted llama-server: {name} on port {inst.port} (~{inst.memory_mb}MB)")
 
         # Discover running Ollama models
-        for m in self.ollama.list_running():
+        try:
+            running = self.ollama.list_running()
+        except Exception as e:
+            log.info(f"ollama not reachable, skipping discovery: {e}")
+            running = []
+        for m in running:
             name = m.get("name", "unknown")
             size_mb = int(m.get("size", 0) / 1024 / 1024)
             if name not in self.models:
@@ -179,9 +195,13 @@ class ModelManager:
 
     def status(self) -> dict:
         """Full manager status."""
+        try:
+            ollama_ver = self.ollama.version()
+        except Exception as e:
+            ollama_ver = f"unreachable: {e}"
         return {
             "backends": {
-                "ollama": self.ollama.version(),
+                "ollama": ollama_ver,
                 "llama_server": {
                     port: {
                         "model": inst.model_name,
@@ -206,12 +226,18 @@ class ModelManager:
                 for name, mm in self.models.items()
             },
             "available": {
-                "ollama": [m["name"] for m in self.ollama.list_models()],
+                "ollama": self._safe_ollama_list(),
                 "gguf": [m["name"] for m in self.llama.available_models()],
             },
             "resource": self._get_resource_summary(),
             "leases": self._get_active_leases(),
         }
+
+    def _safe_ollama_list(self) -> list[str]:
+        try:
+            return [m["name"] for m in self.ollama.list_models()]
+        except Exception:
+            return []
 
     def _get_resource_summary(self) -> dict:
         try:

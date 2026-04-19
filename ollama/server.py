@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional
 
+from . import config
 from .manager import ModelManager, Backend, VLM_PORT
 from .samcloud import SamcloudClient
 from .ollama_client import OllamaClient
@@ -40,14 +41,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("model-service")
 
-SC_TOKEN = os.environ.get("SC_TOKEN", "")
-SERVICE_PORT = int(os.environ.get("SERVICE_PORT", "8800"))
-SC_VERIFY_URL = os.environ.get(
-    "SC_VERIFY_URL", "https://stg.samtg.xyz:9443/api/v1/auth/verify"
-)
-SC_REQUIRED_SCOPE = os.environ.get("SC_REQUIRED_SCOPE", "device:slice-test")
-AUTH_CACHE_TTL = 300  # 5 minutes
-AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "true").lower() == "true"
+SC_TOKEN = config.SC_TOKEN
+SERVICE_PORT = config.SERVICE_PORT
+SC_VERIFY_URL = config.SC_VERIFY_URL
+SC_REQUIRED_SCOPE = config.SC_REQUIRED_SCOPE
+AUTH_CACHE_TTL = config.AUTH_CACHE_TTL
+AUTH_ENABLED = config.AUTH_ENABLED
 
 # Paths that don't require auth
 AUTH_EXEMPT_PATHS = {"/health", "/service-docs"}
@@ -237,9 +236,9 @@ async def service_docs():
         guide_md = "(docs not found on disk)"
 
     return {
-        "name": "model-service",
+        "name": config.SC_SERVICE_NAME,
         "description": (
-            "Unified inference gateway for slice-test. "
+            f"Unified inference gateway for {config.SC_DEVICE}. "
             "Wraps Ollama (MLX) and llama-server (llama.cpp Metal) behind "
             "a single OpenAI-compatible API. Manages GPU memory via SAMcloud "
             "resource leasing — models spin up on demand and unload after 5 min idle. "
@@ -305,9 +304,9 @@ async def service_docs():
         "loaded_models": loaded,
         "model_matching": "Case-insensitive partial match. Use 'qwen3-32b' or 'qwen3.5' as shortnames.",
         "samcloud": {
-            "service_id": "slice-test/model-service",
-            "resource": "slice-test/gpu-0",
-            "device": "slice-test",
+            "service_id": config.SC_SERVICE_ID,
+            "resource": config.SC_RESOURCE_ID,
+            "device": config.SC_DEVICE,
         },
         "guide": guide_md,
     }
@@ -346,7 +345,7 @@ async def load_model(req: LoadRequest):
             # Resolve to full path if just a filename
             model_path = req.model
             if not model_path.startswith("/"):
-                model_path = f"/Users/sam/models/{req.model}"
+                model_path = str(config.MODELS_DIR / req.model)
             mm = mgr.load_llama_model(
                 model_path,
                 port=req.port,

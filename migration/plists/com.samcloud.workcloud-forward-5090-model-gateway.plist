@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.samcloud.workcloud-forward-5090-model-gateway</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/autossh</string>
+        <string>-M</string>
+        <string>0</string>
+        <string>-N</string>
+        <string>-o</string>
+        <string>ServerAliveInterval=15</string>
+        <string>-o</string>
+        <string>ServerAliveCountMax=3</string>
+        <string>-o</string>
+        <string>ExitOnForwardFailure=yes</string>
+        <string>-o</string>
+        <string>IdentitiesOnly=yes</string>
+        <string>-i</string>
+        <string>/Users/sam/.ssh/workcloud</string>
+        <string>-p</string>
+        <string>10001</string>
+        <string>-L</string>
+        <string>18008:localhost:8450</string>
+        <string>phoria@localhost</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AUTOSSH_GATETIME</key>
+        <string>0</string>
+        <key>AUTOSSH_POLL</key>
+        <string>30</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/sam/Library/Logs/samcloud/workcloud-forward-5090-model-gateway.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/sam/Library/Logs/samcloud/workcloud-forward-5090-model-gateway.err</string>
+</dict>
+</plist>

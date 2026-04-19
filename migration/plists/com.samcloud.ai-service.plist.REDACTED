@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.samcloud.ai-service</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>/Users/sam/.local/samcloud/ai-service/server.js</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AI_SERVICE_PORT</key>
+        <string>8766</string>
+        <key>OLLAMA_URL</key>
+        <string>http://localhost:11434</string>
+        <key>OLLAMA_MODEL</key>
+        <string>llava:7b</string>
+        <!-- AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET, TITLES_TABLE, AI_SERVICE_SECRET redacted -->
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/sam/.local/samcloud/ai-service/logs/ai-service.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/sam/.local/samcloud/ai-service/logs/ai-service.err</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/sam/.local/samcloud/ai-service</string>
+</dict>
+</plist>

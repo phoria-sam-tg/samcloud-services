@@ -10,16 +10,24 @@ Models spin up on demand, unload after 5 min idle.
 
 ## SAMcloud Identity
 
-- **User**: `claude-services` (role: agent, scope: `device:slice-test`)
-- **Service**: `slice-test/model-service` (port 8800)
-- **Token**: Always via `SC_TOKEN` env var — never hardcode
+Defaults are now env-driven via `ollama/config.py`. Production defaults:
+
+- **Device**: `claude-services-slice` (`SC_DEVICE`)
+- **Service**: `claude-services-slice/model-service` (`SC_SERVICE_NAME`)
+- **Resource**: `claude-services-slice/gpu-0` (`SC_RESOURCE_ID`)
+- **Registry**: `https://cloud.samtg.xyz/api/v1` (`SC_BASE`)
+- **Required scope**: `device:claude-services-slice` (`SC_REQUIRED_SCOPE`) — tune per deployment
+- **Token**: always via `SC_TOKEN` env — never hardcode. Use the service token (`sc_service_...`) issued at registration, not a user token.
+
+Staging (legacy) used `slice-test/*` identities pointing at `stg.samtg.xyz:9443` — see the `migration` branch for the pre-migration architecture.
 
 ## Key Files
 
 | File | What to know |
 |------|-------------|
+| `ollama/config.py` | Env-driven config. Every SAMcloud identity + backend path reads from here |
 | `ollama/server.py` | FastAPI server + auth middleware. Thin routing — delegates to manager |
-| `ollama/manager.py` | Core logic. `ModelManager` handles lifecycle, leases, cooldown, adoption |
+| `ollama/manager.py` | Core logic. `ModelManager` handles lifecycle, leases, cooldown, adoption. Discovery is resilient to any backend being down |
 | `ollama/samcloud.py` | SAMcloud API client. All registry calls go through this |
 | `ollama/ollama_client.py` | Ollama API. Note: `chat()` passes `**kwargs` so `think=False` works |
 | `ollama/llama_client.py` | llama-server process management. `discover_running()` parses `ps aux` |
@@ -37,7 +45,7 @@ cd ollama && python test_cooldown.py    # Idle unload verification
 - All SAMcloud API calls go through `SamcloudClient` (never raw httpx)
 - All model operations go through `ModelManager` (server.py is thin routing)
 - `GET /service-docs` is the service discovery convention — auth-exempt, returns structured JSON + full markdown guide
-- Auth via SAMcloud token verification (`GET /auth/verify?scope=device:slice-test`)
+- Auth via SAMcloud token verification (`GET /auth/verify?scope=$SC_REQUIRED_SCOPE`)
 
 ## Architecture Decisions
 

@@ -5,22 +5,20 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-BASE = "https://stg.samtg.xyz:9443/api/v1"
-DEVICE = "slice-test"
+from . import config
 
 
 @dataclass
 class SamcloudClient:
     token: str
-    base: str = BASE
-    device: str = DEVICE
+    base: str = field(default_factory=lambda: config.SC_BASE)
+    device: str = field(default_factory=lambda: config.SC_DEVICE)
     _http: httpx.Client = field(default=None, repr=False)
 
     def __post_init__(self):
         self._http = httpx.Client(
             base_url=self.base,
             headers={"Authorization": f"Bearer {self.token}"},
-            verify=False,
             timeout=30,
         )
 

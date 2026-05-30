@@ -8,8 +8,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-LLAMA_SERVER_BIN = "/opt/homebrew/bin/llama-server"
-MODELS_DIR = Path("/Users/sam/models")
+from . import config
+
+LLAMA_SERVER_BIN = config.LLAMA_SERVER_BIN
+MODELS_DIR = config.MODELS_DIR
 
 # Known models and their approximate memory usage (MB)
 KNOWN_MODELS = {

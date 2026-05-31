@@ -309,6 +309,17 @@ class ModelManager:
                     log.info(f"Actual VRAM for {model_name}: {actual_mb}MB (estimated {memory_mb}MB)")
                 break
 
+        # Reconcile the lease to actual VRAM so other tenants see the truth.
+        # Registry has no PATCH for leases — release + re-request. Brief race
+        # window between calls; same pattern as the renewal loop.
+        if lease_id and actual_mb > memory_mb * 1.25:
+            try:
+                self.sc.release_lease(lease_id)
+                lease_id = self._request_lease(model_name, actual_mb)
+                log.info(f"Lease reconciled to actual VRAM: {actual_mb}MB (was {memory_mb}MB)")
+            except Exception as e:
+                log.warning(f"Lease reconcile failed for {model_name}: {e}")
+
         now = time.time()
         mm = ManagedModel(
             name=model_name,

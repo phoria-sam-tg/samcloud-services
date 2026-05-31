@@ -49,7 +49,7 @@ AUTH_CACHE_TTL = config.AUTH_CACHE_TTL
 AUTH_ENABLED = config.AUTH_ENABLED
 
 # Paths that don't require auth
-AUTH_EXEMPT_PATHS = {"/health", "/service-docs"}
+AUTH_EXEMPT_PATHS = {"/health", "/service-docs", "/warm"}
 
 
 class SamcloudAuthMiddleware(BaseHTTPMiddleware):
@@ -210,6 +210,29 @@ class CompletionRequest(BaseModel):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "model-service", "models": len(mgr.models)}
+
+
+@app.get("/warm")
+async def warm():
+    """Auth-exempt summary of currently-resident models. Consumers query this
+    to decide whether to route here (model already hot) or wait through a
+    cold start on another provider."""
+    if not mgr:
+        return {"models": [], "cooldown_seconds": config.COOLDOWN_SECONDS}
+    now = time.time()
+    return {
+        "models": [
+            {
+                "name": name,
+                "backend": mm.backend.value,
+                "memory_mb": mm.memory_mb,
+                "idle_seconds": int(now - mm.last_used),
+                "request_count": mm.request_count,
+            }
+            for name, mm in mgr.models.items()
+        ],
+        "cooldown_seconds": config.COOLDOWN_SECONDS,
+    }
 
 
 @app.get("/service-docs", response_class=JSONResponse)

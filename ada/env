@@ -1,0 +1,11 @@
+# ada-wsl profile for samcloud-services / model-gateway.
+# Sourced by run.sh and systemd EnvironmentFile=.
+#
+# Most config defaults in ollama/config.py already target the prod registry
+# (cloud.samtg.xyz), so we only override device identity here.
+
+SC_DEVICE=ada-wsl
+SC_SERVICE_NAME=model-gateway
+
+# run.sh defaults SC_TOKEN_PATH to $HOME/.samcloud/services/${SC_SERVICE_NAME}.token;
+# override here if your service token lives elsewhere.

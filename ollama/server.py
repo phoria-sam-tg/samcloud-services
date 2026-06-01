@@ -32,7 +32,7 @@ from typing import Optional
 from . import config
 from .manager import ModelManager, Backend, VLM_PORT, InsufficientResource
 from .samcloud import SamcloudClient
-from .ollama_client import OllamaClient
+from .ollama_client import OllamaClient, estimate_memory_mb
 from .llama_client import LlamaServerClient
 
 logging.basicConfig(
@@ -214,23 +214,61 @@ async def health():
 
 @app.get("/warm")
 async def warm():
-    """Auth-exempt summary of currently-resident models. Consumers query this
-    to decide whether to route here (model already hot) or wait through a
-    cold start on another provider."""
+    """Auth-exempt elastic offering. Returns what we can serve right now,
+    broken into resident (already loaded, instant) vs loadable (would fit
+    given current GPU headroom) vs blocked (model too big for what's left).
+
+    The resource_available_mb comes from the samcloud registry — so a
+    sibling tenant taking a big lease shrinks our offering, and freeing
+    that lease widens it back. Consumers use this for dynamic routing.
+    """
     if not mgr:
-        return {"models": [], "cooldown_seconds": config.COOLDOWN_SECONDS}
+        return {"resident": [], "loadable": [], "blocked": [], "resource_available_mb": None}
+
     now = time.time()
+    resource_summary = mgr._get_resource_summary() or {}
+    avail = resource_summary.get("available_memory_mb")
+
+    # Resident: already loaded, instant. Always offered.
+    resident = [
+        {
+            "name": name,
+            "backend": mm.backend.value,
+            "memory_mb": mm.memory_mb,
+            "idle_seconds": int(now - mm.last_used),
+            "request_count": mm.request_count,
+        }
+        for name, mm in mgr.models.items()
+    ]
+    resident_names = {r["name"] for r in resident}
+
+    # Pulled but not loaded — partition by whether they fit in current avail.
+    loadable, blocked = [], []
+    try:
+        pulled = mgr.ollama.list_models()
+    except Exception:
+        pulled = []
+    for m in pulled:
+        name = m.get("name", "")
+        if name in resident_names:
+            continue
+        disk_mb = int(m.get("size", 0) / 1024 / 1024)
+        # Rough VRAM estimate: disk weights × 1.1 (small overhead) plus a
+        # ~4 GB allowance for KV cache at our 65 k ctx with quantised KV.
+        est_mb = max(estimate_memory_mb(name), int(disk_mb * 1.1) + 4000)
+        entry = {"name": name, "backend": "ollama", "estimated_mb": est_mb, "disk_mb": disk_mb}
+        if avail is None or est_mb <= avail:
+            loadable.append(entry)
+        else:
+            entry["short_by_mb"] = est_mb - avail
+            blocked.append(entry)
+
     return {
-        "models": [
-            {
-                "name": name,
-                "backend": mm.backend.value,
-                "memory_mb": mm.memory_mb,
-                "idle_seconds": int(now - mm.last_used),
-                "request_count": mm.request_count,
-            }
-            for name, mm in mgr.models.items()
-        ],
+        "resident": resident,
+        "loadable": loadable,
+        "blocked": blocked,
+        "resource_available_mb": avail,
+        "resource_id": config.SC_RESOURCE_ID,
         "cooldown_seconds": config.COOLDOWN_SECONDS,
     }
 

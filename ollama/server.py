@@ -30,7 +30,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional
 
 from . import config
-from .manager import ModelManager, Backend, VLM_PORT
+from .manager import ModelManager, Backend, VLM_PORT, InsufficientResource
 from .samcloud import SamcloudClient
 from .ollama_client import OllamaClient
 from .llama_client import LlamaServerClient
@@ -541,6 +541,8 @@ def _resolve_model(model_name: str):
             try:
                 mm = mgr.load_ollama_model(ollama_name)
                 return mm
+            except InsufficientResource:
+                raise
             except Exception as e:
                 log.error(f"Auto-load failed for {ollama_name}: {e}")
                 return None
@@ -552,6 +554,8 @@ def _resolve_model(model_name: str):
             try:
                 mm = mgr.load_llama_model(m["file"])
                 return mm
+            except InsufficientResource:
+                raise
             except Exception as e:
                 log.error(f"Auto-load failed for {m['name']}: {e}")
                 return None
@@ -561,7 +565,10 @@ def _resolve_model(model_name: str):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest):
-    mm = _resolve_model(req.model)
+    try:
+        mm = _resolve_model(req.model)
+    except InsufficientResource as e:
+        raise HTTPException(status_code=409, detail=str(e))
     if not mm:
         raise HTTPException(status_code=404, detail=f"Model '{req.model}' not available (not pulled or no GGUF file)")
 
@@ -760,7 +767,10 @@ async def chat_completions(req: ChatRequest):
 
 @app.post("/v1/completions")
 async def completions(req: CompletionRequest):
-    mm = _resolve_model(req.model)
+    try:
+        mm = _resolve_model(req.model)
+    except InsufficientResource as e:
+        raise HTTPException(status_code=409, detail=str(e))
     if not mm:
         raise HTTPException(status_code=404, detail=f"Model '{req.model}' not available (not pulled or no GGUF file)")
 

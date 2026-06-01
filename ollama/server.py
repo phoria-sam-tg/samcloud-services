@@ -212,15 +212,10 @@ async def health():
     return {"status": "ok", "service": "model-service", "models": len(mgr.models)}
 
 
-@app.get("/warm")
-async def warm():
-    """Auth-exempt elastic offering. Returns what we can serve right now,
-    broken into resident (already loaded, instant) vs loadable (would fit
-    given current GPU headroom) vs blocked (model too big for what's left).
-
-    The resource_available_mb comes from the samcloud registry — so a
-    sibling tenant taking a big lease shrinks our offering, and freeing
-    that lease widens it back. Consumers use this for dynamic routing.
+def _elastic_catalog() -> dict:
+    """The dynamic offering: what we can serve right now given current
+    resource headroom. Shared by /warm and /v1/models so OpenAI SDK
+    discovery and samcloud-native discovery report the same truth.
     """
     if not mgr:
         return {"resident": [], "loadable": [], "blocked": [], "resource_available_mb": None}
@@ -229,7 +224,6 @@ async def warm():
     resource_summary = mgr._get_resource_summary() or {}
     avail = resource_summary.get("available_memory_mb")
 
-    # Resident: already loaded, instant. Always offered.
     resident = [
         {
             "name": name,
@@ -242,7 +236,6 @@ async def warm():
     ]
     resident_names = {r["name"] for r in resident}
 
-    # Pulled but not loaded — partition by whether they fit in current avail.
     loadable, blocked = [], []
     try:
         pulled = mgr.ollama.list_models()
@@ -253,8 +246,6 @@ async def warm():
         if name in resident_names:
             continue
         disk_mb = int(m.get("size", 0) / 1024 / 1024)
-        # Rough VRAM estimate: disk weights × 1.1 (small overhead) plus a
-        # ~4 GB allowance for KV cache at our 65 k ctx with quantised KV.
         est_mb = max(estimate_memory_mb(name), int(disk_mb * 1.1) + 4000)
         entry = {"name": name, "backend": "ollama", "estimated_mb": est_mb, "disk_mb": disk_mb}
         if avail is None or est_mb <= avail:
@@ -269,8 +260,55 @@ async def warm():
         "blocked": blocked,
         "resource_available_mb": avail,
         "resource_id": config.SC_RESOURCE_ID,
-        "cooldown_seconds": config.COOLDOWN_SECONDS,
     }
+
+
+@app.get("/warm")
+async def warm():
+    """Auth-exempt elastic offering. Returns what we can serve right now,
+    broken into resident (already loaded, instant) vs loadable (would fit
+    given current GPU headroom) vs blocked (model too big for what's left).
+
+    The resource_available_mb comes from the samcloud registry — so a
+    sibling tenant taking a big lease shrinks our offering, and freeing
+    that lease widens it back. Consumers use this for dynamic routing.
+    """
+    cat = _elastic_catalog()
+    cat["cooldown_seconds"] = config.COOLDOWN_SECONDS
+    return cat
+
+
+@app.get("/v1/models")
+async def openai_models():
+    """OpenAI-compatible model list — dynamic. Only models that can be
+    served right now (resident or fit in current headroom) appear in
+    `data`. Blocked models are omitted so SDK callers can route by what's
+    actually offered. See /warm for the full breakdown with blocked
+    entries and short_by_mb hints.
+    """
+    cat = _elastic_catalog()
+    now = int(time.time())
+    data = []
+    for r in cat["resident"]:
+        data.append({
+            "id": r["name"],
+            "object": "model",
+            "created": now,
+            "owned_by": r["backend"],
+            "status": "resident",
+            "memory_mb": r["memory_mb"],
+            "idle_seconds": r["idle_seconds"],
+        })
+    for l in cat["loadable"]:
+        data.append({
+            "id": l["name"],
+            "object": "model",
+            "created": now,
+            "owned_by": l["backend"],
+            "status": "loadable",
+            "estimated_mb": l["estimated_mb"],
+        })
+    return {"object": "list", "data": data}
 
 
 @app.get("/service-docs", response_class=JSONResponse)
@@ -380,6 +418,10 @@ async def status():
 
 @app.get("/models")
 async def list_models():
+    """Gateway-native model list: managed (loaded) + pulled (available) +
+    elastic offering (resident / loadable / blocked given current GPU
+    headroom). Use /v1/models for OpenAI-SDK shape, /warm for the
+    elastic offering only."""
     return {
         "managed": {
             name: {
@@ -394,6 +436,7 @@ async def list_models():
         },
         "available_ollama": [m["name"] for m in mgr.ollama.list_models()],
         "available_gguf": mgr.llama.available_models(),
+        "offering": _elastic_catalog(),
     }
 
 

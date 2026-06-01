@@ -54,13 +54,16 @@ class SamcloudClient:
         purpose: str = "model-serving",
         ttl_seconds: int = 3600,
     ) -> dict:
-        """Request a memory lease. Returns 201 granted, 202 queued, 409 conflict."""
+        """Request a memory lease. Returns 201 granted, 202 queued, 409 conflict.
+
+        `purpose` stays in the signature for callsite legibility but isn't
+        sent — the cloud.samtg.xyz registry rejects it as extra_forbidden.
+        """
         r = self._http.post(
             f"/resources/{resource_id}/leases",
             json={
                 "service_id": service_id,
                 "memory_mb": memory_mb,
-                "purpose": purpose,
                 "ttl_seconds": ttl_seconds,
             },
         )

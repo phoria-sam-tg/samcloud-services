@@ -30,9 +30,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional
 
 from . import config
-from .manager import ModelManager, Backend, VLM_PORT
+from .manager import ModelManager, Backend, VLM_PORT, InsufficientResource
 from .samcloud import SamcloudClient
-from .ollama_client import OllamaClient
+from .ollama_client import OllamaClient, estimate_memory_mb
 from .llama_client import LlamaServerClient
 
 logging.basicConfig(
@@ -49,7 +49,7 @@ AUTH_CACHE_TTL = config.AUTH_CACHE_TTL
 AUTH_ENABLED = config.AUTH_ENABLED
 
 # Paths that don't require auth
-AUTH_EXEMPT_PATHS = {"/health", "/service-docs"}
+AUTH_EXEMPT_PATHS = {"/health", "/service-docs", "/warm"}
 
 
 class SamcloudAuthMiddleware(BaseHTTPMiddleware):
@@ -212,6 +212,105 @@ async def health():
     return {"status": "ok", "service": "model-service", "models": len(mgr.models)}
 
 
+def _elastic_catalog() -> dict:
+    """The dynamic offering: what we can serve right now given current
+    resource headroom. Shared by /warm and /v1/models so OpenAI SDK
+    discovery and samcloud-native discovery report the same truth.
+    """
+    if not mgr:
+        return {"resident": [], "loadable": [], "blocked": [], "resource_available_mb": None}
+
+    now = time.time()
+    resource_summary = mgr._get_resource_summary() or {}
+    avail = resource_summary.get("available_memory_mb")
+
+    resident = [
+        {
+            "name": name,
+            "backend": mm.backend.value,
+            "memory_mb": mm.memory_mb,
+            "idle_seconds": int(now - mm.last_used),
+            "request_count": mm.request_count,
+        }
+        for name, mm in mgr.models.items()
+    ]
+    resident_names = {r["name"] for r in resident}
+
+    loadable, blocked = [], []
+    try:
+        pulled = mgr.ollama.list_models()
+    except Exception:
+        pulled = []
+    for m in pulled:
+        name = m.get("name", "")
+        if name in resident_names:
+            continue
+        disk_mb = int(m.get("size", 0) / 1024 / 1024)
+        est_mb = max(estimate_memory_mb(name), int(disk_mb * 1.1) + 4000)
+        entry = {"name": name, "backend": "ollama", "estimated_mb": est_mb, "disk_mb": disk_mb}
+        if avail is None or est_mb <= avail:
+            loadable.append(entry)
+        else:
+            entry["short_by_mb"] = est_mb - avail
+            blocked.append(entry)
+
+    return {
+        "resident": resident,
+        "loadable": loadable,
+        "blocked": blocked,
+        "resource_available_mb": avail,
+        "resource_id": config.SC_RESOURCE_ID,
+    }
+
+
+@app.get("/warm")
+async def warm():
+    """Auth-exempt elastic offering. Returns what we can serve right now,
+    broken into resident (already loaded, instant) vs loadable (would fit
+    given current GPU headroom) vs blocked (model too big for what's left).
+
+    The resource_available_mb comes from the samcloud registry — so a
+    sibling tenant taking a big lease shrinks our offering, and freeing
+    that lease widens it back. Consumers use this for dynamic routing.
+    """
+    cat = _elastic_catalog()
+    cat["cooldown_seconds"] = config.COOLDOWN_SECONDS
+    return cat
+
+
+@app.get("/v1/models")
+async def openai_models():
+    """OpenAI-compatible model list — dynamic. Only models that can be
+    served right now (resident or fit in current headroom) appear in
+    `data`. Blocked models are omitted so SDK callers can route by what's
+    actually offered. See /warm for the full breakdown with blocked
+    entries and short_by_mb hints.
+    """
+    cat = _elastic_catalog()
+    now = int(time.time())
+    data = []
+    for r in cat["resident"]:
+        data.append({
+            "id": r["name"],
+            "object": "model",
+            "created": now,
+            "owned_by": r["backend"],
+            "status": "resident",
+            "memory_mb": r["memory_mb"],
+            "idle_seconds": r["idle_seconds"],
+        })
+    for l in cat["loadable"]:
+        data.append({
+            "id": l["name"],
+            "object": "model",
+            "created": now,
+            "owned_by": l["backend"],
+            "status": "loadable",
+            "estimated_mb": l["estimated_mb"],
+        })
+    return {"object": "list", "data": data}
+
+
 @app.get("/service-docs", response_class=JSONResponse)
 async def service_docs():
     """Public service documentation for discovery by agents and consumers.
@@ -319,6 +418,10 @@ async def status():
 
 @app.get("/models")
 async def list_models():
+    """Gateway-native model list: managed (loaded) + pulled (available) +
+    elastic offering (resident / loadable / blocked given current GPU
+    headroom). Use /v1/models for OpenAI-SDK shape, /warm for the
+    elastic offering only."""
     return {
         "managed": {
             name: {
@@ -333,6 +436,7 @@ async def list_models():
         },
         "available_ollama": [m["name"] for m in mgr.ollama.list_models()],
         "available_gguf": mgr.llama.available_models(),
+        "offering": _elastic_catalog(),
     }
 
 
@@ -518,6 +622,8 @@ def _resolve_model(model_name: str):
             try:
                 mm = mgr.load_ollama_model(ollama_name)
                 return mm
+            except InsufficientResource:
+                raise
             except Exception as e:
                 log.error(f"Auto-load failed for {ollama_name}: {e}")
                 return None
@@ -529,6 +635,8 @@ def _resolve_model(model_name: str):
             try:
                 mm = mgr.load_llama_model(m["file"])
                 return mm
+            except InsufficientResource:
+                raise
             except Exception as e:
                 log.error(f"Auto-load failed for {m['name']}: {e}")
                 return None
@@ -538,7 +646,10 @@ def _resolve_model(model_name: str):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest):
-    mm = _resolve_model(req.model)
+    try:
+        mm = _resolve_model(req.model)
+    except InsufficientResource as e:
+        raise HTTPException(status_code=409, detail=str(e))
     if not mm:
         raise HTTPException(status_code=404, detail=f"Model '{req.model}' not available (not pulled or no GGUF file)")
 
@@ -737,7 +848,10 @@ async def chat_completions(req: ChatRequest):
 
 @app.post("/v1/completions")
 async def completions(req: CompletionRequest):
-    mm = _resolve_model(req.model)
+    try:
+        mm = _resolve_model(req.model)
+    except InsufficientResource as e:
+        raise HTTPException(status_code=409, detail=str(e))
     if not mm:
         raise HTTPException(status_code=404, detail=f"Model '{req.model}' not available (not pulled or no GGUF file)")
 

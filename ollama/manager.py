@@ -49,6 +49,12 @@ VLM_MODELS = {
 }
 
 
+class InsufficientResource(Exception):
+    """Raised when the registry can't grant a lease because the resource
+    is over-subscribed. Callers should surface this to the user (HTTP 409)
+    rather than proceeding to load and spilling to CPU."""
+
+
 @dataclass
 class ManagedModel:
     """Tracks a model that's loaded with an active lease."""
@@ -309,6 +315,33 @@ class ModelManager:
                     log.info(f"Actual VRAM for {model_name}: {actual_mb}MB (estimated {memory_mb}MB)")
                 break
 
+        # Reconcile the lease to actual VRAM so other tenants see the truth.
+        # Registry has no PATCH for leases — release + re-request. Brief race
+        # window between calls; same pattern as the renewal loop.
+        # If the registry can't grant the actual size (queued = insufficient
+        # capacity), the model is already loaded but will be spilling — undo
+        # the load and surface the contention to the caller.
+        if lease_id and actual_mb > memory_mb * 1.25:
+            try:
+                self.sc.release_lease(lease_id)
+            except Exception:
+                pass
+            try:
+                lease_id = self._request_lease(model_name, actual_mb)
+                log.info(f"Lease reconciled to actual VRAM: {actual_mb}MB (was {memory_mb}MB)")
+            except InsufficientResource:
+                log.warning(
+                    f"Reconcile found insufficient capacity for {model_name} "
+                    f"({actual_mb}MB); unloading to free GPU"
+                )
+                try:
+                    self.ollama.unload_model(model_name)
+                except Exception:
+                    pass
+                raise
+            except Exception as e:
+                log.warning(f"Lease reconcile failed for {model_name}: {e}")
+
         now = time.time()
         mm = ManagedModel(
             name=model_name,
@@ -388,11 +421,29 @@ class ModelManager:
                 ttl_seconds=LEASE_TTL,
             )
             lease_id = resp.get("id") or resp.get("lease_id")
-            # Validate that the lease has an expiry — reject indefinite leases
+            status = resp.get("status", "active")
+            # The registry queues when memory_mb > available rather than rejecting.
+            # Treat queued as denial for hot-path model loads — we'd rather fail
+            # fast than load and spill to CPU.
+            if status == "queued":
+                queue_pos = resp.get("queue_position")
+                if lease_id:
+                    try:
+                        self.sc.release_lease(str(lease_id))
+                    except Exception:
+                        pass
+                raise InsufficientResource(
+                    f"Resource {RESOURCE_ID} has insufficient capacity for "
+                    f"{model_name} ({memory_mb}MB requested). Lease queued at "
+                    f"position {queue_pos}. Try another provider or wait for "
+                    f"current tenants to release."
+                )
             if resp.get("expires_at") is None:
                 log.warning(f"Lease {lease_id} granted without expiry — will rely on renewal loop to keep it bounded")
-            log.info(f"Lease for {model_name}: {lease_id} ({memory_mb}MB, TTL={LEASE_TTL}s)")
+            log.info(f"Lease for {model_name}: {lease_id} ({memory_mb}MB, TTL={LEASE_TTL}s, status={status})")
             return str(lease_id) if lease_id else None
+        except InsufficientResource:
+            raise
         except Exception as e:
             log.warning(f"Lease request failed for {model_name}: {e}")
             return None

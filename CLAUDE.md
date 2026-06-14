@@ -4,9 +4,9 @@ This is **samcloud-services** — infrastructure for managed model inference on 
 
 ## What This Does
 
-A FastAPI gateway (`ollama/server.py`) that unifies Ollama (MLX) and llama-server (llama.cpp)
-behind an OpenAI-compatible API, with SAMcloud resource leasing for GPU memory management.
-Models spin up on demand, unload after 5 min idle.
+A FastAPI gateway (`ollama/server.py`) that unifies Ollama (MLX), llama-server (llama.cpp)
+and mlx-vlm (vision-language) behind an OpenAI-compatible API, with SAMcloud resource
+leasing for GPU memory management. Models spin up on demand, unload after 5 min idle.
 
 ## SAMcloud Identity
 
@@ -54,6 +54,7 @@ cd ollama && python test_cooldown.py    # Idle unload verification
 - **Actual VRAM** — use `ollama ps` sizes, not file-size estimates
 - **Agents lease, not register** — resource registration is device-daemon territory
 - **Ollama think workaround** — route through native `/api/chat` with `think:false`, translate to OpenAI format ourselves (ticket #69)
+- **On-demand mlx-vlm, gateway-owned** — the gateway starts/stops `mlx_vlm.server` itself (`load_vlm_model` + `match_vlm_model`), rather than adopting a pre-started process. On startup it reaps any stray `mlx_vlm.server`. No boot-order dependency; one VLM per `VLM_PORT`
 - **Three pillars** — SAMcloud provides routing, resources, and auth
 
 ## Current State

@@ -30,7 +30,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional
 
 from . import config
-from .manager import ModelManager, Backend, VLM_PORT
+from .manager import ModelManager, Backend, VLM_PORT, match_vlm_model
 from .samcloud import SamcloudClient
 from .ollama_client import OllamaClient
 from .llama_client import LlamaServerClient
@@ -339,7 +339,11 @@ async def list_models():
 @app.post("/models/load")
 async def load_model(req: LoadRequest):
     try:
-        if req.backend == "llama-server" or (
+        if req.backend == "mlx-vlm" or (
+            req.backend == "auto" and match_vlm_model(req.model)
+        ):
+            mm = mgr.load_vlm_model(req.model)
+        elif req.backend == "llama-server" or (
             req.backend == "auto" and req.model.endswith(".gguf")
         ):
             # Resolve to full path if just a filename
@@ -372,7 +376,13 @@ async def load_model(req: LoadRequest):
 
 @app.post("/models/unload")
 async def unload_model(req: UnloadRequest):
-    result = mgr.unload(req.model, force=req.force)
+    # Accept the same partial names as /models/load and inference: exact key
+    # first, then case-insensitive substring match against loaded models.
+    key = req.model
+    if key not in mgr.models:
+        lower = req.model.lower()
+        key = next((n for n in mgr.models if lower in n.lower()), req.model)
+    result = mgr.unload(key, force=req.force)
     if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail=f"{req.model} not found")
     return result
@@ -509,6 +519,16 @@ def _resolve_model(model_name: str):
         return mgr.models[matched_name]
 
     # Model not loaded — try to auto-load it transparently.
+
+    # Vision-language models: the gateway owns the mlx-vlm process on demand.
+    if match_vlm_model(model_name):
+        log.info(f"Auto-loading VLM (requested: {model_name})")
+        try:
+            return mgr.load_vlm_model(model_name)
+        except Exception as e:
+            log.error(f"VLM auto-load failed for {model_name}: {e}")
+            return None
+
     # Check if it's a known Ollama model (already pulled).
     lower = model_name.lower()
     for m in mgr.ollama.list_models():

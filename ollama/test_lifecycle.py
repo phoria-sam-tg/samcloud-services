@@ -77,7 +77,6 @@ def main():
         resource_id=RESOURCE_ID,
         service_id=SERVICE_ID,
         memory_mb=memory_mb,
-        purpose=f"model:{TEST_MODEL}",
         ttl_seconds=600,
     )
     status_code = lease.pop("status_code", 0)

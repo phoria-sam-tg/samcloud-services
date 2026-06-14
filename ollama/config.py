@@ -61,3 +61,9 @@ LLAMA_SERVER_BIN = _env(
     shutil.which("llama-server") or "/opt/homebrew/bin/llama-server",
 )
 VLM_PORT = _env_int("VLM_PORT", 8801)
+VLM_HOST = _env("VLM_HOST", "127.0.0.1")
+VLM_PYTHON = _env(
+    "VLM_PYTHON",
+    str(Path.home() / "code" / "mlx-vlm-server" / ".venv" / "bin" / "python"),
+)
+VLM_STARTUP_TIMEOUT = _env_int("VLM_STARTUP_TIMEOUT", 120)

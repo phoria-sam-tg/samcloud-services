@@ -2,6 +2,23 @@
 
 Project history and current state. This is a living document.
 
+## 2026-06-14 — On-demand mlx-vlm + lease fix
+
+- **mlx-vlm is now gateway-owned and on-demand.** Added `load_vlm_model` (spawns
+  `python -m mlx_vlm.server`, leases, tracks the process), `match_vlm_model`, and
+  VLM branches in `unload`/`ensure_running`. A cold VLM request now spins the
+  server up (~7s) instead of 404ing. Routing wired in `_resolve_model` and
+  `/models/load` (+ `auto` detection); `/models/unload` resolves partial names.
+- **No more adoption / boot-order for VLM.** `discover()` no longer adopts a
+  running mlx-vlm; instead `_kill_stray_vlm()` reaps any stray `mlx_vlm.server` on
+  startup so the gateway always owns the process. mlx-vlm dropped from reboot order.
+- **Lease `purpose` field removed.** Registry now rejects it (`422 extra_forbidden`);
+  `request_lease` and callers updated. Leasing was previously failing for all paths.
+- VLM config (`VLM_PYTHON`, `VLM_HOST`, `VLM_PORT`, `VLM_STARTUP_TIMEOUT`) in `config.py`.
+- **Known follow-up:** on-demand ollama loads still lease an *estimate* (e.g. 2500 MB
+  for a ~20 GB model) — the "wider leasing" reconcile-to-actual work (overlaps PR #2)
+  should extend to the VLM path too.
+
 ## Current State (2026-04-06)
 
 ### Services Running on slice-test (M1 Max, 64GB)

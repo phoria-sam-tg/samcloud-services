@@ -16,6 +16,9 @@ Lifecycle:
 """
 
 import asyncio
+import os
+import signal
+import subprocess
 import time
 import logging
 from dataclasses import dataclass, field
@@ -43,10 +46,31 @@ class Backend(str, Enum):
     VLM = "mlx-vlm"
 
 VLM_PORT = config.VLM_PORT
+VLM_HOST = config.VLM_HOST
+VLM_PYTHON = config.VLM_PYTHON
+VLM_STARTUP_TIMEOUT = config.VLM_STARTUP_TIMEOUT
 VLM_MODELS = {
     "gemma-4": {"default": "mlx-community/gemma-4-31b-it-nvfp4", "memory_mb": 18700},
     "qwen2.5-vl": {"default": "mlx-community/Qwen2.5-VL-7B-Instruct-4bit", "memory_mb": 5700},
 }
+VLM_DEFAULT_MEMORY_MB = 18700
+
+
+def match_vlm_model(model_name: str):
+    """Map a requested name to a known VLM. Returns (resolved_id, memory_mb) or None.
+
+    Used by both the load path and the gateway's auto-load resolver to decide
+    whether a request should be served by an mlx-vlm process.
+    """
+    lower = model_name.lower()
+    for prefix, info in VLM_MODELS.items():
+        default = info["default"].lower()
+        if prefix in lower or lower in default or default in lower:
+            return info["default"], info["memory_mb"]
+    # Heuristic fallback for vision-language model names we don't have pinned.
+    if "-vl" in lower or "vlm" in lower or "vision" in lower:
+        return model_name, VLM_DEFAULT_MEMORY_MB
+    return None
 
 
 @dataclass
@@ -62,6 +86,7 @@ class ManagedModel:
     request_count: int = 0
     managed: bool = True  # False = pre-existing process we adopted
     llama_instance: Optional[LlamaInstance] = field(default=None, repr=False)
+    vlm_process: Optional[subprocess.Popen] = field(default=None, repr=False)
 
 
 @dataclass
@@ -138,35 +163,11 @@ class ModelManager:
                 adopted.append(mm)
                 log.info(f"Adopted Ollama model: {name} (~{mm.memory_mb}MB)")
 
-        # Discover mlx-vlm models
-        try:
-            import httpx
-            r = httpx.get(f"http://localhost:{VLM_PORT}/health", timeout=5)
-            if r.status_code == 200:
-                health = r.json()
-                loaded = health.get("loaded_model")
-                if loaded and loaded not in self.models:
-                    # Estimate memory from known VLM models
-                    mem = 18700  # default
-                    for prefix, info in VLM_MODELS.items():
-                        if prefix in loaded.lower():
-                            mem = info["memory_mb"]
-                            break
-                    mm = ManagedModel(
-                        name=loaded,
-                        backend=Backend.VLM,
-                        memory_mb=mem,
-                        lease_id=None,
-                        port=VLM_PORT,
-                        loaded_at=time.time(),
-                        last_used=time.time(),
-                        managed=False,
-                    )
-                    self.models[loaded] = mm
-                    adopted.append(mm)
-                    log.info(f"Adopted VLM model: {loaded} (~{mem}MB)")
-        except Exception as e:
-            log.info(f"No VLM server detected on port {VLM_PORT}: {e}")
+        # mlx-vlm is NOT adopted: the gateway owns its lifecycle and spins it
+        # up on demand (see load_vlm_model). Any mlx-vlm left running from a
+        # previous gateway is a stray — kill it so we always start from a clean,
+        # owned state and never route to a process we can't tear down.
+        self._kill_stray_vlm()
 
         return adopted
 
@@ -181,7 +182,6 @@ class ModelManager:
                     resource_id=RESOURCE_ID,
                     service_id=SERVICE_ID,
                     memory_mb=mm.memory_mb,
-                    purpose=f"model:{name}",
                     ttl_seconds=LEASE_TTL,
                 )
                 lease_id = lease_resp.get("id") or lease_resp.get("lease_id")
@@ -376,6 +376,132 @@ class ModelManager:
         self.models[name] = mm
         return mm
 
+    # -- mlx-vlm model operations --
+
+    def _kill_stray_vlm(self):
+        """Terminate any mlx-vlm server process the gateway doesn't own.
+
+        Frees VLM_PORT and guarantees we never route to an un-owned process.
+        Processes we currently track (managed VLMs) are left alone.
+        """
+        owned = {
+            mm.vlm_process.pid
+            for mm in self.models.values()
+            if mm.backend == Backend.VLM and mm.vlm_process
+        }
+        try:
+            out = subprocess.run(
+                ["pgrep", "-f", "mlx_vlm.server"],
+                capture_output=True, text=True,
+            )
+        except Exception as e:
+            log.warning(f"Could not scan for stray mlx-vlm processes: {e}")
+            return
+        for line in out.stdout.split():
+            try:
+                pid = int(line)
+            except ValueError:
+                continue
+            if pid in owned or pid == os.getpid():
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                log.info(f"Killed stray mlx-vlm process {pid}")
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                log.warning(f"Failed to kill stray mlx-vlm process {pid}: {e}")
+
+    def load_vlm_model(self, model_name: str) -> ManagedModel:
+        """Start an mlx-vlm server for a vision-language model on demand.
+
+        The gateway owns the process: it spawns mlx_vlm.server, leases memory,
+        and tears both down on cooldown/unload. Only one VLM runs at a time on
+        VLM_PORT — a request for a different VLM swaps the current one out.
+        """
+        import httpx
+
+        match = match_vlm_model(model_name)
+        if match is None:
+            raise RuntimeError(f"{model_name} is not a recognised mlx-vlm model")
+        resolved, memory_mb = match
+
+        if resolved in self.models:
+            mm = self.models[resolved]
+            mm.last_used = time.time()
+            mm.request_count += 1
+            return mm
+
+        # Single VLM per port — evict any other VLM first.
+        for existing, mm in list(self.models.items()):
+            if mm.backend == Backend.VLM:
+                log.info(f"Unloading VLM {existing} to make room for {resolved}")
+                self.unload(existing, force=True)
+
+        # Ensure the port is clear of any un-owned process.
+        self._kill_stray_vlm()
+
+        lease_id = self._request_lease(resolved, memory_mb)
+
+        log.info(f"Starting mlx-vlm server for {resolved} on {VLM_HOST}:{VLM_PORT}...")
+        proc = subprocess.Popen(
+            [
+                VLM_PYTHON, "-m", "mlx_vlm.server",
+                "--model", resolved,
+                "--port", str(VLM_PORT),
+                "--host", VLM_HOST,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        base = f"http://{VLM_HOST}:{VLM_PORT}"
+        ready = False
+        for _ in range(VLM_STARTUP_TIMEOUT):
+            if proc.poll() is not None:
+                self._release_lease_quietly(lease_id)
+                raise RuntimeError(
+                    f"mlx-vlm server for {resolved} exited early (code {proc.returncode})"
+                )
+            try:
+                if httpx.get(f"{base}/health", timeout=2).status_code == 200:
+                    ready = True
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+
+        if not ready:
+            proc.terminate()
+            self._release_lease_quietly(lease_id)
+            raise RuntimeError(
+                f"mlx-vlm server for {resolved} did not become healthy in {VLM_STARTUP_TIMEOUT}s"
+            )
+
+        now = time.time()
+        mm = ManagedModel(
+            name=resolved,
+            backend=Backend.VLM,
+            memory_mb=memory_mb,
+            lease_id=lease_id,
+            port=VLM_PORT,
+            loaded_at=now,
+            last_used=now,
+            request_count=1,
+            managed=True,
+            vlm_process=proc,
+        )
+        self.models[resolved] = mm
+        return mm
+
+    def _release_lease_quietly(self, lease_id: Optional[str]):
+        if not lease_id:
+            return
+        try:
+            self.sc.release_lease(lease_id)
+        except Exception as e:
+            log.warning(f"Lease release error: {e}")
+
     # -- Common operations --
 
     def _request_lease(self, model_name: str, memory_mb: int) -> Optional[str]:
@@ -384,7 +510,6 @@ class ModelManager:
                 resource_id=RESOURCE_ID,
                 service_id=SERVICE_ID,
                 memory_mb=memory_mb,
-                purpose=f"model:{model_name}",
                 ttl_seconds=LEASE_TTL,
             )
             lease_id = resp.get("id") or resp.get("lease_id")
@@ -408,6 +533,19 @@ class ModelManager:
         if model_name not in self.models:
             return False
         mm = self.models[model_name]
+        if mm.backend == Backend.VLM:
+            # Restart our mlx-vlm process if it died.
+            if mm.managed and mm.vlm_process and mm.vlm_process.poll() is not None:
+                log.warning(f"mlx-vlm process for {mm.name} died — restarting")
+                name = mm.name
+                del self.models[name]
+                try:
+                    self.load_vlm_model(name)
+                    return True
+                except Exception as e:
+                    log.error(f"Failed to restart mlx-vlm for {name}: {e}")
+                    return False
+            return True
         if mm.backend != Backend.OLLAMA:
             return True  # llama-server managed separately
         # Check if Ollama still has it loaded
@@ -444,6 +582,19 @@ class ModelManager:
         elif mm.backend == Backend.LLAMA:
             result = self.llama.stop(mm.port)
             log.info(f"Stopped llama-server: {result}")
+        elif mm.backend == Backend.VLM:
+            if mm.vlm_process:
+                try:
+                    mm.vlm_process.terminate()
+                    try:
+                        mm.vlm_process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        mm.vlm_process.kill()
+                    log.info(f"Stopped mlx-vlm server for {mm.name}")
+                except Exception as e:
+                    log.warning(f"mlx-vlm stop error: {e}")
+            else:
+                self._kill_stray_vlm()
 
         # Release lease
         if mm.lease_id:

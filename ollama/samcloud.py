@@ -51,7 +51,6 @@ class SamcloudClient:
         resource_id: str,
         service_id: str,
         memory_mb: int,
-        purpose: str = "model-serving",
         ttl_seconds: int = 3600,
     ) -> dict:
         """Request a memory lease. Returns 201 granted, 202 queued, 409 conflict."""
@@ -60,7 +59,6 @@ class SamcloudClient:
             json={
                 "service_id": service_id,
                 "memory_mb": memory_mb,
-                "purpose": purpose,
                 "ttl_seconds": ttl_seconds,
             },
         )

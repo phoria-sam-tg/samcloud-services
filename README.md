@@ -109,7 +109,7 @@ Model names use **case-insensitive partial matching**:
 }
 ```
 
-`backend`: `"auto"` (default), `"ollama"`, or `"llama-server"`. Auto selects llama-server for `.gguf` files, Ollama for everything else.
+`backend`: `"auto"` (default), `"ollama"`, `"llama-server"`, or `"mlx-vlm"`. Auto selects llama-server for `.gguf` files, mlx-vlm for recognised vision-language model names (e.g. `qwen2.5-vl`, `gemma-4`), and Ollama for everything else.
 
 ### Chat Request Body
 
@@ -144,11 +144,15 @@ Model names use **case-insensitive partial matching**:
     │  │  GET  /models  /status  /health        │  │
     │  └──────────┬─────────────────────┬───────┘  │
     │             │                     │          │
-    │  ┌──────────┴──────┐  ┌──────────┴───────┐  │
-    │  │ Ollama :11434   │  │ llama-server     │  │
-    │  │ MLX backend     │  │ llama.cpp Metal  │  │
-    │  └─────────────────┘  └──────────────────┘  │
+    │  ┌────────────┐ ┌────────────┐ ┌──────────┐ │
+    │  │ Ollama     │ │ llama-srv  │ │ mlx-vlm  │ │
+    │  │ :11434 MLX │ │ llama.cpp  │ │ :8801 VL │ │
+    │  └────────────┘ └────────────┘ └──────────┘ │
     └──────────────────────────────────────────────┘
+
+All three backends spin up on demand and are torn down on idle cooldown.
+The gateway **owns** each backend process it starts (mlx-vlm included) — it
+is not pre-started out of band, and there is no boot-order dependency.
 ```
 
 ## Model Lifecycle
@@ -174,13 +178,22 @@ Request arrives
 
 ### Environment Variables
 
+All defaults are env-driven via `ollama/config.py` and target the production
+samcloud registry + the `claude-services-slice` device.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SC_TOKEN` | — | SAMcloud agent token (**required**) |
+| `SC_BASE` | `https://cloud.samtg.xyz/api/v1` | SAMcloud registry base URL |
+| `SC_DEVICE` | `claude-services-slice` | Device identity |
 | `SERVICE_PORT` | `8800` | Server listen port |
-| `SC_VERIFY_URL` | `https://stg.samtg.xyz:9443/api/v1/auth/verify` | SAMcloud auth endpoint |
-| `SC_REQUIRED_SCOPE` | `device:slice-test` | Required scope for callers |
+| `SC_VERIFY_URL` | `${SC_BASE}/auth/verify` | SAMcloud auth endpoint |
+| `SC_REQUIRED_SCOPE` | `device:${SC_DEVICE}` | Required scope for callers |
 | `AUTH_ENABLED` | `true` | Set `false` to disable auth (development only) |
+| `VLM_PYTHON` | `~/code/mlx-vlm-server/.venv/bin/python` | Python that runs `mlx_vlm.server` |
+| `VLM_HOST` | `127.0.0.1` | Host the on-demand mlx-vlm server binds |
+| `VLM_PORT` | `8801` | Port for the on-demand mlx-vlm server |
+| `VLM_STARTUP_TIMEOUT` | `120` | Seconds to wait for mlx-vlm to become healthy |
 
 ### Tuning (manager.py constants)
 
@@ -212,6 +225,15 @@ The service integrates with SAMcloud across three pillars:
 - llama.cpp with Metal GPU acceleration
 - Full GPU offloading, flash attention, quantised KV cache
 - GGUF models from a configurable directory
+
+### mlx-vlm (vision-language)
+
+- Apple MLX vision-language models (Qwen2.5-VL, Gemma 4, etc.)
+- The gateway starts `mlx_vlm.server` on demand, leases GPU memory, and stops
+  it on idle cooldown — it owns the process end to end (no adoption, no
+  boot-order pre-start). On startup any stray `mlx_vlm.server` is reaped so the
+  gateway always begins from a clean owned state.
+- Configured via `VLM_PYTHON` / `VLM_HOST` / `VLM_PORT` (see Configuration)
 
 ## Project Structure
 

@@ -2,6 +2,27 @@
 
 Project history and current state. This is a living document.
 
+## 2026-07-02 — Stage-1 capacity offering (flex tier) on wafer
+
+- **`offering:<tier>` self-report (doc #8 Stage 1, ticket #135).** The gateway now
+  advertises one of `offering:full | degraded | mini | none` as a `capabilities`
+  entry, recomputed every `OFFERING_POLL_SECONDS` (30s) and PATCHed on change so
+  the fleet map reflects live capacity. New `offering_loop` / `_compute_offering`
+  / `_apply_offering` in `manager.py`; config knobs in `config.py`
+  (`OFFERING_ENABLED`, `_POLL_SECONDS`, `_HYSTERESIS`, `_MINI_MB`, `_DEGRADED_MB`,
+  `_FULL_MB`). First reading publishes immediately; later changes require the new
+  tier to hold `OFFERING_HYSTERESIS` (2) consecutive polls to avoid flapping.
+- **Signal = LOCAL unified-memory availability** (`_collect_stats()`'s
+  vm_stat/sysctl `total - used`), *not* the registry's lease-based
+  `available_memory_mb`. Reason: the gateway runs under a service token, which is
+  scope-filtered out of resource reads (`GET /resources/{id}` → 403, dashboard/
+  leases return empty). On a unified-memory Mac real memory pressure is the truer
+  "can I serve a model" signal anyway, and it also captures training that spikes
+  memory without holding a formal lease. Verified end-to-end: full → degraded
+  under ~9 GB pressure, restore to full on release, with hysteresis.
+- **Good-citizen flex** for the wafer box shared with brush splat training: the
+  tier drops as memory fills (training running) and restores when it frees.
+
 ## 2026-06-14 — On-demand mlx-vlm + lease fix
 
 - **mlx-vlm is now gateway-owned and on-demand.** Added `load_vlm_model` (spawns

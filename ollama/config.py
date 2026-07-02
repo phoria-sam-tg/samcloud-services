@@ -53,6 +53,27 @@ LEASE_TTL = _env_int("LEASE_TTL", 3600)
 LEASE_RENEW_AT = float(_env("LEASE_RENEW_AT", "0.5"))
 OLLAMA_KEEP_ALIVE = _env_int("OLLAMA_KEEP_ALIVE", -1)
 
+# --- Stage-1 capacity offering (doc #8) ---
+# The service self-reports a coarse offering tier as an `offering:<tier>`
+# capability, recomputed from live pressure and updated via PATCH on change.
+# Good-citizen flex on a laptop shared with brush splat training: drop the tier
+# as unified memory fills (training running), restore when it frees.
+#
+# Signal: LOCAL unified-memory availability (memory_total - memory_used from
+# vm_stat/sysctl, same collector as the stats loop). We compute from local
+# memory rather than the registry's lease-based available_memory_mb because the
+# gateway runs under a service token, which is scope-filtered out of resource
+# reads (GET /resources/{id} -> 403). On a unified-memory Mac real memory
+# pressure is in any case the truer "can I serve a model" signal, and it also
+# captures training that spikes memory without holding a formal lease.
+# Thresholds are available-MB, ascending: none < mini < degraded < full.
+OFFERING_ENABLED = _env_bool("OFFERING_ENABLED", True)
+OFFERING_POLL_SECONDS = _env_int("OFFERING_POLL_SECONDS", 30)
+OFFERING_HYSTERESIS = _env_int("OFFERING_HYSTERESIS", 2)  # stable polls before a tier change
+OFFERING_MINI_MB = _env_int("OFFERING_MINI_MB", 3500)      # avail < this -> none (qwen3:1.7b ~3.3GB won't fit)
+OFFERING_DEGRADED_MB = _env_int("OFFERING_DEGRADED_MB", 6000)  # [mini,degraded) -> mini (tight, mini model only)
+OFFERING_FULL_MB = _env_int("OFFERING_FULL_MB", 10000)     # >= this -> full; [degraded,full) -> degraded
+
 # --- backends ---
 OLLAMA_BASE = _env("OLLAMA_BASE", "http://localhost:11434")
 MODELS_DIR = Path(_env("MODELS_DIR", str(Path.home() / "models")))

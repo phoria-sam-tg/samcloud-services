@@ -30,7 +30,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional
 
 from . import config
-from .manager import ModelManager, Backend, VLM_PORT, match_vlm_model
+from .manager import ModelManager, Backend, VLM_PORT, match_vlm_model, match_gguf_model
 from .samcloud import SamcloudClient
 from .ollama_client import OllamaClient
 from .llama_client import LlamaServerClient
@@ -339,16 +339,26 @@ async def list_models():
 @app.post("/models/load")
 async def load_model(req: LoadRequest):
     try:
+        # Only probe for a GGUF match when the backend could plausibly be
+        # llama-server, so an explicit backend="ollama" still bypasses it.
+        gguf_match = None
+        if req.backend in ("auto", "llama-server"):
+            gguf_match = match_gguf_model(req.model, mgr.llama.available_models())
+
         if req.backend == "mlx-vlm" or (
             req.backend == "auto" and match_vlm_model(req.model)
         ):
             mm = mgr.load_vlm_model(req.model)
-        elif req.backend == "llama-server" or (
+        elif req.backend == "llama-server" or gguf_match or (
             req.backend == "auto" and req.model.endswith(".gguf")
         ):
-            # Resolve to full path if just a filename
-            model_path = req.model
-            if not model_path.startswith("/"):
+            # Resolve to full path: known GGUF match, absolute path, or a
+            # filename relative to MODELS_DIR.
+            if gguf_match:
+                model_path = gguf_match["file"]
+            elif req.model.startswith("/"):
+                model_path = req.model
+            else:
                 model_path = str(config.MODELS_DIR / req.model)
             mm = mgr.load_llama_model(
                 model_path,
@@ -576,6 +586,19 @@ async def chat_completions(req: ChatRequest):
         ollama_kwargs = {}
         if req.tools:
             ollama_kwargs["tools"] = req.tools
+        # think:false — this is the documented #69 decision but was never wired
+        # in. Without it a reasoning model (qwen3.5) spends unbounded, *uncounted*
+        # tokens on a thinking phase that we then discard (we only surface
+        # message.content), which both wastes the inference slot for minutes
+        # (the #97 hang) and starves any num_predict budget below. Disable it so
+        # tokens go to the content we actually return.
+        ollama_kwargs["think"] = False
+        # Bound generation length: Ollama takes this under options.num_predict,
+        # not the OpenAI-style top-level max_tokens. Without this an unbounded
+        # generation can occupy the single inference slot for minutes and starve
+        # every other route (ticket #97).
+        if req.max_tokens is not None:
+            ollama_kwargs["options"] = {"num_predict": req.max_tokens}
 
         if req.stream:
             async def stream():

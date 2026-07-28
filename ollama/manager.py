@@ -73,6 +73,22 @@ def match_vlm_model(model_name: str):
     return None
 
 
+def match_gguf_model(model_name: str, available: list[dict]):
+    """Map a requested short name to a known local GGUF file.
+
+    `available` is LlamaServerClient.available_models() — the caller passes
+    it in so this stays a pure function like match_vlm_model. Lets
+    /models/load and the auto-load resolver accept "agi" instead of the
+    exact qwen2.5-32b-agi-q4_k_m.gguf filename.
+    """
+    lower = model_name.lower()
+    for m in available:
+        name = m["name"].lower()
+        if lower in name or name in lower:
+            return m
+    return None
+
+
 @dataclass
 class ManagedModel:
     """Tracks a model that's loaded with an active lease."""
@@ -143,12 +159,18 @@ class ModelManager:
             name = m.get("name", "unknown")
             size_mb = int(m.get("size", 0) / 1024 / 1024)
             if name not in self.models:
-                # Pin the model so Ollama doesn't unload it on its own timer
+                # Re-apply the configured keep_alive so the model honours the
+                # idle timer (OLLAMA_KEEP_ALIVE). Previously this pinned -1 and
+                # marked the model managed=False, which exempted it from cooldown
+                # (check_cooldowns / unload both skip non-managed) — so an
+                # on-demand load became stuck in memory forever and was re-pinned
+                # on every restart. Adopt it as a managed Ollama model instead so
+                # the cooldown loop can spin it back down when idle (ticket #97).
                 try:
                     self.ollama.load_model(name, keep_alive=OLLAMA_KEEP_ALIVE)
-                    log.info(f"Pinned Ollama model {name} (keep_alive={OLLAMA_KEEP_ALIVE})")
+                    log.info(f"Re-applied keep_alive={OLLAMA_KEEP_ALIVE} to adopted Ollama model {name}")
                 except Exception as e:
-                    log.warning(f"Failed to pin {name}: {e}")
+                    log.warning(f"Failed to set keep_alive on {name}: {e}")
                 mm = ManagedModel(
                     name=name,
                     backend=Backend.OLLAMA,
@@ -157,7 +179,7 @@ class ModelManager:
                     port=11434,
                     loaded_at=time.time(),
                     last_used=time.time(),
-                    managed=False,
+                    managed=True,
                 )
                 self.models[name] = mm
                 adopted.append(mm)

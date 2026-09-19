@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional
 
+from . import capacity
 from . import config
 from .manager import ModelManager, Backend, VLM_PORT, match_vlm_model, match_gguf_model
 from .samcloud import SamcloudClient
@@ -336,6 +337,16 @@ async def list_models():
     }
 
 
+def _capacity_503(e: "capacity.InsufficientCapacity") -> HTTPException:
+    """A refusal is an answer, not a fault — 503 with the numbers to retry on.
+
+    Every load path funnels through here so a caller cannot tell the three
+    backends apart by how they decline.
+    """
+    log.info(f"Refused on capacity: {e}")
+    return HTTPException(status_code=503, detail=e.as_dict())
+
+
 @app.post("/models/load")
 async def load_model(req: LoadRequest):
     try:
@@ -377,6 +388,8 @@ async def load_model(req: LoadRequest):
             "memory_mb": mm.memory_mb,
             "lease_id": mm.lease_id,
         }
+    except capacity.InsufficientCapacity as e:
+        raise _capacity_503(e)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
@@ -548,6 +561,10 @@ def _resolve_model(model_name: str):
             try:
                 mm = mgr.load_ollama_model(ollama_name)
                 return mm
+            except capacity.InsufficientCapacity as e:
+                # Not a missing model — a capacity answer. Surface it, with the
+                # list of what does fit, instead of collapsing to "not pulled".
+                raise _capacity_503(e)
             except Exception as e:
                 log.error(f"Auto-load failed for {ollama_name}: {e}")
                 return None
@@ -559,6 +576,10 @@ def _resolve_model(model_name: str):
             try:
                 mm = mgr.load_llama_model(m["file"])
                 return mm
+            except capacity.InsufficientCapacity as e:
+                # Not a missing model — a capacity answer. Surface it, with the
+                # list of what does fit, instead of collapsing to "not pulled".
+                raise _capacity_503(e)
             except Exception as e:
                 log.error(f"Auto-load failed for {m['name']}: {e}")
                 return None

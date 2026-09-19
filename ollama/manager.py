@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from . import capacity
 from . import config
 from .ollama_client import OllamaClient, estimate_memory_mb
 from .llama_client import LlamaServerClient, LlamaInstance
@@ -284,6 +285,24 @@ class ModelManager:
 
     # -- Ollama model operations --
 
+    def catalogue_mb(self) -> dict:
+        """Every local Ollama model mapped to its weight size in MB.
+
+        The fit decision and the advertised offering both derive from this, so
+        `offering:full` keeps meaning "the biggest model we hold fits" even as
+        the catalogue changes — fixed MB bands go stale the moment it does.
+        """
+        out = {}
+        try:
+            for m in self.ollama.list_models():
+                name = m.get("name", "")
+                size = int(m.get("size", 0))
+                if name and size:
+                    out[name] = round(size / 1024 / 1024)
+        except Exception as e:
+            log.warning(f"Could not read model catalogue: {e}")
+        return out
+
     def load_ollama_model(self, model_name: str) -> ManagedModel:
         """Load an Ollama model with lease management."""
         if model_name in self.models:
@@ -292,18 +311,50 @@ class ModelManager:
             mm.request_count += 1
             return mm
 
-        memory_mb = estimate_memory_mb(model_name)
 
-        # Unload other Ollama models first to prevent Ollama from
-        # silently evicting them (Ollama evicts to fit new models,
-        # ignoring keep_alive). We explicitly unload + release leases.
-        ollama_models = [
-            name for name, mm in self.models.items()
-            if mm.backend == Backend.OLLAMA
-        ]
-        for existing in ollama_models:
-            log.info(f"Unloading {existing} to make room for {model_name}")
-            self.unload(existing, force=True)
+        # Fit against what this box can hand over WITHOUT swapping, instead of
+        # evicting whatever is resident to force-fit the ask. The contract is
+        # "20GB used by us, 5GB left, so I can offer the small model" — the
+        # caller picks from what fits rather than us making room by force.
+        # Ollama would otherwise silently evict to fit, ignoring keep_alive.
+        need_mb = self.ollama.memory_estimate_mb(model_name)
+        avail_mb = capacity.collect().get("memory_available_mb", 0)
+
+        if not capacity.fits(need_mb, avail_mb):
+            resident = [
+                name for name, mm in self.models.items()
+                if mm.backend == Backend.OLLAMA
+            ]
+            reclaimable = sum(self.models[n].memory_mb or 0 for n in resident)
+            if config.AUTO_EVICT and capacity.fits(need_mb, avail_mb + reclaimable):
+                for existing in resident:
+                    log.info(f"Unloading {existing} to make room for {model_name}")
+                    self.unload(existing, force=True)
+            else:
+                fitting = capacity.servable(self.catalogue_mb(), avail_mb)
+                detail = (
+                    f"{model_name} needs ~{need_mb}MB, but only "
+                    f"{capacity.usable_mb(avail_mb)}MB is on offer "
+                    f"({int(capacity.USABLE_FRACTION * 100)}% of the {avail_mb}MB "
+                    f"free right now)"
+                )
+                if resident:
+                    detail += (
+                        f" ({reclaimable}MB held by {', '.join(resident)}, "
+                        f"released on idle)"
+                    )
+                detail += (
+                    f". Fits right now: {', '.join(fitting)}" if fitting
+                    else ". Nothing in the catalogue fits right now."
+                )
+                log.info(f"Refusing load: {detail}")
+                raise capacity.InsufficientCapacity(
+                    detail,
+                    need_mb=need_mb,
+                    usable_mb=capacity.usable_mb(avail_mb),
+                    available_mb=avail_mb,
+                    fits_now=fitting,
+                )
 
         # Pull if needed
         local = [m["name"] for m in self.ollama.list_models()]
@@ -313,6 +364,10 @@ class ModelManager:
                 s = progress.get("status", "")
                 if s == "success":
                     log.info(f"Pull complete: {model_name}")
+
+        # Re-read the size now the weights are local — the gate above may
+        # have run against a name-guess for a model we had not pulled yet.
+        memory_mb = self.ollama.memory_estimate_mb(model_name)
 
         # Request lease
         lease_id = self._request_lease(model_name, memory_mb)

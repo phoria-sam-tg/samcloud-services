@@ -17,6 +17,7 @@ Lifecycle:
 
 import asyncio
 import os
+import re
 import signal
 import subprocess
 import time
@@ -114,6 +115,9 @@ class ModelManager:
     models: dict[str, ManagedModel] = field(default_factory=dict)
     _cooldown_task: Optional[asyncio.Task] = field(default=None, repr=False)
     _health_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    _stats_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    _offering_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    _offering_tier: Optional[str] = field(default=None, repr=False)
 
     def discover(self) -> list[ManagedModel]:
         """Discover and adopt already-running model processes.
@@ -723,6 +727,137 @@ class ModelManager:
                 log.warning(f"Health report error: {e}")
             await asyncio.sleep(60)
 
+    def _collect_stats(self) -> dict:
+        """Best-effort unified-memory stats for the Metal resource.
+
+        Apple Silicon has no discrete VRAM — the GPU and CPU share one pool of
+        unified memory — so we report system memory pressure as the resource
+        gauge. GPU compute % needs `powermetrics` (root), which this headless
+        service can't run, so it is omitted (memory-only, by design).
+        """
+        stats: dict = {}
+        try:
+            out = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                stats["memory_total_mb"] = int(int(out.stdout.strip()) / (1024 * 1024))
+        except Exception:
+            pass
+        try:
+            vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5)
+            if vm.returncode == 0:
+                page_size = 4096
+                m = re.search(r"page size of (\d+) bytes", vm.stdout)
+                if m:
+                    page_size = int(m.group(1))
+
+                def _pages(label: str) -> int:
+                    mm = re.search(rf"{label}:\s+(\d+)\.", vm.stdout)
+                    return int(mm.group(1)) if mm else 0
+
+                # "Used" ≈ App (active) + Wired + Compressed — matches what
+                # Activity Monitor calls Memory Used; excludes free/cached.
+                used_pages = (
+                    _pages("Pages active")
+                    + _pages("Pages wired down")
+                    + _pages("Pages occupied by compressor")
+                )
+                stats["memory_used_mb"] = int(used_pages * page_size / (1024 * 1024))
+        except Exception:
+            pass
+        return stats
+
+    async def stats_loop(self):
+        """Push unified-memory stats to the SAMcloud resource every 15s.
+
+        The slice reference gateway does not report stats, so its gpu-0 shows
+        `last_stats: never` and the dashboard reads NaN. Wafer improves on the
+        reference by keeping the resource's utilisation fresh and online.
+        """
+        while True:
+            try:
+                stats = self._collect_stats()
+                if stats:
+                    self.sc.push_stats(RESOURCE_ID, stats)
+            except Exception as e:
+                log.warning(f"Stats push error: {e}")
+            await asyncio.sleep(15)
+
+    def _compute_offering(self) -> Optional[str]:
+        """Coarse offering tier from live LOCAL unified-memory pressure (doc #8 Stage 1).
+
+        Good-citizen flex for wafer (mini-tier box shared with brush splat
+        training). Uses `_collect_stats()` (vm_stat/sysctl) — no registry scope
+        needed — because the service token is filtered out of resource reads.
+        `avail = memory_total - memory_used`; tiers ascending:
+          - avail < OFFERING_MINI_MB     -> `none`     (mini model won't fit)
+          - avail < OFFERING_DEGRADED_MB -> `mini`     (tight; only the mini model)
+          - avail < OFFERING_FULL_MB     -> `degraded` (some headroom)
+          - avail >= OFFERING_FULL_MB    -> `full`     (plenty free)
+        Returns None if memory can't be read (leave the tier unchanged).
+        """
+        stats = self._collect_stats()
+        used = stats.get("memory_used_mb")
+        total = stats.get("memory_total_mb")
+        if used is None or total is None:
+            return None
+        avail = total - used
+        if avail < config.OFFERING_MINI_MB:
+            return "none"
+        if avail < config.OFFERING_DEGRADED_MB:
+            return "mini"
+        if avail < config.OFFERING_FULL_MB:
+            return "degraded"
+        return "full"
+
+    def _apply_offering(self, tier: str):
+        """Publish the tier as an `offering:<tier>` capability (replacing any prior
+        offering:* entry, preserving all other capabilities). PATCH emits a
+        service.updated event, satisfying doc #8's 'emit on tier change'."""
+        try:
+            svc = self.sc.get_service(SERVICE_ID)
+            caps = [
+                c for c in (svc.get("capabilities") or [])
+                if not str(c).startswith("offering:")
+            ]
+            caps.append(f"offering:{tier}")
+            self.sc.update_service(SERVICE_ID, capabilities=caps)
+            log.info(f"Offering tier {self._offering_tier} -> {tier} (capabilities now {caps})")
+            self._offering_tier = tier
+        except Exception as e:
+            log.warning(f"Failed to apply offering:{tier}: {e}")
+
+    async def offering_loop(self):
+        """Stage-1 capacity offering (doc #8): recompute the offering tier from
+        live resource pressure and advertise it via the service's capabilities.
+        The first reading is published immediately; subsequent changes require the
+        new tier to hold for OFFERING_HYSTERESIS consecutive polls to avoid
+        flapping on transient spikes."""
+        pending: Optional[str] = None
+        pending_count = 0
+        while True:
+            try:
+                tier = self._compute_offering()
+                if tier is not None:
+                    if self._offering_tier is None:
+                        # First advertisement — no hysteresis wait.
+                        self._apply_offering(tier)
+                        pending, pending_count = None, 0
+                    elif tier == self._offering_tier:
+                        pending, pending_count = None, 0
+                    elif tier == pending:
+                        pending_count += 1
+                        if pending_count >= config.OFFERING_HYSTERESIS:
+                            self._apply_offering(tier)
+                            pending, pending_count = None, 0
+                    else:
+                        pending, pending_count = tier, 1
+            except Exception as e:
+                log.warning(f"Offering loop error: {e}")
+            await asyncio.sleep(config.OFFERING_POLL_SECONDS)
+
     async def lease_renewal_loop(self):
         """Renew leases before they expire. Runs every LEASE_TTL * LEASE_RENEW_AT seconds."""
         interval = int(LEASE_TTL * LEASE_RENEW_AT)
@@ -752,7 +887,11 @@ class ModelManager:
         if self._health_task is None or self._health_task.done():
             self._health_task = asyncio.create_task(self.health_loop())
         self._renewal_task = asyncio.create_task(self.lease_renewal_loop())
-        log.info("Background tasks started (cooldown, health, lease renewal)")
+        if self._stats_task is None or self._stats_task.done():
+            self._stats_task = asyncio.create_task(self.stats_loop())
+        if config.OFFERING_ENABLED and (self._offering_task is None or self._offering_task.done()):
+            self._offering_task = asyncio.create_task(self.offering_loop())
+        log.info("Background tasks started (cooldown, health, lease renewal, stats, offering)")
 
     def shutdown(self) -> list[dict]:
         """Release all leases. Only stop processes we started (managed=True)."""
@@ -768,7 +907,7 @@ class ModelManager:
                     results.append({"model": name, "status": "lease_released", "process": "kept"})
                 except Exception:
                     pass
-        for task in [self._cooldown_task, self._health_task, getattr(self, '_renewal_task', None)]:
+        for task in [self._cooldown_task, self._health_task, getattr(self, '_renewal_task', None), self._stats_task, self._offering_task]:
             if task and not task.done():
                 task.cancel()
         return results

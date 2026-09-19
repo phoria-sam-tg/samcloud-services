@@ -728,89 +728,63 @@ class ModelManager:
             await asyncio.sleep(60)
 
     def _collect_stats(self) -> dict:
-        """Best-effort unified-memory stats for the Metal resource.
+        """Canonical capacity reading — see ollama/capacity.py.
 
-        Apple Silicon has no discrete VRAM — the GPU and CPU share one pool of
-        unified memory — so we report system memory pressure as the resource
-        gauge. GPU compute % needs `powermetrics` (root), which this headless
-        service can't run, so it is omitted (memory-only, by design).
+        Was a local vm_stat parse reporting total and used only. Two things
+        were wrong with it: it assumed 4KiB pages on a machine that uses 16KiB,
+        under-reporting memory by 4x; and "used" counts pages the compressor is
+        merely sitting on, so it read 22.7GiB used on a 36GiB box whose entire
+        process RSS was ~3.9GiB. The number that answers "will this load swap"
+        is memory_available_mb (free + inactive + speculative), which only the
+        shared collector reports.
         """
-        stats: dict = {}
         try:
-            out = subprocess.run(
-                ["sysctl", "-n", "hw.memsize"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if out.returncode == 0 and out.stdout.strip():
-                stats["memory_total_mb"] = int(int(out.stdout.strip()) / (1024 * 1024))
-        except Exception:
-            pass
-        try:
-            vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5)
-            if vm.returncode == 0:
-                page_size = 4096
-                m = re.search(r"page size of (\d+) bytes", vm.stdout)
-                if m:
-                    page_size = int(m.group(1))
-
-                def _pages(label: str) -> int:
-                    mm = re.search(rf"{label}:\s+(\d+)\.", vm.stdout)
-                    return int(mm.group(1)) if mm else 0
-
-                # "Used" ≈ App (active) + Wired + Compressed — matches what
-                # Activity Monitor calls Memory Used; excludes free/cached.
-                used_pages = (
-                    _pages("Pages active")
-                    + _pages("Pages wired down")
-                    + _pages("Pages occupied by compressor")
-                )
-                stats["memory_used_mb"] = int(used_pages * page_size / (1024 * 1024))
-        except Exception:
-            pass
-        return stats
+            return capacity.collect()
+        except Exception as e:
+            log.warning(f"Capacity read failed: {e}")
+            return {}
 
     async def stats_loop(self):
-        """Push unified-memory stats to the SAMcloud resource every 15s.
+        """Push unified-memory stats to this box's SAMcloud resource every 15s.
 
-        The slice reference gateway does not report stats, so its gpu-0 shows
-        `last_stats: never` and the dashboard reads NaN. Wafer improves on the
-        reference by keeping the resource's utilisation fresh and online.
+        Without it a resource shows `last_stats: never` and the dashboard reads
+        NaN. The reading is the full `capacity.collect()`; `registry_payload()`
+        narrows it to the keys the registry's strict ResourceStats model will
+        accept, because memory_available_mb — the whole point of the collector —
+        is not yet on the wire and an unknown key 422s the push.
         """
         while True:
             try:
                 stats = self._collect_stats()
                 if stats:
-                    self.sc.push_stats(RESOURCE_ID, stats)
+                    self.sc.push_stats(RESOURCE_ID, capacity.registry_payload(stats))
             except Exception as e:
                 log.warning(f"Stats push error: {e}")
             await asyncio.sleep(15)
 
     def _compute_offering(self) -> Optional[str]:
-        """Coarse offering tier from live LOCAL unified-memory pressure (doc #8 Stage 1).
+        """Offering tier derived from what actually fits (doc #8 Stage 1).
 
-        Good-citizen flex for wafer (mini-tier box shared with brush splat
-        training). Uses `_collect_stats()` (vm_stat/sysctl) — no registry scope
-        needed — because the service token is filtered out of resource reads.
-        `avail = memory_total - memory_used`; tiers ascending:
-          - avail < OFFERING_MINI_MB     -> `none`     (mini model won't fit)
-          - avail < OFFERING_DEGRADED_MB -> `mini`     (tight; only the mini model)
-          - avail < OFFERING_FULL_MB     -> `degraded` (some headroom)
-          - avail >= OFFERING_FULL_MB    -> `full`     (plenty free)
-        Returns None if memory can't be read (leave the tier unchanged).
+        Good-citizen flex on a box shared with other work: the tier drops as
+        unified memory fills and restores when it frees, so a caller reading
+        the registry is told what this box can really serve right now.
+
+        Was fixed MB bands over `total - used`. Both halves were wrong: `used`
+        counts reclaimable compressed pages, and the bands were calibrated when
+        the largest model was ~6GB — so wafer advertised `offering:full` on
+        ~14GiB available while a 17.5GB model could not load without swapping.
+        Deriving the tier from the catalogue keeps `full` meaning "the big one
+        fits" as models come and go, and needs no per-box threshold tuning.
+        Returns None if memory cannot be read, leaving the tier unchanged.
         """
-        stats = self._collect_stats()
-        used = stats.get("memory_used_mb")
-        total = stats.get("memory_total_mb")
-        if used is None or total is None:
+        try:
+            avail = capacity.collect().get("memory_available_mb")
+            if avail is None:
+                return None
+            return capacity.offering_tier(self.catalogue_mb(), avail)
+        except Exception as e:
+            log.warning(f"Offering computation failed: {e}")
             return None
-        avail = total - used
-        if avail < config.OFFERING_MINI_MB:
-            return "none"
-        if avail < config.OFFERING_DEGRADED_MB:
-            return "mini"
-        if avail < config.OFFERING_FULL_MB:
-            return "degraded"
-        return "full"
 
     def _apply_offering(self, tier: str):
         """Publish the tier as an `offering:<tier>` capability (replacing any prior

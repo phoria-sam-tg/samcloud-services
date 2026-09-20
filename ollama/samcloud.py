@@ -96,7 +96,10 @@ class SamcloudClient:
             body = {}
         if not isinstance(body, dict):
             body = {"detail": body}
-        return {"status_code": r.status_code, **body}
+        # `status_code` last: the HTTP status is the load-bearing half of this
+        # return value, and a body field of the same name must not shadow it.
+        # A 409 read as a 200 is the exact failure this function exists to stop.
+        return {**body, "status_code": r.status_code}
 
     def release_lease(self, lease_id: str) -> dict:
         r = self._http.delete(f"/leases/{lease_id}")

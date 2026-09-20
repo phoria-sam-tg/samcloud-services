@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from ollama.manager import ModelManager, Backend            # noqa: E402
 from ollama.exo_client import ExoClient, ExoUnavailable     # noqa: E402
 from ollama import capacity, config                         # noqa: E402
+from ollama.samcloud import SamcloudClient                  # noqa: E402
 
 
 def mgr() -> "ModelManager":
@@ -885,6 +886,38 @@ def test_concurrent_tier_resolves_lose_no_count():
     expected = threads * per_thread
     check(f"no counts lost across {threads} threads (expected {expected})",
           slow._count, expected)
+
+
+def test_status_code_is_not_shadowed_by_the_body():
+    """The HTTP status must win over a body field of the same name.
+
+    `request_lease` returns `{"status_code": ..., **body}`. Merged in that
+    order a body carrying its own `status_code` silently replaces the real
+    HTTP status, and a 409 conflict read as a 200 grant is precisely the
+    two-consumers-in-one-pool failure this module exists to prevent. No
+    registry response observed on 2026-09-20 carries the field, so this is
+    a guard rather than a repair — but the cost of being wrong is the whole
+    bug, and the cost of the guard is a dict ordering.
+    """
+    sc = SamcloudClient.__new__(SamcloudClient)
+    sc._http = MagicMock()
+    resp = MagicMock()
+    resp.status_code = 409
+    resp.json.return_value = {
+        "detail": "resource is held", "status_code": 200,
+        "held_by": "wafer-services/model-service",
+    }
+    sc._http.post.return_value = resp
+
+    out = sc.request_lease("claude-services-slice/exo-pool", exclusive=True)
+    check("HTTP 409 survives a body status_code=200", out["status_code"], 409)
+    check("body fields still present", out["held_by"],
+          "wafer-services/model-service")
+
+    # And the verdict built from it must still decline.
+    m = mgr()
+    o = m._lease_outcome(out)
+    check("shadowed conflict still declines", o.granted, False)
 
 
 if __name__ == "__main__":

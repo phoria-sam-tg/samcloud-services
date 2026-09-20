@@ -17,7 +17,6 @@ Lifecycle:
 
 import asyncio
 import os
-import re
 import signal
 import subprocess
 import time

@@ -1,0 +1,810 @@
+"""
+Model Service - FastAPI server
+
+Unified management for all model backends (Ollama + llama-server) on slice-test.
+Handles SAMcloud resource leasing, model lifecycle, and health reporting.
+
+Endpoints:
+  GET  /health              - Health check
+  GET  /status              - Full status (all backends, models, leases, resources)
+  GET  /models              - List all managed + available models
+  POST /models/load         - Load a model (Ollama or llama-server)
+  POST /models/unload       - Unload a model (releases lease)
+  POST /v1/chat/completions - OpenAI-compatible chat (routes to correct backend)
+  POST /v1/completions      - OpenAI-compatible completion
+"""
+
+import asyncio
+import os
+import json
+import time
+import hashlib
+import logging
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+from typing import Optional
+
+from . import config
+from .manager import ModelManager, Backend, VLM_PORT, match_vlm_model
+from .samcloud import SamcloudClient
+from .ollama_client import OllamaClient
+from .llama_client import LlamaServerClient
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
+log = logging.getLogger("model-service")
+
+SC_TOKEN = config.SC_TOKEN
+SERVICE_PORT = config.SERVICE_PORT
+SC_VERIFY_URL = config.SC_VERIFY_URL
+SC_REQUIRED_SCOPE = config.SC_REQUIRED_SCOPE
+AUTH_CACHE_TTL = config.AUTH_CACHE_TTL
+AUTH_ENABLED = config.AUTH_ENABLED
+
+# Paths that don't require auth
+AUTH_EXEMPT_PATHS = {"/health", "/service-docs"}
+
+
+class SamcloudAuthMiddleware(BaseHTTPMiddleware):
+    """Verify caller identity via SAMcloud token verification.
+
+    Forwards the caller's Bearer token to SAMcloud GET /auth/verify,
+    caches results for AUTH_CACHE_TTL seconds, and rejects
+    unauthenticated or out-of-scope requests.
+    """
+
+    def __init__(self, app, verify_url: str, required_scope: str):
+        super().__init__(app)
+        self.verify_url = verify_url
+        self.required_scope = required_scope
+        self._cache: dict[str, tuple[float, dict]] = {}  # token_hash -> (expiry, identity)
+
+    def _cache_key(self, token: str) -> str:
+        return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+    def _get_cached(self, token: str) -> Optional[dict]:
+        key = self._cache_key(token)
+        entry = self._cache.get(key)
+        if entry and entry[0] > time.time():
+            return entry[1]
+        if entry:
+            del self._cache[key]
+        return None
+
+    def _set_cached(self, token: str, identity: dict):
+        key = self._cache_key(token)
+        self._cache[key] = (time.time() + AUTH_CACHE_TTL, identity)
+
+    async def dispatch(self, request: Request, call_next):
+        if not AUTH_ENABLED or request.url.path in AUTH_EXEMPT_PATHS:
+            return await call_next(request)
+
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Missing Authorization: Bearer <token>"},
+            )
+
+        token = auth_header  # Forward full "Bearer xxx" header
+
+        # Check cache
+        cached = self._get_cached(token)
+        if cached:
+            request.state.caller = cached
+            return await call_next(request)
+
+        # Verify with SAMcloud
+        try:
+            url = self.verify_url
+            if self.required_scope:
+                url += f"?scope={self.required_scope}"
+            async with httpx.AsyncClient(verify=False, timeout=10) as client:
+                resp = await client.get(url, headers={"Authorization": token})
+        except Exception as e:
+            log.warning(f"SAMcloud verify failed: {e}")
+            return JSONResponse(
+                status_code=502,
+                content={"detail": "Auth service unavailable"},
+            )
+
+        if resp.status_code == 401:
+            return JSONResponse(status_code=401, content={"detail": "Invalid token"})
+        if resp.status_code == 403:
+            return JSONResponse(status_code=403, content={"detail": "Token valid but out of scope"})
+        if resp.status_code != 200:
+            return JSONResponse(
+                status_code=502,
+                content={"detail": f"Auth service returned {resp.status_code}"},
+            )
+
+        identity = resp.json()
+        self._set_cached(token, identity)
+        request.state.caller = identity
+        log.info(f"Verified caller: {identity.get('username')} ({identity.get('role')})")
+
+        return await call_next(request)
+
+mgr: Optional[ModelManager] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global mgr
+    sc = SamcloudClient(token=SC_TOKEN)
+    mgr = ModelManager(sc=sc)
+
+    # Discover and adopt running models
+    adopted = mgr.discover()
+    for m in adopted:
+        log.info(f"Adopted: {m.name} ({m.backend.value}) ~{m.memory_mb}MB on port {m.port}")
+
+    # Claim leases for everything running
+    leases = mgr.claim_leases()
+    for l in leases:
+        log.info(f"Lease: {l}")
+
+    mgr.start_background_tasks()
+    log.info(f"Model Service ready - managing {len(mgr.models)} models")
+
+    yield
+
+    log.info("Shutting down...")
+    results = mgr.shutdown()
+    for r in results:
+        log.info(f"  {r}")
+
+
+app = FastAPI(
+    title="Model Service",
+    description="Unified model serving with SAMcloud resource leasing",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    SamcloudAuthMiddleware,
+    verify_url=SC_VERIFY_URL,
+    required_scope=SC_REQUIRED_SCOPE,
+)
+
+
+# -- Request models --
+
+class LoadRequest(BaseModel):
+    model: str
+    backend: str = "auto"  # "ollama", "llama-server", or "auto"
+    port: int = 8000  # for llama-server
+    ctx_size: int = 12288
+    gpu_layers: int = 99
+
+class UnloadRequest(BaseModel):
+    model: str
+    force: bool = False
+
+class ChatRequest(BaseModel):
+    model: str
+    messages: list[dict]
+    stream: bool = True
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    tools: Optional[list[dict]] = None
+    tool_choice: Optional[str | dict] = None
+
+class CompletionRequest(BaseModel):
+    model: str
+    prompt: str
+    stream: bool = True
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+
+
+# -- Endpoints --
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "model-service", "models": len(mgr.models)}
+
+
+@app.get("/service-docs", response_class=JSONResponse)
+async def service_docs():
+    """Public service documentation for discovery by agents and consumers.
+    Returns structured docs with a full markdown guide based on the repo README."""
+    loaded = {}
+    if mgr:
+        loaded = {
+            name: {
+                "backend": mm.backend.value,
+                "memory_mb": mm.memory_mb,
+            }
+            for name, mm in mgr.models.items()
+        }
+
+    # Read the repo docs for the full guide
+    guide_md = ""
+    docs_path = os.path.join(os.path.dirname(__file__), "README.md")
+    try:
+        with open(docs_path) as f:
+            guide_md = f.read()
+    except FileNotFoundError:
+        guide_md = "(docs not found on disk)"
+
+    return {
+        "name": config.SC_SERVICE_NAME,
+        "description": (
+            f"Unified inference gateway for {config.SC_DEVICE}. "
+            "Wraps Ollama (MLX) and llama-server (llama.cpp Metal) behind "
+            "a single OpenAI-compatible API. Manages GPU memory via SAMcloud "
+            "resource leasing — models spin up on demand and unload after 5 min idle. "
+            "Requires SAMcloud token (Bearer) for authenticated access."
+        ),
+        "auth": {
+            "method": "SAMcloud token verification",
+            "header": "Authorization: Bearer <your-sc-token>",
+            "required_scope": SC_REQUIRED_SCOPE,
+            "exempt_paths": list(AUTH_EXEMPT_PATHS),
+        },
+        "endpoints": {
+            "POST /v1/chat/completions": {
+                "description": "OpenAI-compatible chat completion",
+                "auth": True,
+                "body": {"model": "<name>", "messages": [{"role": "user", "content": "..."}], "stream": True},
+                "notes": "Model name uses partial matching (e.g. 'qwen3-32b' matches 'Qwen3-32B-Q6_K')",
+            },
+            "POST /v1/completions": {
+                "description": "OpenAI-compatible text completion",
+                "auth": True,
+                "body": {"model": "<name>", "prompt": "...", "stream": True},
+            },
+            "GET /models": {
+                "description": "List managed and available models",
+                "auth": True,
+            },
+            "GET /status": {
+                "description": "Full status — backends, models, leases, resource utilisation",
+                "auth": True,
+            },
+            "POST /models/load": {
+                "description": "Load a model (pulls if needed, requests GPU lease)",
+                "auth": True,
+                "body": {"model": "<name>", "backend": "auto|ollama|llama-server"},
+            },
+            "POST /models/unload": {
+                "description": "Unload a model (releases GPU lease)",
+                "auth": True,
+                "body": {"model": "<name>", "force": False},
+            },
+            "GET /health": {
+                "description": "Health check",
+                "auth": False,
+            },
+            "GET /service-docs": {
+                "description": "This endpoint — public service documentation",
+                "auth": False,
+            },
+        },
+        "backends": {
+            "ollama": {
+                "version": "0.19.0",
+                "features": ["mlx", "apple-silicon", "flash-attention"],
+                "port": 11434,
+            },
+            "llama-server": {
+                "version": "b8500",
+                "features": ["metal", "flash-attention", "quantized-kv-cache"],
+                "port": 8000,
+            },
+        },
+        "loaded_models": loaded,
+        "model_matching": "Case-insensitive partial match. Use 'qwen3-32b' or 'qwen3.5' as shortnames.",
+        "samcloud": {
+            "service_id": config.SC_SERVICE_ID,
+            "resource": config.SC_RESOURCE_ID,
+            "device": config.SC_DEVICE,
+        },
+        "guide": guide_md,
+    }
+
+
+@app.get("/status")
+async def status():
+    return mgr.status()
+
+
+@app.get("/models")
+async def list_models():
+    return {
+        "managed": {
+            name: {
+                "backend": mm.backend.value,
+                "port": mm.port,
+                "memory_mb": mm.memory_mb,
+                "lease_id": mm.lease_id,
+                "idle_seconds": int(time.time() - mm.last_used),
+                "request_count": mm.request_count,
+            }
+            for name, mm in mgr.models.items()
+        },
+        "available_ollama": [m["name"] for m in mgr.ollama.list_models()],
+        "available_gguf": mgr.llama.available_models(),
+    }
+
+
+@app.post("/models/load")
+async def load_model(req: LoadRequest):
+    try:
+        if req.backend == "mlx-vlm" or (
+            req.backend == "auto" and match_vlm_model(req.model)
+        ):
+            mm = mgr.load_vlm_model(req.model)
+        elif req.backend == "llama-server" or (
+            req.backend == "auto" and req.model.endswith(".gguf")
+        ):
+            # Resolve to full path if just a filename
+            model_path = req.model
+            if not model_path.startswith("/"):
+                model_path = str(config.MODELS_DIR / req.model)
+            mm = mgr.load_llama_model(
+                model_path,
+                port=req.port,
+                ctx_size=req.ctx_size,
+                gpu_layers=req.gpu_layers,
+            )
+        else:
+            mm = mgr.load_ollama_model(req.model)
+
+        return {
+            "status": "loaded",
+            "model": mm.name,
+            "backend": mm.backend.value,
+            "port": mm.port,
+            "memory_mb": mm.memory_mb,
+            "lease_id": mm.lease_id,
+        }
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        log.exception(f"Failed to load {req.model}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/models/unload")
+async def unload_model(req: UnloadRequest):
+    # Accept the same partial names as /models/load and inference: exact key
+    # first, then case-insensitive substring match against loaded models.
+    key = req.model
+    if key not in mgr.models:
+        lower = req.model.lower()
+        key = next((n for n in mgr.models if lower in n.lower()), req.model)
+    result = mgr.unload(key, force=req.force)
+    if result["status"] == "not_found":
+        raise HTTPException(status_code=404, detail=f"{req.model} not found")
+    return result
+
+
+def _fix_tool_calls(tool_calls: list[dict]) -> list[dict]:
+    """Convert Ollama tool_calls to OpenAI format.
+    Ollama returns arguments as a JSON object; OpenAI SDK expects a JSON string."""
+    fixed = []
+    for tc in tool_calls:
+        fc = dict(tc)
+        if "function" in fc:
+            fn = dict(fc["function"])
+            if isinstance(fn.get("arguments"), dict):
+                fn["arguments"] = json.dumps(fn["arguments"])
+            fn.pop("index", None)  # Ollama includes index, OpenAI doesn't
+            fc["function"] = fn
+        if "type" not in fc:
+            fc["type"] = "function"
+        fixed.append(fc)
+    return fixed
+
+
+import re
+
+# Gemma 4 tool call format:
+#   <|tool_call>call:func_name{key:<|"|">value<|"|">, key2:<|"|">value2<|"|">}<tool_call|>
+_GEMMA_TC_RE = re.compile(
+    r'<\|tool_call>call:(\w+)\{(.*?)\}<tool_call\|>',
+    re.DOTALL,
+)
+_GEMMA_ARG_RE = re.compile(
+    r'(\w+):\s*<\|"\|">(.*?)<\|"\|">',
+)
+_CALL_COUNTER = 0
+
+
+def _parse_gemma_tool_calls(content: str) -> tuple[str, list[dict]]:
+    """Parse Gemma 4 tool call tags from content into structured tool_calls.
+    Returns (remaining_content, tool_calls)."""
+    global _CALL_COUNTER
+    tool_calls = []
+    for match in _GEMMA_TC_RE.finditer(content):
+        func_name = match.group(1)
+        args_str = match.group(2)
+        arguments = {}
+        for arg_match in _GEMMA_ARG_RE.finditer(args_str):
+            arguments[arg_match.group(1)] = arg_match.group(2)
+        _CALL_COUNTER += 1
+        tool_calls.append({
+            "id": f"call_gemma_{_CALL_COUNTER}",
+            "type": "function",
+            "function": {
+                "name": func_name,
+                "arguments": json.dumps(arguments),
+            },
+        })
+    # Strip tool call tags from content
+    remaining = _GEMMA_TC_RE.sub("", content).strip()
+    return remaining, tool_calls
+
+
+def _tools_to_gemma_system(tools: list[dict]) -> str:
+    """Convert OpenAI tools array to a system prompt for Gemma 4."""
+    lines = ["You have access to the following tools:\n"]
+    for tool in tools:
+        fn = tool.get("function", {})
+        name = fn.get("name", "")
+        desc = fn.get("description", "")
+        params = fn.get("parameters", {}).get("properties", {})
+        required = fn.get("parameters", {}).get("required", [])
+        param_parts = []
+        for pname, pinfo in params.items():
+            req = " (required)" if pname in required else ""
+            param_parts.append(f"{pname}: {pinfo.get('type', 'string')}{req}")
+        lines.append(f"- {name}: {desc}. Parameters: {{{', '.join(param_parts)}}}")
+    lines.append("")
+    lines.append('When you need to use a tool, output EXACTLY this format:')
+    lines.append('<|tool_call>call:function_name{param:<|"|">value<|"|">}<tool_call|>')
+    lines.append("")
+    lines.append("Do not wrap tool calls in markdown. Call tools directly.")
+    return "\n".join(lines)
+
+
+def _openai_messages_to_ollama(messages: list[dict]) -> list[dict]:
+    """Convert OpenAI-format messages to Ollama native format.
+    Key differences:
+    - tool_calls arguments: OpenAI=string, Ollama=object
+    - tool messages: OpenAI has tool_call_id, Ollama doesn't use it
+    """
+    converted = []
+    for msg in messages:
+        m = dict(msg)
+        # Convert tool_calls arguments from string to object
+        if "tool_calls" in m and m["tool_calls"]:
+            fixed_tcs = []
+            for tc in m["tool_calls"]:
+                tc = dict(tc)
+                if "function" in tc:
+                    fn = dict(tc["function"])
+                    if isinstance(fn.get("arguments"), str):
+                        try:
+                            fn["arguments"] = json.loads(fn["arguments"])
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    fn.pop("index", None)
+                    tc["function"] = fn
+                tc.pop("type", None)
+                tc.pop("id", None)
+                fixed_tcs.append(tc)
+            m["tool_calls"] = fixed_tcs
+        # Strip tool_call_id from tool messages (Ollama doesn't use it)
+        m.pop("tool_call_id", None)
+        converted.append(m)
+    return converted
+
+
+def _resolve_model(model_name: str):
+    """Find a managed model, or auto-load it. Never returns None for known models."""
+    # Check already-loaded models (exact then partial match)
+    matched_name = None
+    if model_name in mgr.models:
+        matched_name = model_name
+    else:
+        lower = model_name.lower()
+        for name in mgr.models:
+            if lower in name.lower():
+                matched_name = name
+                break
+
+    if matched_name:
+        mgr.ensure_running(matched_name)
+        mgr.touch(matched_name)
+        return mgr.models[matched_name]
+
+    # Model not loaded — try to auto-load it transparently.
+
+    # Vision-language models: the gateway owns the mlx-vlm process on demand.
+    if match_vlm_model(model_name):
+        log.info(f"Auto-loading VLM (requested: {model_name})")
+        try:
+            return mgr.load_vlm_model(model_name)
+        except Exception as e:
+            log.error(f"VLM auto-load failed for {model_name}: {e}")
+            return None
+
+    # Check if it's a known Ollama model (already pulled).
+    lower = model_name.lower()
+    for m in mgr.ollama.list_models():
+        ollama_name = m["name"]
+        if lower in ollama_name.lower() or ollama_name.lower() in lower:
+            log.info(f"Auto-loading {ollama_name} (requested: {model_name})")
+            try:
+                mm = mgr.load_ollama_model(ollama_name)
+                return mm
+            except Exception as e:
+                log.error(f"Auto-load failed for {ollama_name}: {e}")
+                return None
+
+    # Check GGUF files
+    for m in mgr.llama.available_models():
+        if lower in m["name"].lower():
+            log.info(f"Auto-loading {m['file']} (requested: {model_name})")
+            try:
+                mm = mgr.load_llama_model(m["file"])
+                return mm
+            except Exception as e:
+                log.error(f"Auto-load failed for {m['name']}: {e}")
+                return None
+
+    return None
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ChatRequest):
+    mm = _resolve_model(req.model)
+    if not mm:
+        raise HTTPException(status_code=404, detail=f"Model '{req.model}' not available (not pulled or no GGUF file)")
+
+    if mm.backend == Backend.OLLAMA:
+        # Route to Ollama native /api/chat with think:false to avoid
+        # the Ollama 0.19 bug where /v1/ ignores think parameter and
+        # returns empty content with all output in reasoning field.
+        # We translate the native response to OpenAI format ourselves.
+        # Pass tools through for structured tool_call support.
+        # Route through native /api/chat (not /v1/) to avoid the Ollama bug
+        # where /v1/ puts content in the reasoning field. Via /api/chat,
+        # content is populated correctly alongside thinking.
+        # Convert OpenAI-format messages to Ollama native format.
+        ollama_messages = _openai_messages_to_ollama(req.messages)
+        ollama_kwargs = {}
+        if req.tools:
+            ollama_kwargs["tools"] = req.tools
+
+        if req.stream:
+            async def stream():
+                saw_tool_calls = False
+                try:
+                    async for chunk in mgr.ollama.chat_stream(mm.name, ollama_messages, **ollama_kwargs):
+                        delta = {}
+                        if "message" in chunk and chunk["message"].get("content"):
+                            delta["content"] = chunk["message"]["content"]
+                        if "message" in chunk and chunk["message"].get("tool_calls"):
+                            delta["tool_calls"] = _fix_tool_calls(chunk["message"]["tool_calls"])
+                            saw_tool_calls = True
+                        if chunk.get("done"):
+                            finish = "tool_calls" if saw_tool_calls else "stop"
+                            yield "data: " + json.dumps({
+                                "choices": [{"delta": {}, "finish_reason": finish}]
+                            }) + "\n\n"
+                            yield "data: [DONE]\n\n"
+                        elif delta:
+                            yield "data: " + json.dumps({
+                                "choices": [{"delta": delta, "finish_reason": None}],
+                                "model": mm.name,
+                            }) + "\n\n"
+                except asyncio.CancelledError:
+                    log.info(f"Client disconnected during stream for {mm.name}")
+                except Exception as e:
+                    log.warning(f"Stream error for {mm.name}: {e}")
+            return StreamingResponse(stream(), media_type="text/event-stream")
+        else:
+            # Non-streaming: collect full response via native API
+            full_content = ""
+            tool_calls = None
+            usage = {}
+            for chunk in mgr.ollama.chat(mm.name, ollama_messages, **ollama_kwargs):
+                if "message" in chunk:
+                    full_content += chunk["message"].get("content", "")
+                    if chunk["message"].get("tool_calls"):
+                        tool_calls = chunk["message"]["tool_calls"]
+                if chunk.get("done"):
+                    usage = {
+                        "prompt_tokens": chunk.get("prompt_eval_count", 0),
+                        "completion_tokens": chunk.get("eval_count", 0),
+                        "total_tokens": (chunk.get("prompt_eval_count", 0) +
+                                         chunk.get("eval_count", 0)),
+                    }
+            message = {"role": "assistant", "content": full_content}
+            if tool_calls:
+                message["tool_calls"] = _fix_tool_calls(tool_calls)
+            finish_reason = "tool_calls" if tool_calls else "stop"
+            return {
+                "choices": [{
+                    "message": message,
+                    "finish_reason": finish_reason,
+                    "index": 0,
+                }],
+                "model": mm.name,
+                "usage": usage,
+            }
+
+    elif mm.backend == Backend.LLAMA:
+        # Forward to llama-server's OpenAI-compatible endpoint
+        payload = {
+            "model": mm.name,
+            "messages": req.messages,
+            "stream": req.stream,
+        }
+        if req.temperature is not None:
+            payload["temperature"] = req.temperature
+        if req.max_tokens is not None:
+            payload["max_tokens"] = req.max_tokens
+        if req.tools:
+            payload["tools"] = req.tools
+        if req.tool_choice is not None:
+            payload["tool_choice"] = req.tool_choice
+
+        if req.stream:
+            async def stream():
+                async with httpx.AsyncClient() as client:
+                    async with client.stream(
+                        "POST",
+                        f"http://127.0.0.1:{mm.port}/v1/chat/completions",
+                        json=payload,
+                        timeout=None,
+                    ) as resp:
+                        async for line in resp.aiter_lines():
+                            if line:
+                                yield line + "\n"
+            return StreamingResponse(stream(), media_type="text/event-stream")
+        else:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"http://127.0.0.1:{mm.port}/v1/chat/completions",
+                    json=payload,
+                    timeout=300,
+                )
+                return resp.json()
+
+    elif mm.backend == Backend.VLM:
+        # Forward to mlx-vlm. mlx-vlm doesn't handle tools natively,
+        # so we inject tools into the system prompt and parse Gemma 4's
+        # tool call tags from the response content.
+        messages = list(req.messages)
+        if req.tools:
+            tool_system = _tools_to_gemma_system(req.tools)
+            # Prepend or merge with existing system message
+            if messages and messages[0].get("role") == "system":
+                messages[0] = dict(messages[0])
+                messages[0]["content"] = tool_system + "\n\n" + messages[0]["content"]
+            else:
+                messages.insert(0, {"role": "system", "content": tool_system})
+
+        payload = {
+            "model": mm.name,
+            "messages": messages,
+            "stream": req.stream,
+        }
+        if req.temperature is not None:
+            payload["temperature"] = req.temperature
+        if req.max_tokens is not None:
+            payload["max_tokens"] = req.max_tokens
+
+        if req.stream:
+            # For streaming with tools, collect full response then parse
+            # (Gemma tool calls come as a single chunk, not incremental)
+            if req.tools:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        f"http://127.0.0.1:{mm.port}/v1/chat/completions",
+                        json={**payload, "stream": False},
+                        timeout=300,
+                    )
+                    data = resp.json()
+                    content = data["choices"][0]["message"].get("content", "")
+                    remaining, tool_calls = _parse_gemma_tool_calls(content)
+                    message = {"role": "assistant", "content": remaining}
+                    if tool_calls:
+                        message["tool_calls"] = tool_calls
+                    finish = "tool_calls" if tool_calls else "stop"
+                    # Emit as a single SSE event
+                    async def single_event():
+                        yield "data: " + json.dumps({
+                            "choices": [{"delta": message, "finish_reason": finish}],
+                            "model": mm.name,
+                            "usage": data.get("usage", {}),
+                        }) + "\n\n"
+                        yield "data: [DONE]\n\n"
+                    return StreamingResponse(single_event(), media_type="text/event-stream")
+            else:
+                async def stream():
+                    async with httpx.AsyncClient() as client:
+                        async with client.stream(
+                            "POST",
+                            f"http://127.0.0.1:{mm.port}/v1/chat/completions",
+                            json=payload,
+                            timeout=None,
+                        ) as resp:
+                            async for line in resp.aiter_lines():
+                                if line:
+                                    yield line + "\n"
+                return StreamingResponse(stream(), media_type="text/event-stream")
+        else:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"http://127.0.0.1:{mm.port}/v1/chat/completions",
+                    json=payload,
+                    timeout=300,
+                )
+                data = resp.json()
+                # Parse Gemma tool calls from content
+                if req.tools:
+                    content = data["choices"][0]["message"].get("content", "")
+                    remaining, tool_calls = _parse_gemma_tool_calls(content)
+                    data["choices"][0]["message"]["content"] = remaining
+                    if tool_calls:
+                        data["choices"][0]["message"]["tool_calls"] = tool_calls
+                        data["choices"][0]["finish_reason"] = "tool_calls"
+                return data
+
+
+@app.post("/v1/completions")
+async def completions(req: CompletionRequest):
+    mm = _resolve_model(req.model)
+    if not mm:
+        raise HTTPException(status_code=404, detail=f"Model '{req.model}' not available (not pulled or no GGUF file)")
+
+    if mm.backend == Backend.OLLAMA:
+        if req.stream:
+            def stream():
+                for chunk in mgr.ollama.generate(mm.name, req.prompt):
+                    yield json.dumps(chunk) + "\n"
+            return StreamingResponse(stream(), media_type="application/x-ndjson")
+        else:
+            chunks = list(mgr.ollama.generate(mm.name, req.prompt))
+            return chunks[-1] if chunks else {}
+
+    elif mm.backend == Backend.LLAMA:
+        payload = {
+            "model": mm.name,
+            "prompt": req.prompt,
+            "stream": req.stream,
+        }
+        if req.temperature is not None:
+            payload["temperature"] = req.temperature
+        if req.max_tokens is not None:
+            payload["max_tokens"] = req.max_tokens
+
+        if req.stream:
+            async def stream():
+                async with httpx.AsyncClient() as client:
+                    async with client.stream(
+                        "POST",
+                        f"http://127.0.0.1:{mm.port}/v1/completions",
+                        json=payload,
+                        timeout=None,
+                    ) as resp:
+                        async for line in resp.aiter_lines():
+                            if line:
+                                yield line + "\n"
+            return StreamingResponse(stream(), media_type="text/event-stream")
+        else:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"http://127.0.0.1:{mm.port}/v1/completions",
+                    json=payload,
+                    timeout=300,
+                )
+                return resp.json()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=SERVICE_PORT)

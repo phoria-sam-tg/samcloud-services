@@ -166,6 +166,12 @@ class ModelManager:
     # registry is the thing that enforces one-at-a-time, and this bookkeeping
     # should not be the component that quietly assumes it.
     _pool_leases: set = field(default_factory=set, repr=False)
+    # Guards pool bookkeeping that is mutated OFF the event loop — the lease set
+    # above, and the tier's request counter in resolve_exo_tier. Both reach this
+    # object from `asyncio.to_thread`, so the single-threaded loop no longer
+    # serialises them for free. That is the general cost of moving work off the
+    # loop: implicit serialisation leaves with it, and anything read-modify-write
+    # has to say so explicitly.
     _pool_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _cooldown_task: Optional[asyncio.Task] = field(default=None, repr=False)
     _health_task: Optional[asyncio.Task] = field(default=None, repr=False)
@@ -727,7 +733,17 @@ class ModelManager:
                 )
                 existing.name = resident
             existing.last_used = now
-            existing.request_count += 1
+            # Guarded because this method now runs in a thread pool, not on the
+            # event loop. `+= 1` is LOAD/ADD/STORE and was serialised only
+            # implicitly, by there being one thread; two concurrent `think`
+            # resolves can interleave it and lose a count. Concurrent resolves
+            # are not hypothetical — resolve happens *before* the lease, so they
+            # are precisely the case where one caller wins the pool and the
+            # other is declined. The assignments above are left unguarded on
+            # purpose: they are idempotent, every racer writing the same
+            # resident value read from the same pool.
+            with self._pool_lock:
+                existing.request_count += 1
             return existing
 
         mm = ManagedModel(

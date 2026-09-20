@@ -817,6 +817,76 @@ def test_resolve_model_does_not_block_the_loop():
         srv.mgr = real_mgr
 
 
+def test_concurrent_tier_resolves_lose_no_count():
+    """resolve_exo_tier runs in a thread pool now, so its counter needs a lock.
+
+    The category rather than the instance: moving work off the event loop takes
+    the loop's implicit serialisation with it, and `request_count += 1` is
+    LOAD/ADD/STORE. Concurrent `think` resolves are the normal case, not a
+    corner one — resolve happens before the lease, so they are exactly the pair
+    where one caller wins the pool and the other is declined.
+
+    The increment's window is amplified deliberately, and getting that right
+    took two attempts worth recording. Running 320 plain increments across 8
+    threads passed with the lock removed — CPython rarely switches between those
+    three bytecodes unaided. Adding a sleep to the counter's getter also passed
+    with the lock removed, because the sleep came *before* the read, so the
+    getter still returned a fresh value and there was no window to lose. Only
+    reading first and then yielding produces the race. Verified both ways:
+    without the lock this reports 5 of 40; with it, 40 of 40.
+    """
+    import threading as _th
+    import time as _t
+
+    class SlowCounter:
+        """Stands in for ManagedModel, with a wide read-modify-write window."""
+        def __init__(self):
+            self.backend = Backend.EXO
+            self.name = "mlx-community/GLM-4.7-Flash-6bit"
+            self.last_used = 0.0
+            self.tier = "think"
+            self._count = 0
+
+        @property
+        def request_count(self):
+            # Read FIRST, then yield, so the value returned is stale by the time
+            # it is added to and stored. A first attempt slept *before* reading
+            # and the test passed with the lock removed — the getter was still
+            # returning a fresh value, so there was no window to lose. Order
+            # matters more than duration here.
+            value = self._count
+            _t.sleep(0.002)
+            return value
+
+        @request_count.setter
+        def request_count(self, v):
+            self._count = v
+
+    m = mgr()
+
+    class StubExo:
+        def pool_status(self):
+            return {"resident_model": "mlx-community/GLM-4.7-Flash-6bit",
+                    "ready": True, "busy": False, "instances": []}
+
+    m.exo = StubExo()
+    slow = SlowCounter()
+    m.models["think"] = slow
+
+    threads, per_thread = 8, 5
+    def worker():
+        for _ in range(per_thread):
+            m.resolve_exo_tier("think")
+
+    ts = [_th.Thread(target=worker) for _ in range(threads)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+
+    expected = threads * per_thread
+    check(f"no counts lost across {threads} threads (expected {expected})",
+          slow._count, expected)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"Running {len(tests)} test groups\n")

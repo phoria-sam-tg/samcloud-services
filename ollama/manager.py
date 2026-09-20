@@ -330,7 +330,13 @@ class ModelManager:
                     else ". Nothing in the catalogue fits right now."
                 )
                 log.info(f"Refusing load: {detail}")
-                raise capacity.InsufficientCapacity(detail)
+                raise capacity.InsufficientCapacity(
+                    detail,
+                    need_mb=need_mb,
+                    usable_mb=capacity.usable_mb(avail_mb),
+                    available_mb=avail_mb,
+                    fits_now=fitting,
+                )
 
         # Pull if needed
         local = [m["name"] for m in self.ollama.list_models()]

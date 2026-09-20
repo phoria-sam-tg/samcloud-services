@@ -1272,6 +1272,53 @@ def test_stream_defaults_to_false_like_openai():
     check("explicit stream=True still honoured", explicit.stream, True)
 
 
+def test_sse_events_are_terminated_by_a_blank_line():
+    """Every SSE passthrough must emit "\\n\\n", not "\\n".
+
+    A blank line is what *dispatches* an SSE event. The upstream readers here
+    (`ExoClient.chat_stream`, httpx `aiter_lines()`) both drop blank lines, so
+    re-adding a single newline leaves every event unterminated: a
+    spec-compliant parser accumulates and dispatches nothing.
+
+    That is invisible to almost every check. `curl` prints the bytes and looks
+    correct; chunk counts, delta keys, content-type, TTFB and total latency all
+    match the upstream exactly — every one of those was measured and matched
+    while the stream was unusable. The only symptom is a client reporting an
+    empty stream with no finish_reason, which points at the producer.
+
+    Source-level, because the property is "every passthrough site", and a
+    behavioural test would only cover whichever backend the test could reach.
+    """
+    import ast as _ast
+    from pathlib import Path as _Path
+
+    src = (_Path(__file__).resolve().parent / "server.py").read_text()
+    bare, terminated = [], []
+    for i, line in enumerate(src.split("\n"), 1):
+        t = line.strip()
+        if t == 'yield line + "\\n"':
+            bare.append(i)
+        elif t == 'yield line + "\\n\\n"':
+            terminated.append(i)
+
+    check(f"no SSE passthrough emits a bare newline (found {bare})", bare, [])
+    check("all four passthrough sites terminate events", len(terminated), 4)
+
+    # And the hand-built events must be terminated too.
+    tree = _ast.parse(src)
+    unterminated = []
+    for node in _ast.walk(tree):
+        if not isinstance(node, (_ast.Yield,)) or node.value is None:
+            continue
+        for lit in _ast.walk(node.value):
+            if isinstance(lit, _ast.Constant) and isinstance(lit.value, str):
+                v = lit.value
+                if v.startswith("data: ") and v.endswith("\n") and not v.endswith("\n\n"):
+                    unterminated.append(node.lineno)
+    check(f"hand-built data: events terminated too (bad at {unterminated})",
+          unterminated, [])
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"Running {len(tests)} test groups\n")

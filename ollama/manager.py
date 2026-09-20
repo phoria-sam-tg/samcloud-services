@@ -297,10 +297,21 @@ class ModelManager:
         return {}
 
     def _get_active_leases(self) -> list[dict]:
+        """Active leases on this box's GPU, matched here rather than on the wire.
+
+        `GET /leases` documents `?resource=` and ignores it, honours an
+        undocumented `?resource_id=`, and #774 may reconcile the two in either
+        direction — so neither spelling is safe to depend on. `?status=` is
+        documented and works, and the fleet-wide active set is small, so this
+        asks for the one filter that is in the contract and matches the
+        resource itself. The `except` is deliberately narrow: a filter that
+        stops working must not become a silent empty list again.
+        """
         try:
-            return self.sc.list_leases(resource_id=RESOURCE_ID, status="active")
+            leases = self.sc.list_leases(status="active")
         except Exception:
             return []
+        return [lease for lease in leases if lease.get("resource_id") == RESOURCE_ID]
 
     # -- Ollama model operations --
 

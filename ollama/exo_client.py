@@ -318,7 +318,33 @@ class ExoClient:
                 "runners": described,
             })
 
-        live = next((i for i in instances if i["serviceable"]), None)
+        serviceable = [i for i in instances if i["serviceable"]]
+        if len(serviceable) > 1:
+            # Detect, do not adjudicate. exo's placement adds to a map of
+            # instances and eviction is a separate `DELETE /instance/{id}`
+            # (confirmed against its API surface: POST /place_instance and
+            # DELETE /instance/{id} are distinct verbs), so two live instances
+            # are one `place` away. Every re-place so far has deleted before
+            # placing — a habit in the procedure, not something exo enforces.
+            #
+            # With two, "the pool" stops being one thing and this client cannot
+            # say which instance a generation would land on, nor whether the
+            # exclusive lease still corresponds to one inference slot. Picking
+            # by a rule invented here — "prefer all-Ready", "prefer newest" —
+            # would be a policy guess dressed as a fix, and preferring Ready
+            # would actively mask the busy state the wedge guard exists to
+            # detect. So: keep the existing choice, and make the condition
+            # impossible to miss in the log.
+            log.warning(
+                "exo reports %d serviceable instances (%s) — this client assumes "
+                "ONE and the exclusive lease assumes one inference slot. Reading "
+                "the first; which instance a generation lands on is undefined "
+                "here. If this is not a transient mid-swap state, the pool needs "
+                "one instance deleted.",
+                len(serviceable),
+                ", ".join(i["model"] for i in serviceable),
+            )
+        live = serviceable[0] if serviceable else None
         if live is None and instances:
             log.info(
                 "no serviceable exo instance: %s",

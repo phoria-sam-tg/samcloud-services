@@ -1401,6 +1401,67 @@ def test_observed_openai_fields_are_not_silently_dropped():
     check("omitted response_format is None", bare.response_format, None)
 
 
+def test_two_serviceable_instances_are_detected_not_adjudicated():
+    """Two live instances must be logged, and the selection must not change.
+
+    Reachable rather than hypothetical: exo's placement adds to a map of
+    instances and eviction is a separate DELETE — `POST /place_instance` and
+    `DELETE /instance/{id}` are distinct verbs on its API — so two live
+    instances are one `place` away. Every re-place so far has deleted first,
+    which is a habit in the procedure and not something exo enforces.
+
+    This client assumes ONE pool and the exclusive lease assumes one inference
+    slot, so with two it cannot say which instance a generation lands on.
+    Choosing by an invented rule would be a policy guess dressed as a fix, and
+    "prefer all-Ready" would actively mask the busy state the wedge guard
+    exists to detect. So the test pins detection and the *absence* of a new
+    policy.
+    """
+    import logging as _logging
+
+    two = {
+        "instances": {
+            "aaa": {"MlxRingInstance": {
+                "instanceId": "aaa",
+                "shardAssignments": {"modelId": "mlx-community/GLM-4.7-Flash-6bit",
+                                     "runnerToShard": {"r1": {}, "r2": {}}}}},
+            "bbb": {"MlxRingInstance": {
+                "instanceId": "bbb",
+                "shardAssignments": {"modelId": "mlx-community/Other-Model",
+                                     "runnerToShard": {"r3": {}, "r4": {}}}}},
+        },
+        "runners": {"r1": {"RunnerReady": {}}, "r2": {"RunnerReady": {}},
+                    "r3": {"RunnerRunning": {}}, "r4": {"RunnerRunning": {}}},
+    }
+
+    records = []
+    handler = _logging.Handler()
+    handler.emit = lambda r: records.append(r.getMessage())
+    log = _logging.getLogger("exo-client")
+    log.addHandler(handler)
+    try:
+        st = exo_with(two).pool_status()
+    finally:
+        log.removeHandler(handler)
+
+    check("two serviceable instances are reported", len(st["instances"]), 2)
+    check("selection still takes the first", st["resident_model"],
+          "mlx-community/GLM-4.7-Flash-6bit")
+    check("the condition is logged",
+          any("serviceable instances" in m for m in records), True)
+    check("the log names how many", any(" 2 serviceable" in m for m in records), True)
+
+    # And one instance must stay silent — a detector that fires normally is noise.
+    records.clear()
+    log.addHandler(handler)
+    try:
+        exo_with(REAL_STATE).pool_status()
+    finally:
+        log.removeHandler(handler)
+    check("one instance logs nothing",
+          any("serviceable instances" in m for m in records), False)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"Running {len(tests)} test groups\n")

@@ -26,11 +26,14 @@ Two things about this backend are unlike every other one behind the gateway:
 
 import asyncio
 import json
+import logging
 import httpx
 from dataclasses import dataclass, field
 from typing import Optional
 
 from . import config
+
+log = logging.getLogger("exo-client")
 
 EXO_BASE = config.EXO_BASE
 
@@ -90,16 +93,53 @@ def _instance_runners(entry: dict) -> list[str]:
     return []
 
 
-def _runner_is_running(runner_state: dict) -> bool:
-    """True only for `RunnerRunning`.
+# Runner states that mean "this shard can take a request". Runner state is
+# variant-tagged like the instance: `{"RunnerRunning": {}}`, `{"RunnerReady": {}}`.
+#
+# Both of these are serviceable, and getting that wrong is not a small error in
+# either direction. The first version of this accepted only `RunnerRunning`,
+# which was the state the pool happened to be in when it was first read. A
+# re-placement on 2026-09-20 brought the new instance up with both runners in
+# `RunnerReady` — a pool that provably answered in 8.8s — and this gateway
+# reported it unavailable and declined every request with a 503. Accepting too
+# few states refuses a working pool; accepting too many routes a request into a
+# shard that is failed or on its way out, which is worse. So the set is
+# explicit, and anything outside it is refused *and logged* rather than guessed
+# at, because an unknown state on an exclusive resource is not a safe default.
+_SERVICEABLE_RUNNER_STATES = frozenset({"RunnerRunning", "RunnerReady"})
 
-    Runner state is variant-tagged like the instance: `{"RunnerRunning": {}}`,
-    `{"RunnerShuttingDown": {}}`. A shutting-down runner still appears in
-    `/state` and still has its shard assignment, so counting a model as
-    servable because it is *mentioned* would route a request into a shard
-    that is on its way out.
+# Known-bad, listed so an expected failure is not logged as a surprise.
+_UNSERVICEABLE_RUNNER_STATES = frozenset({
+    "RunnerShuttingDown", "RunnerFailed", "RunnerStarting", "RunnerLoading",
+})
+
+
+def _runner_state_name(runner_state: dict) -> Optional[str]:
+    """The variant tag of a runner state, e.g. `"RunnerReady"`."""
+    if isinstance(runner_state, dict):
+        for key in runner_state:
+            return key
+    return None
+
+
+def _runner_is_serviceable(runner_state: dict) -> bool:
+    """Can this runner take a request right now?
+
+    A shutting-down or failed runner still appears in `/state` and still holds
+    its shard assignment, so treating a model as servable because it is merely
+    *mentioned* would route a generation into a shard that cannot run it.
     """
-    return isinstance(runner_state, dict) and "RunnerRunning" in runner_state
+    name = _runner_state_name(runner_state)
+    if name in _SERVICEABLE_RUNNER_STATES:
+        return True
+    if name is not None and name not in _UNSERVICEABLE_RUNNER_STATES:
+        log.warning(
+            "exo runner state %r is not in this client's known set; treating the "
+            "shard as not serviceable. If it means the runner is ready, add it to "
+            "_SERVICEABLE_RUNNER_STATES — until then the pool reads as unavailable.",
+            name,
+        )
+    return False
 
 
 @dataclass
@@ -149,9 +189,15 @@ class ExoClient:
                 continue
             runner_ids = _instance_runners(entry)
             if runner_ids and all(
-                _runner_is_running(runners.get(rid) or {}) for rid in runner_ids
+                _runner_is_serviceable(runners.get(rid) or {}) for rid in runner_ids
             ):
                 return model_id
+            log.info(
+                "exo instance for %s is not serviceable: runner states %s",
+                model_id,
+                {rid[:8]: _runner_state_name(runners.get(rid) or {})
+                 for rid in runner_ids},
+            )
         return None
 
     def list_models(self) -> list[dict]:

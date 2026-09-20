@@ -10,14 +10,26 @@ leasing for GPU memory management. Models spin up on demand, unload after 5 min 
 
 ## SAMcloud Identity
 
-Defaults are now env-driven via `ollama/config.py`. Production defaults:
+Every identity is env-driven via `ollama/config.py`. **This runs on more than one
+box — the values below are the code's fallbacks, not a description of production.**
+They happen to spell out `claude-services-slice`, so an agent reading them on any
+other box is reading the wrong box's identity. Read the box's own env file
+(`~/.config/samcloud-services/env`, 600, sourced by the start script) before
+assuming any of them.
 
-- **Device**: `claude-services-slice` (`SC_DEVICE`)
-- **Service**: `claude-services-slice/model-service` (`SC_SERVICE_NAME`)
-- **Resource**: `claude-services-slice/gpu-0` (`SC_RESOURCE_ID`)
-- **Registry**: `https://cloud.samtg.xyz/api/v1` (`SC_BASE`)
-- **Required scope**: `device:claude-services-slice` (`SC_REQUIRED_SCOPE`) — tune per deployment
-- **Token**: always via `SC_TOKEN` env — never hardcode. Use the service token (`sc_service_...`) issued at registration, not a user token.
+| | `config.py` fallback | wafer-services runs |
+|---|---|---|
+| `SC_DEVICE` | `claude-services-slice` | `wafer-services` |
+| `SC_RESOURCE_ID` | `<device>/gpu-0` | `wafer-services/gpu-metal` |
+| `SC_REQUIRED_SCOPE` | `device:<device>` | `group:services` |
+| `SC_BASE` | `https://cloud.samtg.xyz/api/v1` | same |
+| `SC_SERVICE_NAME` | `model-service` | same |
+
+**Token**: always via `SC_TOKEN` env — never hardcode; a hardcoded copy is what
+silently 401'd a box for fourteen days after a rotation (#760). It need not be a
+service token: wafer's gateway runs under a dedicated *agent* identity
+(`wafer-model-service`, scopes exactly `["device:wafer-services"]`), which is why
+it can read its own resource where a scope-filtered service token could not.
 
 Staging (legacy) used `slice-test/*` identities pointing at `stg.samtg.xyz:9443` — see the `migration` branch for the pre-migration architecture.
 
@@ -50,7 +62,9 @@ cd ollama && python test_cooldown.py    # Idle unload verification
 `test_capacity_refusal` loads nothing and leases nothing — the refusal precedes
 both — so it is the one safe to run against a live box. It reads real memory, so
 it is a live check of the gate and not only of the shape. It self-skips if the
-box genuinely has room for a 40GB model.
+box genuinely has room for a 40GB model — note that the skip returns success
+having run step 1 only, so a green result on a very large box has not exercised
+the 503 path the test exists for.
 
 ## Conventions
 

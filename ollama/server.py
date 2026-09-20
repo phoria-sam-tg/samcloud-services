@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional
 
+from . import capacity
 from . import config
 from .manager import ModelManager, Backend, VLM_PORT, match_vlm_model
 from .samcloud import SamcloudClient
@@ -538,6 +539,11 @@ def _resolve_model(model_name: str):
             try:
                 mm = mgr.load_ollama_model(ollama_name)
                 return mm
+            except capacity.InsufficientCapacity as e:
+                # Not a missing model — a capacity answer. Surface it, with the
+                # list of what does fit, instead of collapsing to "not pulled".
+                log.info(f"Refused {ollama_name} on capacity: {e}")
+                raise HTTPException(status_code=503, detail=str(e))
             except Exception as e:
                 log.error(f"Auto-load failed for {ollama_name}: {e}")
                 return None
@@ -549,6 +555,11 @@ def _resolve_model(model_name: str):
             try:
                 mm = mgr.load_llama_model(m["file"])
                 return mm
+            except capacity.InsufficientCapacity as e:
+                # Not a missing model — a capacity answer. Surface it, with the
+                # list of what does fit, instead of collapsing to "not pulled".
+                log.info(f"Refused {m['name']} on capacity: {e}")
+                raise HTTPException(status_code=503, detail=str(e))
             except Exception as e:
                 log.error(f"Auto-load failed for {m['name']}: {e}")
                 return None

@@ -2,6 +2,64 @@
 
 Project history and current state. This is a living document.
 
+## 2026-09-20 — Capacity migration committed, and the two boxes reconciled
+
+- **The capacity gate is in git.** It had been running in production on both
+  inference boxes since 2026-08-30 as uncommitted working-tree state —
+  `ollama/capacity.py` untracked, four files modified-not-committed, and a
+  drift of `.bak-*` siblings standing in for history. Neither box agent could
+  read the other's tree, so the copies diverged unnoticed (ticket #758).
+- **`ollama/capacity.py` is the one collector**, byte-identical on every box, so
+  an `offering:` advertised by one service means the same as another's. It sizes
+  off `free + inactive + speculative`, not `active + wired + compressor`:
+  "used" counts pages the compressor is merely sitting on (22.7GiB of 36GiB read
+  used on wafer against ~3.9GiB of real process RSS), which refuses models that
+  would have fitted and says nothing about whether a load will swap. Page size
+  comes from the kernel — assuming 4KiB on a 16KiB machine under-reported slice
+  by 4x for weeks. Tool paths are absolute, because the gateway's launchd PATH
+  omits `/usr/sbin` and a bare `sysctl` turned every request into a 404.
+- **Refusals are answers, not faults.** `InsufficientCapacity` carries
+  `need_mb` / `usable_mb` / `available_mb` / `fits_now`, and
+  `server._capacity_503()` is the single funnel every load path returns it
+  through — including `POST /models/load`, which had no capacity branch at all
+  and returned a 500 with a stack-trace string (#756). The class derives from
+  `Exception`, not `RuntimeError`, so the pre-existing
+  `except RuntimeError -> 409` cannot swallow it and make the missing branch
+  look fixed. `ollama/test_capacity_refusal.py` drives all four shapes.
+- **Loads fit rather than evict.** `load_ollama_model` checks against what the
+  box can hand over instead of unloading whatever is resident to force-fit the
+  ask; eviction is opt-in behind `AUTO_EVICT` (default off).
+- **Sizes come from Ollama, not from the name.** `memory_estimate_mb()` reads
+  the real weight size; the name fallback now anchors its size tag on a digit
+  boundary. Substring matching read "qwen3.8:27b-mlx" as 7b and leased 5000MB
+  for a model that resides at 17530MB — a 3.5x under-count that told other
+  tenants there was room that did not exist. "13b" hit "3b" the same way.
+- **The two lineages are merged.** `feat/wafer-gpu-metal-stats` (stats loop,
+  Stage-1 offering) and `main` (GGUF short-name routing, #97 mitigations,
+  capacity gate) both branched from 0d60324 and each grew the half the other
+  lacked. Merged, then wired onto the shared collector: `_collect_stats()` is
+  `capacity.collect()`, `stats_loop` pushes `registry_payload()`, and
+  `_compute_offering()` uses `capacity.offering_tier()`.
+- **The offering MB bands are gone** (`OFFERING_MINI_MB` / `_DEGRADED_MB` /
+  `_FULL_MB`, superseding the 2026-07-02 entry below). They banded
+  `total - used` into tiers and were calibrated when the largest model was
+  ~6GB, so wafer advertised `offering:full` on ~14GiB available against a
+  17.5GB model that could not load without swapping. The tier now derives from
+  what actually fits out of the live catalogue — `full` = everything we hold
+  fits, `mini` = exactly one does, `none` = nothing does — which stays true as
+  models come and go and needs no per-box tuning. `OFFERING_ENABLED`,
+  `_POLL_SECONDS` and `_HYSTERESIS` remain the per-box knobs.
+- **One stats push per box, from the gateway.** `ollama/gpu_stats.py` retired;
+  slice's separate `com.samcloud.cs-gpu-stats` launchd job is unloaded in
+  favour of `ModelManager.stats_loop()`, which is lifecycle-managed and shares
+  the collector. The module had been hollowed out by the migration anyway —
+  `collect_stats()` was a passthrough and the helpers under it were dead.
+- **Still open:** `llama-server` and `mlx-vlm` have no capacity gate — only
+  Ollama does, so `server.py` catches `InsufficientCapacity` around
+  `load_llama_model`, which cannot raise it. Deliberately not fixed here:
+  gating them starts refusing loads that succeed today, which is a behaviour
+  change callers should be told about first (ticket #754).
+
 ## 2026-07-02 — Stage-1 capacity offering (flex tier) on wafer
 
 - **`offering:<tier>` self-report (doc #8 Stage 1, ticket #135).** The gateway now

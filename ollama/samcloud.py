@@ -81,15 +81,21 @@ class SamcloudClient:
         self,
         name: str,
         port: int,
+        description: str,
         health_endpoint: str = "/health",
         subdomain: Optional[str] = None,
         capabilities: Optional[list[str]] = None,
         version: Optional[str] = None,
     ) -> dict:
+        # `description` is required by the API and was missing here — POST /services
+        # answers 422 {"loc": ["body", "description"], "msg": "Field required"} without
+        # it. No caller on this box, so it had drifted unnoticed; measured against the
+        # live plane on #760.
         payload = {
             "name": name,
             "device_id": self.device,
             "port": port,
+            "description": description,
             "health_endpoint": health_endpoint,
         }
         if subdomain:

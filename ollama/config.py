@@ -61,11 +61,23 @@ OLLAMA_KEEP_ALIVE = _env_int("OLLAMA_KEEP_ALIVE", -1)
 #
 # Signal: LOCAL unified-memory availability (memory_total - memory_used from
 # vm_stat/sysctl, same collector as the stats loop). We compute from local
-# memory rather than the registry's lease-based available_memory_mb because the
-# gateway runs under a service token, which is scope-filtered out of resource
-# reads (GET /resources/{id} -> 403). On a unified-memory Mac real memory
-# pressure is in any case the truer "can I serve a model" signal, and it also
-# captures training that spikes memory without holding a formal lease.
+# memory rather than the registry's lease-based available_memory_mb because on
+# a unified-memory Mac real memory pressure is the truer "can I serve a model"
+# signal: it captures training that spikes memory without holding a formal
+# lease, and available_memory_mb is spec minus leases and never consults
+# utilisation at all (#750 — it reported 36864 MB on this box at 70.6%).
+#
+# This comment previously gave a second reason — that the gateway runs under a
+# service token scope-filtered out of resource reads. That is no longer why:
+# the gateway runs under a dedicated agent identity (wafer-model-service, user
+# 60, scopes ["device:wafer-services"]) and reads resources fine — #760.
+#
+# The original note said that refusal was 403, and it was right. server.log has
+# six GET /resources/wafer-services/gpu-metal -> 403 on 2026-07-02, the day this
+# workaround was written, and the endpoint was never called again. The refusal
+# only became 404 later (see the 2026-09-08 change on #760). An earlier edit of
+# mine "corrected" the 403 to 404 and was wrong to: the code changed under the
+# comment, the comment did not misreport it.
 # Thresholds are available-MB, ascending: none < mini < degraded < full.
 OFFERING_ENABLED = _env_bool("OFFERING_ENABLED", True)
 OFFERING_POLL_SECONDS = _env_int("OFFERING_POLL_SECONDS", 30)
@@ -88,3 +100,8 @@ VLM_PYTHON = _env(
     str(Path.home() / "code" / "mlx-vlm-server" / ".venv" / "bin" / "python"),
 )
 VLM_STARTUP_TIMEOUT = _env_int("VLM_STARTUP_TIMEOUT", 120)
+
+# Force-fit a requested model by unloading whatever is resident.
+# OFF by default: the contract is "publish what is available and let the
+# handshake pick a model that fits", not "evict to satisfy every ask".
+AUTO_EVICT = _env_bool("AUTO_EVICT", False)

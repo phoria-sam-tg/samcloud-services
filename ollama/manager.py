@@ -21,6 +21,8 @@ import signal
 import subprocess
 import time
 import logging
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -28,6 +30,7 @@ from typing import Optional
 from . import capacity
 from . import config
 from .ollama_client import OllamaClient, estimate_memory_mb
+from .exo_client import ExoClient, ExoUnavailable
 from .llama_client import LlamaServerClient, LlamaInstance
 from .samcloud import SamcloudClient
 
@@ -45,6 +48,10 @@ class Backend(str, Enum):
     OLLAMA = "ollama"
     LLAMA = "llama-server"
     VLM = "mlx-vlm"
+    # The pool. Unlike the three above, the gateway does not own the process
+    # and does not place the model — it holds an exclusive lease around a
+    # generation and proxies. See exo_client.py.
+    EXO = "exo"
 
 VLM_PORT = config.VLM_PORT
 VLM_HOST = config.VLM_HOST
@@ -55,6 +62,25 @@ VLM_MODELS = {
     "qwen2.5-vl": {"default": "mlx-community/Qwen2.5-VL-7B-Instruct-4bit", "memory_mb": 5700},
 }
 VLM_DEFAULT_MEMORY_MB = 18700
+
+EXO_RESOURCE_ID = config.EXO_RESOURCE_ID
+EXO_TIERS = config.EXO_TIERS
+EXO_LEASE_TTL = config.EXO_LEASE_TTL
+
+
+def match_exo_tier(model_name: str) -> bool:
+    """Is this request asking for the pool?
+
+    Deliberately an exact, case-insensitive match on a tier name and nothing
+    else. Every other matcher in this file does substring matching so callers
+    can say "agi" or "gemma-4" — that is right when a name identifies a file we
+    can load on demand, and wrong here. The pool holds one model at a time and
+    a swap costs 30s-10min, so a request naming a model is a request we cannot
+    honour; only "give me the think tier, whatever is in it" is honest. Fuzzy
+    matching would also let any request containing the substring "think" fall
+    through to a 64 GB pool by accident.
+    """
+    return model_name.strip().lower() in EXO_TIERS
 
 
 def match_vlm_model(model_name: str):
@@ -91,6 +117,24 @@ def match_gguf_model(model_name: str, available: list[dict]):
 
 
 @dataclass
+class LeaseOutcome:
+    """The verdict on a lease request: was it granted, and if not, why not.
+
+    Exists so the answer cannot collapse back to a truthy lease id. A queued
+    lease has an id too, which is exactly how "202 reads as granted" survived
+    — the old code returned `str(lease_id)` and every caller tested it for
+    truthiness. Callers now have to look at `granted`.
+    """
+    granted: bool
+    state: str                                  # active | queued | conflict | error
+    lease_id: Optional[str] = None
+    held_by: Optional[str] = None
+    expires_at: Optional[str] = None
+    queue_position: Optional[int] = None
+    message: Optional[str] = None
+
+
+@dataclass
 class ManagedModel:
     """Tracks a model that's loaded with an active lease."""
     name: str
@@ -102,6 +146,10 @@ class ManagedModel:
     last_used: float
     request_count: int = 0
     managed: bool = True  # False = pre-existing process we adopted
+    # Set only for Backend.EXO, where the dict key is the *tier* a caller asks
+    # for ("think") while `name` is whatever model the pool currently holds.
+    # Every other backend keys on the model name itself.
+    tier: Optional[str] = None
     llama_instance: Optional[LlamaInstance] = field(default=None, repr=False)
     vlm_process: Optional[subprocess.Popen] = field(default=None, repr=False)
 
@@ -111,7 +159,14 @@ class ModelManager:
     sc: SamcloudClient
     ollama: OllamaClient = field(default_factory=OllamaClient)
     llama: LlamaServerClient = field(default_factory=LlamaServerClient)
+    exo: ExoClient = field(default_factory=ExoClient)
     models: dict[str, ManagedModel] = field(default_factory=dict)
+    # Pool leases currently held by this process, so shutdown can give back
+    # what a killed request did not. A set rather than a single slot: the
+    # registry is the thing that enforces one-at-a-time, and this bookkeeping
+    # should not be the component that quietly assumes it.
+    _pool_leases: set = field(default_factory=set, repr=False)
+    _pool_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _cooldown_task: Optional[asyncio.Task] = field(default=None, repr=False)
     _health_task: Optional[asyncio.Task] = field(default=None, repr=False)
 
@@ -200,6 +255,12 @@ class ModelManager:
         for name, mm in self.models.items():
             if mm.lease_id:
                 continue
+            if mm.backend == Backend.EXO:
+                # The pool is never leased for residency — its lease is taken
+                # per generation and released after, and it is exclusive, so
+                # claiming one here would close the pool for as long as the
+                # gateway runs.
+                continue
             try:
                 lease_resp = self.sc.request_lease(
                     resource_id=RESOURCE_ID,
@@ -207,13 +268,29 @@ class ModelManager:
                     memory_mb=mm.memory_mb,
                     ttl_seconds=LEASE_TTL,
                 )
-                lease_id = lease_resp.get("id") or lease_resp.get("lease_id")
-                mm.lease_id = str(lease_id) if lease_id else None
-                results.append({"model": name, "lease_id": mm.lease_id, "memory_mb": mm.memory_mb})
-                log.info(f"Lease claimed for {name}: {mm.lease_id} ({mm.memory_mb}MB)")
             except Exception as e:
                 log.warning(f"Failed to claim lease for {name}: {e}")
                 results.append({"model": name, "error": str(e)})
+                continue
+
+            # Same rule as _request_lease: queued is not granted. This path had
+            # the identical defect — it read an id out of any response that did
+            # not raise — and it runs over every adopted model at startup.
+            outcome = self._lease_outcome(lease_resp)
+            if outcome.granted:
+                mm.lease_id = outcome.lease_id
+                results.append({"model": name, "lease_id": mm.lease_id,
+                                "memory_mb": mm.memory_mb})
+                log.info(f"Lease claimed for {name}: {mm.lease_id} ({mm.memory_mb}MB)")
+            else:
+                if outcome.state == "queued":
+                    self._release_lease_quietly(outcome.lease_id)
+                mm.lease_id = None
+                log.warning(
+                    f"Lease NOT claimed for {name} ({outcome.state}): {outcome.message}"
+                )
+                results.append({"model": name, "lease": outcome.state,
+                                "detail": outcome.message})
         return results
 
     def status(self) -> dict:
@@ -279,7 +356,12 @@ class ModelManager:
 
     def _get_active_leases(self) -> list[dict]:
         try:
-            return self.sc.list_leases(resource=RESOURCE_ID, status="active")
+            # resource_id=, not resource= — the plane silently ignores unknown
+            # query filters, so `resource=` returned every active lease on the
+            # fleet and /status named another box's exclusive lease as this
+            # GPU's. An unknown field in a POST body is a 422; an unknown filter
+            # in a GET is the whole table. See #774.
+            return self.sc.list_leases(resource_id=RESOURCE_ID, status="active")
         except Exception:
             return []
 
@@ -571,6 +653,83 @@ class ModelManager:
         self.models[resolved] = mm
         return mm
 
+    # -- the pool (Backend.EXO) --
+
+    def resolve_exo_tier(self, tier: str) -> ManagedModel:
+        """Register or refresh the pool tier. Takes no lease and loads nothing.
+
+        The asymmetry with every other `load_*` method here is the point. For
+        Ollama, llama-server and mlx-vlm, "resolve" means *make it resident* and
+        the lease covers that residency. The pool is already resident, placed
+        out of band, with its pages already wired and already counted by each
+        box's own capacity gate — so there is nothing to load and nothing to
+        lease for. The lease that matters is taken later, around the generation,
+        by `pool_lease()`.
+
+        The resident model is re-read from the pool on every resolve rather
+        than cached, so an operator swapping the model is picked up without a
+        deploy here. That is also why `memory_mb` is 0: claiming a figure would
+        double-count pages the box already sees, and a lease written from a
+        pre-load estimate was measured 4.7x wrong.
+        """
+        if not config.EXO_ENABLED:
+            raise ExoUnavailable("exo backend is disabled (EXO_ENABLED=0)")
+
+        resident = self.exo.resident_model()   # raises ExoUnavailable if down
+        if not resident:
+            raise ExoUnavailable(
+                f"the exo pool at {config.EXO_BASE} is reachable but has no "
+                f"model resident and ready — it is most likely mid-swap, or "
+                f"was never placed after a reboot (it cannot restart itself)"
+            )
+
+        now = time.time()
+        existing = self.models.get(tier)
+        if existing is not None and existing.backend == Backend.EXO:
+            if existing.name != resident:
+                log.info(
+                    f"pool resident model changed: {existing.name} -> {resident} "
+                    f"(tier '{tier}' now serves {resident})"
+                )
+                existing.name = resident
+            existing.last_used = now
+            existing.request_count += 1
+            return existing
+
+        mm = ManagedModel(
+            name=resident,
+            backend=Backend.EXO,
+            memory_mb=0,          # not ours to account for; see docstring
+            lease_id=None,        # per-generation, not per-residency
+            port=0,               # not a local port; reached over the network
+            loaded_at=now,
+            last_used=now,
+            request_count=1,
+            # We did not start this process and must never stop it. managed=False
+            # also keeps the cooldown loop from trying to unload the pool after
+            # five idle minutes, which it has no right to do.
+            managed=False,
+            tier=tier,
+        )
+        self.models[tier] = mm
+        log.info(f"Pool tier '{tier}' -> {resident} (exclusive lease per request)")
+        return mm
+
+    def exo_request_defaults(self, model_id: str) -> dict:
+        """Per-model request defaults for the pool, matched on the model id.
+
+        Same shape as the Ollama `think:false` workaround: a small table of
+        things a given model needs that the caller should not have to know. On
+        an exclusive resource the `max_tokens` cap is not a nicety — an
+        unbounded generation owns the pool until it stops talking.
+        """
+        lower = (model_id or "").lower()
+        defaults = {"max_tokens": config.EXO_MAX_TOKENS}
+        for key, overrides in config.EXO_MODEL_DEFAULTS.items():
+            if key in lower:
+                defaults.update(overrides)
+        return defaults
+
     def _release_lease_quietly(self, lease_id: Optional[str]):
         if not lease_id:
             return
@@ -581,7 +740,85 @@ class ModelManager:
 
     # -- Common operations --
 
+    def _lease_outcome(self, resp: dict) -> "LeaseOutcome":
+        """Read a lease response into a verdict. The load-bearing half.
+
+        This used to return `str(lease_id)` for anything that did not raise,
+        which meant a **queued** lease read as a granted one. On a shared,
+        byte-metered resource that is close to harmless — the load proceeds and
+        the registry's accounting is a little optimistic. On an *exclusive*
+        resource it is the whole bug: "you are second in line" and "the pool is
+        yours" are opposite answers, and acting on the wrong one puts two
+        consumers inside one inference instance.
+
+        The verdict cannot come from the status code alone. The API index
+        documents `201 granted / 202 queued`, but the registry's handler sets
+        no status code on either path, so **both** return a plain `200` — as
+        the measurement on #748 recorded (`grant 200`). Code-only logic would
+        therefore either accept everything (today's bug) or, if written to the
+        documentation, reject every grant — the same bug pointing the other
+        way. So: treat any non-2xx as a refusal, and among 2xx let the body
+        decide. `status: "queued"` or a `queue_position` means not ours.
+        """
+        code = resp.get("status_code", 0)
+        lease_id = resp.get("id") or resp.get("lease_id")
+        lease_id = str(lease_id) if lease_id else None
+        status = (resp.get("status") or "").lower()
+        queue_position = resp.get("queue_position")
+
+        # A 409's body is FastAPI-wrapped: {"detail": {"detail", "held_by",
+        # "expires_at"}}. Flatten so the holder's expiry is reachable either way.
+        detail = resp.get("detail")
+        if isinstance(detail, dict):
+            held_by = detail.get("held_by")
+            expires_at = detail.get("expires_at") or resp.get("expires_at")
+            message = detail.get("detail") or str(detail)
+        else:
+            held_by = resp.get("service_id")
+            expires_at = resp.get("expires_at")
+            message = detail if isinstance(detail, str) else None
+
+        if code == 409:
+            return LeaseOutcome(
+                granted=False, state="conflict", lease_id=None,
+                held_by=held_by, expires_at=expires_at,
+                queue_position=queue_position,
+                message=message or "resource is held exclusively",
+            )
+        if code not in (200, 201, 202):
+            return LeaseOutcome(
+                granted=False, state="error", lease_id=None,
+                message=message or f"lease request returned {code}",
+            )
+        if status == "queued" or queue_position is not None:
+            return LeaseOutcome(
+                granted=False, state="queued", lease_id=lease_id,
+                queue_position=queue_position,
+                message=message or "lease queued, not granted",
+            )
+        if not lease_id:
+            # 2xx with no identifier is not something to proceed on.
+            return LeaseOutcome(
+                granted=False, state="error", lease_id=None,
+                message="lease response carried no id",
+            )
+        return LeaseOutcome(
+            granted=True, state="active", lease_id=lease_id,
+            expires_at=resp.get("expires_at"), held_by=resp.get("service_id"),
+        )
+
     def _request_lease(self, model_name: str, memory_mb: int) -> Optional[str]:
+        """Lease memory for a model on the shared GPU resource.
+
+        Returns a lease id only when one was actually granted. A queued lease
+        is released rather than kept: we are not going to wait for it, and a
+        row left sitting in `queued` is renewed by the renewal loop and
+        released by nobody. The load itself still proceeds — the capacity gate
+        upstream has already decided the model fits this box, and refusing on
+        a registry byte-count disagreement would be a regression — but it
+        proceeds honestly unleased instead of recording a lease it does not
+        hold.
+        """
         try:
             resp = self.sc.request_lease(
                 resource_id=RESOURCE_ID,
@@ -589,15 +826,159 @@ class ModelManager:
                 memory_mb=memory_mb,
                 ttl_seconds=LEASE_TTL,
             )
-            lease_id = resp.get("id") or resp.get("lease_id")
-            # Validate that the lease has an expiry — reject indefinite leases
-            if resp.get("expires_at") is None:
-                log.warning(f"Lease {lease_id} granted without expiry — will rely on renewal loop to keep it bounded")
-            log.info(f"Lease for {model_name}: {lease_id} ({memory_mb}MB, TTL={LEASE_TTL}s)")
-            return str(lease_id) if lease_id else None
         except Exception as e:
             log.warning(f"Lease request failed for {model_name}: {e}")
             return None
+
+        outcome = self._lease_outcome(resp)
+        if outcome.granted:
+            if outcome.expires_at is None:
+                log.warning(
+                    f"Lease {outcome.lease_id} granted without expiry — relying "
+                    f"on the renewal loop to keep it bounded"
+                )
+            log.info(
+                f"Lease for {model_name}: {outcome.lease_id} "
+                f"({memory_mb}MB, TTL={LEASE_TTL}s)"
+            )
+            return outcome.lease_id
+
+        if outcome.state == "queued":
+            log.warning(
+                f"Lease for {model_name} was QUEUED, not granted "
+                f"(position {outcome.queue_position}) — releasing the queued row "
+                f"and loading unleased; the capacity gate already cleared this fit"
+            )
+            self._release_lease_quietly(outcome.lease_id)
+        else:
+            log.warning(
+                f"Lease for {model_name} not granted ({outcome.state}): "
+                f"{outcome.message}"
+            )
+        return None
+
+    # -- The pool (Backend.EXO): an exclusive lease around one generation --
+
+    def _retry_after_s(self, expires_at: Optional[str]) -> Optional[int]:
+        """Seconds until `expires_at`, floored at 1. None if unparseable.
+
+        The holder's expiry is the only honest retry hint available on an
+        exclusive conflict: there is no queue to report a position in, so
+        "come back when the current holder's lease lapses" is the real answer.
+        """
+        if not expires_at:
+            return None
+        try:
+            from datetime import datetime, timezone
+            ts = expires_at.replace("Z", "+00:00")
+            when = datetime.fromisoformat(ts)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            delta = (when - datetime.now(timezone.utc)).total_seconds()
+            return max(1, int(delta))
+        except Exception:
+            return None
+
+    def acquire_pool(self, purpose: str = "generation") -> str:
+        """Take the exclusive lease on the pool, or raise capacity.PoolBusy.
+
+        There is no wait-and-retry here on purpose. The pool serves one request
+        at a time and a generation is minutes, so blocking a caller until it is
+        free would be the hang the design rules out; a structured decline that
+        says when to come back is the contract instead.
+        """
+        try:
+            resp = self.sc.request_lease(
+                resource_id=EXO_RESOURCE_ID,
+                service_id=SERVICE_ID,
+                memory_mb=None,      # the pool is TAKEN, not metered in bytes
+                ttl_seconds=EXO_LEASE_TTL,
+                exclusive=True,
+            )
+        except Exception as e:
+            # A registry we cannot reach is not a free pool. Refusing to start
+            # work we cannot announce is the safe direction on an exclusive
+            # resource: the alternative collides with whoever does hold it.
+            raise capacity.PoolBusy(
+                f"cannot confirm the pool is free — registry unreachable: {e}",
+                resource_id=EXO_RESOURCE_ID,
+                retry_after_s=30,
+            )
+
+        outcome = self._lease_outcome(resp)
+        if outcome.granted:
+            # Register here rather than in pool_lease(), so that a caller which
+            # acquires directly is swept by shutdown() too. The streaming path
+            # has to acquire before it returns a response — otherwise a busy
+            # pool would be discovered after the 200 headers were already on
+            # the wire and a decline could only be delivered as stream content.
+            with self._pool_lock:
+                self._pool_leases.add(outcome.lease_id)
+            log.info(
+                f"Pool lease {outcome.lease_id} acquired for {purpose} "
+                f"(exclusive, TTL={EXO_LEASE_TTL}s)"
+            )
+            return outcome.lease_id
+
+        if outcome.state == "queued":
+            # Should be unreachable while we send no memory_mb, but if the
+            # registry ever queues an exclusive request, queued is not granted.
+            self._release_lease_quietly(outcome.lease_id)
+            raise capacity.PoolBusy(
+                "the pool queued this request rather than granting it",
+                resource_id=EXO_RESOURCE_ID,
+                queue_position=outcome.queue_position,
+                retry_after_s=60,
+            )
+
+        retry_after = self._retry_after_s(outcome.expires_at)
+        holder = f" (held by {outcome.held_by})" if outcome.held_by else ""
+        raise capacity.PoolBusy(
+            f"the exo pool is serving another request{holder}; it holds one "
+            f"request at a time" + (
+                f", and the current lease lapses in {retry_after}s"
+                if retry_after else ""
+            ),
+            resource_id=EXO_RESOURCE_ID,
+            queue_position=outcome.queue_position,
+            retry_after_s=retry_after,
+            expires_at=outcome.expires_at,
+        )
+
+    def release_pool(self, lease_id: Optional[str]):
+        """Give the pool back. Safe to call twice; never raises."""
+        if not lease_id:
+            return
+        with self._pool_lock:
+            self._pool_leases.discard(lease_id)
+        try:
+            self.sc.release_lease(lease_id)
+            log.info(f"Pool lease {lease_id} released")
+        except Exception as e:
+            # Worth a louder log than a shared lease: an exclusive lease left
+            # behind does not make the pool slower, it makes it closed until
+            # the TTL lapses.
+            log.error(
+                f"FAILED to release pool lease {lease_id}: {e} — the pool stays "
+                f"closed to other consumers until its {EXO_LEASE_TTL}s TTL expires"
+            )
+
+    @contextmanager
+    def pool_lease(self, purpose: str = "generation"):
+        """Hold the pool for the duration of a block, and give it back after.
+
+        The equivalent of the exo repo's `scripts/with-pool.sh` trapping
+        EXIT/INT/TERM: the `finally` covers a normal return, an exception, and
+        a cancelled request (asyncio raises CancelledError *into* the frame, so
+        a client that disconnects mid-generation still unwinds through here).
+        What it cannot cover is SIGKILL or a power cut, which is what the
+        lease TTL is for, and why `shutdown()` sweeps any still-held lease.
+        """
+        lease_id = self.acquire_pool(purpose)
+        try:
+            yield lease_id
+        finally:
+            self.release_pool(lease_id)
 
     def touch(self, model_name: str):
         """Mark a model as recently used (resets cooldown timer)."""
@@ -610,6 +991,23 @@ class ModelManager:
         if model_name not in self.models:
             return False
         mm = self.models[model_name]
+        if mm.backend == Backend.EXO:
+            # Nothing local to restart. "Running" means the pool still answers
+            # and still holds a ready model — and if it has been swapped under
+            # us, pick up the new one rather than sending a request for a model
+            # that is no longer there.
+            try:
+                resident = self.exo.resident_model()
+            except ExoUnavailable as e:
+                log.warning(f"pool unreachable for tier '{model_name}': {e}")
+                return False
+            if not resident:
+                log.warning(f"pool has no ready model for tier '{model_name}'")
+                return False
+            if resident != mm.name:
+                log.info(f"pool resident model changed: {mm.name} -> {resident}")
+                mm.name = resident
+            return True
         if mm.backend == Backend.VLM:
             # Restart our mlx-vlm process if it died.
             if mm.managed and mm.vlm_process and mm.vlm_process.poll() is not None:
@@ -645,6 +1043,21 @@ class ModelManager:
             return {"status": "not_found"}
 
         mm = self.models[model_name]
+
+        if mm.backend == Backend.EXO:
+            # Deregister the tier, never touch the pool. We did not start the
+            # exo instance and stopping it would strand whoever else is using
+            # it — and it cannot be restarted unattended, so a stop here is
+            # effectively permanent until a human opens a Terminal. `force`
+            # deliberately does not override this.
+            del self.models[model_name]
+            log.info(f"Deregistered pool tier '{model_name}' (pool left running)")
+            return {
+                "status": "deregistered",
+                "model": model_name,
+                "backend": Backend.EXO.value,
+                "note": "the exo pool is not owned by this gateway; nothing was stopped",
+            }
 
         # Don't auto-unload adopted processes unless forced
         if not mm.managed and not force:
@@ -757,6 +1170,16 @@ class ModelManager:
     def shutdown(self) -> list[dict]:
         """Release all leases. Only stop processes we started (managed=True)."""
         results = []
+        # Give the pool back first. uvicorn runs lifespan shutdown on SIGTERM
+        # and SIGINT, so this is the trap that `scripts/with-pool.sh` installs
+        # on EXIT/INT/TERM: a request killed mid-generation does not strand an
+        # exclusive lease and close the pool until its TTL lapses. SIGKILL is
+        # still beyond reach — that is what the TTL is for.
+        with self._pool_lock:
+            held = list(self._pool_leases)
+        for lease_id in held:
+            self.release_pool(lease_id)
+            results.append({"pool_lease": lease_id, "status": "released"})
         for name in list(self.models.keys()):
             mm = self.models[name]
             if mm.managed:

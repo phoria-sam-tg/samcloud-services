@@ -96,6 +96,58 @@ class InsufficientCapacity(Exception):
         }
 
 
+class PoolBusy(Exception):
+    """An exclusive resource is held by someone else right now.
+
+    The sibling of `InsufficientCapacity`, and deliberately the same *kind* of
+    answer: a refusal that carries the numbers to retry on, not a fault. The
+    two are distinct because they mean different things and a caller should act
+    on them differently — `insufficient_capacity` says "this box cannot fit
+    that model, here is what does fit", and there is no point retrying in ten
+    seconds. `resource_busy` says "the thing you want exists and works, but
+    someone else has it", and retrying is exactly the right move.
+
+    Only exclusive resources can raise it. On `claude-services-slice/exo-pool`
+    a lease means the pool is TAKEN, not that bytes are reserved, so a second
+    consumer that starts work while a lease is held is not merely slow — it
+    rebuilds the 20-minute collision of 2026-09-20.
+
+    `queue_position` is carried for shape-compatibility with the
+    `insufficient_capacity` body and is honestly `None` on an exclusive
+    conflict: the registry maintains no queue for that path. Only the
+    memory-oversubscription branch assigns queue positions, and a resource
+    that leases no bytes never enters it. `retry_after_s` is the field doing
+    the real work, derived from the holder's `expires_at`.
+    """
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        resource_id: Optional[str] = None,
+        retry_after_s: Optional[int] = None,
+        expires_at: Optional[str] = None,
+        queue_position: Optional[int] = None,
+    ):
+        super().__init__(detail)
+        self.detail = detail
+        self.resource_id = resource_id
+        self.retry_after_s = retry_after_s
+        self.expires_at = expires_at
+        self.queue_position = queue_position
+
+    def as_dict(self) -> dict:
+        """Body for a 503, in the same shape as an insufficient_capacity one."""
+        return {
+            "error": "resource_busy",
+            "message": self.detail,
+            "resource_id": self.resource_id,
+            "queue_position": self.queue_position,
+            "retry_after_s": self.retry_after_s,
+            "expires_at": self.expires_at,
+        }
+
+
 def usable_mb(available_mb: int) -> int:
     """How much of `available_mb` we are willing to commit."""
     return max(0, min(int(available_mb * USABLE_FRACTION),

@@ -2,6 +2,55 @@
 
 Project history and current state. This is a living document.
 
+## 2026-09-20 — Backend.EXO: the pool behind model-service (ticket #770)
+
+A fourth backend, and the first the gateway does not own. `claude-services-slice/exo-pool`
+is ONE exo instance spanning slice and wafer that serves ONE request at a time, placed
+out of band. Callers ask for a tier — `{"model": "think"}` — and get whatever is
+resident, resolved from exo's `/state` at request time so an operator can swap the model
+without a deploy here.
+
+**The lease.** `_request_lease` returned an id for any response that did not raise, so a
+**queued lease read as granted**. On shared `gpu-0` that is close to harmless; on an
+exclusive resource it puts two consumers inside one inference instance. Replaced with a
+`LeaseOutcome` verdict that callers must test. The verdict reads the response **body**,
+not the status code: the registry grants with a plain `200`, not the `201` its own API
+index documents, so status-only logic fails in one direction or the other. `claim_leases`
+had the same defect and is fixed too.
+
+**`memory_mb` must be null on the pool.** The registry queues when
+`memory_mb > available`, and `available` is `total - leased` where `total` comes from
+`vram_mb`/`gpu_memory_mb`/`unified_memory_mb`/`ram_mb` in the resource specs. `exo-pool`
+carries none of those by design, so `total` is 0 and any positive byte count is queued
+forever regardless of how idle the pool is. "A lease means the pool is TAKEN, not that
+bytes are reserved" turns out to be operationally load-bearing, not just honest framing.
+
+**Declining.** A caller who asks while the pool is busy gets a 503 in the same shape as
+the shipped `insufficient_capacity` one: `resource_busy`, with `retry_after_s` derived
+from the holder's `expires_at` and a real `Retry-After` header. `queue_position` is
+present but honestly `null` — the exclusive-conflict path maintains no queue, and the
+only code that assigns positions is the memory-oversubscription branch the pool never
+enters. Measured: 0.38s, HTTP 503, no leftover lease.
+
+**Not stranding the pool.** An exclusive lease left behind does not degrade the pool, it
+closes it. Released in a `finally`, swept by `shutdown()` on SIGTERM/SIGINT, and bounded
+by a TTL that `config.py` clamps to exceed `EXO_GENERATE_TIMEOUT` — the registry expires
+leases on time and cannot extend one, and renewing by release-then-reacquire would open a
+window for a third party to take the resource mid-generation.
+
+**Two things measured about exo itself.** Its `stream: false` returns `200` headers and
+then no body at all (two runs, 240s, zero bytes, probed directly with the gateway out of
+the path), so non-streaming callers are served by `chat_collect()`, which streams and
+aggregates. That also made the path cancellable: the first version used
+`asyncio.to_thread` around a sync call, and because a thread cannot be cancelled, a
+client that disconnected held the pool for the rest of the generation and blocked the
+gateway's own graceful shutdown.
+
+Known limitation, documented rather than solved: the pool cannot restart itself after a
+reboot. macOS grants local-network access per responsible process, so a headless launch
+is denied and exo must be started from a Terminal on the host. The backend can therefore
+be advertised but not started unattended.
+
 ## 2026-06-14 — On-demand mlx-vlm + lease fix
 
 - **mlx-vlm is now gateway-owned and on-demand.** Added `load_vlm_model` (spawns

@@ -72,3 +72,63 @@ VLM_STARTUP_TIMEOUT = _env_int("VLM_STARTUP_TIMEOUT", 120)
 # OFF by default: the contract is "publish what is available and let the
 # handshake pick a model that fits", not "evict to satisfy every ask".
 AUTO_EVICT = _env_bool("AUTO_EVICT", False)
+
+
+# --- exo pool (Backend.EXO) ---
+# ONE exo instance spanning slice + wafer, serving ONE request at a time.
+# Unlike every other backend the gateway owns, we neither start it nor place
+# its model: it must be launched from Terminal.app (macOS grants local-network
+# access per responsible process, so a headless launch is denied), and the
+# resident model is swapped out of band by whoever operates the pool.
+EXO_BASE = _env("EXO_BASE", "http://192.168.1.3:52415")
+EXO_ENABLED = _env_bool("EXO_ENABLED", True)
+EXO_RESOURCE_ID = _env("EXO_RESOURCE_ID", f"{SC_DEVICE}/exo-pool")
+
+# Tier names that route to the pool. Callers ask for a tier, not a model:
+# swapping the resident model costs 30s-10min, so the model is a property of
+# the instance and naming one in a request would be a promise we cannot keep.
+EXO_TIERS = tuple(
+    t.strip() for t in _env("EXO_TIERS", "think").split(",") if t.strip()
+)
+
+# How long we will wait for the pool to finish one generation. Two boxes, ring
+# pipeline parallelism and a reasoning model: minutes is normal, and the first
+# request after a placement is the slowest (cold KV cache).
+EXO_GENERATE_TIMEOUT = _env_int("EXO_GENERATE_TIMEOUT", 1500)
+
+# Ceiling on how long an exclusive lease can outlive the request that took it.
+# This is a leak bound, not an expected generation length — the happy path
+# releases in a `finally`. It matters because a lease stranded on an exclusive
+# resource does not degrade the pool, it closes it.
+#
+# It MUST be longer than EXO_GENERATE_TIMEOUT, and that ordering is the whole
+# point of having both. The registry expires an active lease the moment it
+# passes `expires_at` and offers no way to extend one; renewing by
+# release-then-reacquire would open a window where a third party can take an
+# exclusive resource out from under a running generation. So the only safe
+# arrangement is a lease that outlives the longest request it can be covering.
+# Set them equal (as an earlier version of this did, both at 1800) and a
+# generation that runs to its timeout finishes just as its lease lapses — the
+# pool silently becomes grantable to someone else while we are still using it,
+# which is the exact collision the exclusive lease exists to prevent.
+EXO_LEASE_TTL = _env_int("EXO_LEASE_TTL", 1800)
+
+# Enforce the ordering rather than trusting whoever edits the env next. Widening
+# the lease is the safe direction: a lease that is too long delays the pool for
+# other consumers, while one that is too short breaks exclusivity outright.
+_EXO_TTL_MARGIN = 300
+if EXO_LEASE_TTL < EXO_GENERATE_TIMEOUT + _EXO_TTL_MARGIN:
+    EXO_LEASE_TTL = EXO_GENERATE_TIMEOUT + _EXO_TTL_MARGIN
+
+# Per-model request defaults — the same shape model-service already uses for
+# its Ollama `think:false` workaround. On an exclusive resource an unbounded
+# generation is not slow, it is a denial of service: one caller owns the pool
+# until it stops talking. Cap every request, and let the caller lower it but
+# never raise it past the cap.
+EXO_MAX_TOKENS = _env_int("EXO_MAX_TOKENS", 2048)
+EXO_MODEL_DEFAULTS = {
+    # GLM-4.7-Flash has `thinking_toggle`, and at 6bit over two boxes its
+    # thinking phase can run for minutes. We keep thinking ON — the tier is
+    # called `think` and that is what it is for — and bound the total instead.
+    "glm-4.7-flash": {"max_tokens": EXO_MAX_TOKENS},
+}

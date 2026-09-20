@@ -677,6 +677,43 @@ def test_pool_status_reports_progress_for_a_swap():
           True)
 
 
+def test_pool_status_reports_busy():
+    """Running means a generation is in flight, readable without issuing one."""
+    state = json.loads(json.dumps(REAL_STATE))
+    state["runners"]["00c6ed85"] = {"RunnerRunning": {}}
+    state["runners"]["3c7551f4"] = {"RunnerRunning": {}}
+    st = exo_with(state).pool_status()
+    check("busy while generating", st["busy"], True)
+    check("still serviceable while busy", st["ready"], True)
+    check("model still named while busy", st["resident_model"],
+          "mlx-community/GLM-4.7-Flash-6bit")
+
+
+def test_pool_status_idle_is_not_busy():
+    state = json.loads(json.dumps(REAL_STATE))
+    state["runners"]["00c6ed85"] = {"RunnerReady": {}}
+    state["runners"]["3c7551f4"] = {"RunnerReady": {}}
+    st = exo_with(state).pool_status()
+    check("idle is not busy", st["busy"], False)
+    check("idle is ready", st["ready"], True)
+
+
+def test_busy_pool_still_resolves_so_the_lease_can_decline():
+    """A busy pool must reach the lease check, not short-circuit as unavailable.
+
+    exo only dispatches under RunnerReady, but the exclusive lease is what stops
+    us dispatching into a busy runner — so a mid-generation pool has to resolve
+    far enough for acquire_pool() to return the 409 that becomes a
+    `resource_busy` 503 with a retry hint. Declining it as `pool_unavailable`
+    here would lose the retry hint entirely.
+    """
+    state = json.loads(json.dumps(REAL_STATE))
+    state["runners"]["00c6ed85"] = {"RunnerRunning": {}}
+    state["runners"]["3c7551f4"] = {"RunnerRunning": {}}
+    check("busy pool still names a resident model",
+          exo_with(state).resident_model(), "mlx-community/GLM-4.7-Flash-6bit")
+
+
 def test_pool_status_one_read():
     """resident_model() must not fetch /state twice."""
     calls = []

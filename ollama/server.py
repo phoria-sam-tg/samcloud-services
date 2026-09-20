@@ -371,6 +371,12 @@ def _exo_pool_view() -> dict:
         status = mgr.exo.pool_status()
         view["resident_model"] = status["resident_model"]
         view["ready"] = status["ready"]
+        # A generation is in flight. Read from exo's runner states rather than
+        # from our own lease bookkeeping, so it is true even when the pool is
+        # driven directly rather than through this gateway. `busy` with no
+        # active lease on the resource is the wedge signature — a generation
+        # nobody is reading — which is what a client dying mid-request leaves.
+        view["busy"] = status["busy"]
         # Per-runner states, which carry layer progress while a swap is in
         # flight — the difference between "not ready" and "23/47 layers in".
         view["runners"] = {

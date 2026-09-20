@@ -123,6 +123,23 @@ def _instance_runners(entry: dict) -> list[str]:
 # pool that provably answered in 8.8s. Accepting too few refuses a working
 # pool; accepting too many routes a generation into a shard that is failed or
 # on its way out, which is worse.
+#
+# One important refinement, from `worker/runner/runner.py` on the wafer node:
+# exo's own dispatch accepts a `TextGeneration` **only** under
+# `isinstance(self.current_status, RunnerReady)`, and its fall-through is
+# `case _: raise ValueError(...outside of state machine...)`. So "serviceable"
+# here does NOT mean "will accept a generation this instant" — under
+# `RunnerRunning` it would not. It means "this instance is placed and
+# functional", and what keeps us from dispatching into a busy runner is the
+# **exclusive lease**, not this set: a pool mid-generation is already leased, so
+# `acquire_pool()` returns 409 and the caller gets `resource_busy` with a retry
+# hint long before anything is sent to exo.
+#
+# That division of labour is deliberate and worth not "fixing". Dropping
+# `RunnerRunning` from this set would make a busy pool report as
+# *pool_unavailable* — structurally a worse answer than *resource_busy*, since
+# it carries no `retry_after_s` and invites a caller to look for a
+# misconfiguration instead of coming back in a moment.
 _SERVICEABLE_RUNNER_STATES = frozenset({"RunnerReady", "RunnerRunning"})
 
 # Will be serviceable shortly, is not now. Failing closed on these is right,
@@ -257,9 +274,23 @@ class ExoClient:
             serviceable = bool(runner_ids) and all(
                 _runner_is_serviceable(runners.get(rid) or {}) for rid in runner_ids
             )
+            # `handle_generation_tasks` sets RunnerRunning on entry and restores
+            # RunnerReady only once `active_tasks` drains, so a Running runner
+            # means a generation is genuinely in flight — readable here without
+            # issuing one. Correlate it with lease state and it is also the
+            # wedge signature that cost an hour on 2026-09-20: Running with no
+            # active lease on the pool is a generation nobody is reading, which
+            # is the shape a client dying mid-request leaves behind. This client
+            # deliberately reports the signal and does not diagnose it — the
+            # registry half of that correlation is the manager's to know.
+            busy = any(
+                _runner_state_name(runners.get(rid) or {}) == "RunnerRunning"
+                for rid in runner_ids
+            )
             instances.append({
                 "model": model_id,
                 "serviceable": serviceable,
+                "busy": busy,
                 "runners": described,
             })
 
@@ -272,6 +303,7 @@ class ExoClient:
         return {
             "resident_model": live["model"] if live else None,
             "ready": live is not None,
+            "busy": bool(live and live["busy"]),
             "instances": instances,
         }
 

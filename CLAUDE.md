@@ -124,6 +124,18 @@ the 503 path the test exists for.
   on time and cannot extend one, and renewing by release-then-reacquire would open a
   window for a third party to take an exclusive resource mid-generation. `config.py`
   clamps the ordering rather than trusting the env.
+- **Comments carry causation badly** (ticket #770) — two false facts were written
+  into this codebase in one session and had to be pulled back out: that exo's
+  `stream: false` "returns 200 headers and then no body, ever", and that a client
+  failed because it "omits `stream`". Both were **real measurements with wrong
+  conclusions attached** — the first probed a pool that was already occupied, the
+  second trusted a client's own pre-send dump instead of the socket. Neither
+  survived contact with a second instrument.
+  A measurement ages well; the causal story attached to it does not, and a comment
+  is where the two become indistinguishable to a reader who was not there and
+  cannot check. So: record what was measured and how, keep the inference visibly
+  separate from it, and prefer "measured X under conditions Y" to "X because Y".
+  If a comment asserts *why*, it should say what would disconfirm it.
 - **Three pillars** — SAMcloud provides routing, resources, and auth
 
 ## Current State

@@ -1021,10 +1021,14 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
             # Loud, because the alternative is a caller receiving well-formed
             # prose where it asked for structured output, with a 200 and nothing
             # in any log. Neither this gateway nor exo implements it.
+            # Truncated: a JSON-schema response_format is routinely several KB,
+            # and this logs once per request into a file two instances of this
+            # service already share and have already misread each other's lines
+            # in. 200 characters keeps the signal and bounds the cost.
             log.warning(
-                f"response_format={req.response_format!r} requested for tier "
-                f"'{mm.tier}' and IGNORED — structured output is not supported "
-                f"by this backend. The answer will be free-form text."
+                f"response_format={str(req.response_format)[:200]} requested "
+                f"for tier '{mm.tier}' and IGNORED — structured output is not "
+                f"supported by this backend. The answer will be free-form text."
             )
 
         # Per-model defaults, with max_tokens treated as a ceiling rather than

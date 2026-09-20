@@ -147,8 +147,12 @@ class ExoClient:
 
     # A generation on the pool is minutes, not seconds: two boxes, ring
     # pipeline parallelism, and a reasoning model. Connect fast or fail, then
-    # wait a long time for tokens.
-    _generate_timeout = httpx.Timeout(connect=10, read=1800, write=30, pool=30)
+    # wait a long time for tokens. The read timeout is deliberately shorter
+    # than the exclusive lease's TTL — see config.EXO_LEASE_TTL for why the
+    # ordering matters.
+    _generate_timeout = httpx.Timeout(
+        connect=10, read=config.EXO_GENERATE_TIMEOUT, write=30, pool=30
+    )
 
     def chat(self, model: str, messages: list[dict], **kwargs) -> dict:
         """Non-streaming chat completion. A proxy: OpenAI in, OpenAI out."""
@@ -174,7 +178,9 @@ class ExoClient:
             async with session.post(
                 f"{self.base_url}/v1/chat/completions",
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=1800, sock_connect=10),
+                timeout=aiohttp.ClientTimeout(
+                    total=config.EXO_GENERATE_TIMEOUT, sock_connect=10
+                ),
             ) as resp:
                 resp.raise_for_status()
                 async for raw in resp.content:

@@ -920,6 +920,72 @@ def test_status_code_is_not_shadowed_by_the_body():
     check("shadowed conflict still declines", o.granted, False)
 
 
+# --- /v1/models discovery --------------------------------------------------
+
+def test_v1_models_lists_tier_and_never_touches_the_pool():
+    """Discovery must list the tier and must not read the pool to do it.
+
+    The pool read is the point: a wedged pool takes up to EXO_GENERATE_TIMEOUT
+    to fail, and a discovery call that hangs on it turns a listing into the
+    outage it is supposed to describe.
+    """
+    import asyncio, types
+    import ollama.server as srv
+
+    class ExplodingExo:
+        def pool_status(self, *a, **k):
+            raise AssertionError("/v1/models must not read the pool")
+        def pool_status_cached(self, *a, **k):
+            raise AssertionError("/v1/models must not read the pool")
+        def resident_model(self, *a, **k):
+            raise AssertionError("/v1/models must not read the pool")
+
+    class FakeOllama:
+        def list_models(self): return [{"name": "qwen3:1.7b"}, {"name": "qwen3.8:27b-mlx"}]
+    class FakeLlama:
+        def available_models(self): return [{"name": "qwen2.5-32b-agi-q4_k_m"}]
+
+    real = getattr(srv, "mgr", None)
+    srv.mgr = types.SimpleNamespace(
+        exo=ExplodingExo(), models={}, ollama=FakeOllama(), llama=FakeLlama())
+    try:
+        out = asyncio.run(srv.list_models_openai())
+    finally:
+        srv.mgr = real
+
+    ids = [m["id"] for m in out["data"]]
+    check("openai envelope", out["object"], "list")
+    check("every entry is a model object",
+          all(m["object"] == "model" for m in out["data"]), True)
+    check("tier listed", "think" in ids, True)
+    check("tier owned_by exo",
+          next(m["owned_by"] for m in out["data"] if m["id"] == "think"), "exo")
+    check("ollama models listed", "qwen3:1.7b" in ids, True)
+    check("gguf listed", "qwen2.5-32b-agi-q4_k_m" in ids, True)
+    check("no duplicates", len(ids), len(set(ids)))
+
+
+def test_v1_models_survives_a_dead_ollama():
+    """One catalogue being down must not fail the whole listing."""
+    import asyncio, types
+    import ollama.server as srv
+
+    class DeadOllama:
+        def list_models(self): raise RuntimeError("connection refused")
+    class FakeLlama:
+        def available_models(self): return []
+
+    real = getattr(srv, "mgr", None)
+    srv.mgr = types.SimpleNamespace(
+        exo=object(), models={}, ollama=DeadOllama(), llama=FakeLlama())
+    try:
+        out = asyncio.run(srv.list_models_openai())
+    finally:
+        srv.mgr = real
+    check("still returns a list", out["object"], "list")
+    check("tier still listed", "think" in [m["id"] for m in out["data"]], True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"Running {len(tests)} test groups\n")

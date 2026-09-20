@@ -329,6 +329,71 @@ async def status():
     return mgr.status()
 
 
+@app.get("/v1/models")
+async def list_models_openai():
+    """OpenAI-compatible model list.
+
+    Exists because the rest of this gateway's OpenAI surface lives under `/v1`
+    — `/v1/chat/completions`, `/v1/completions` — while the only listing was at
+    `/models`. A client that found chat where the standard puts it has every
+    reason to look for the list where the standard puts it too, and got a 404.
+    That is a discovery failure on an otherwise working backend, which is the
+    confusing kind: chat succeeds, so the endpoint is clearly right, but the
+    client cannot enumerate anything.
+
+    Deliberately cheap. It reports what this gateway can be *asked* for, not
+    what is resident — exactly as `/v1/models` does for every other
+    OpenAI-compatible server, where an unloaded model is still listed. The pool
+    tier is included whenever EXO is enabled rather than only when the pool is
+    ready, for the same reason: it is a configured route, and a request for it
+    while the pool is down gets the structured `pool_unavailable` 503 that path
+    already returns. Readiness lives on `/models` (`exo_pool.ready`,
+    `exo_pool.busy`) where there is somewhere to put it.
+
+    No pool read at all, so a wedged pool cannot make discovery hang — the one
+    thing that would turn a listing into the outage it is meant to describe.
+    """
+    now = int(time.time())
+    seen: set = set()
+    data: list[dict] = []
+
+    def add(model_id: str, owned_by: str):
+        if model_id and model_id not in seen:
+            seen.add(model_id)
+            data.append({
+                "id": model_id,
+                "object": "model",
+                "created": now,
+                "owned_by": owned_by,
+            })
+
+    # Tiers first: a caller asking this gateway for the pool asks by tier, and
+    # listing the resident model id instead would invite a request naming a
+    # model we cannot promise to still hold.
+    if config.EXO_ENABLED:
+        for tier in config.EXO_TIERS:
+            add(tier, "exo")
+
+    for name in mgr.models:
+        mm = mgr.models[name]
+        if mm.backend != Backend.EXO:      # tiers already added under their tier name
+            add(name, mm.backend.value)
+
+    try:
+        for m in mgr.ollama.list_models():
+            add(m.get("name", ""), "ollama")
+    except Exception as e:
+        log.warning(f"/v1/models: ollama catalogue unavailable: {e}")
+
+    try:
+        for m in mgr.llama.available_models():
+            add(m.get("name", ""), "llama-server")
+    except Exception as e:
+        log.warning(f"/v1/models: gguf catalogue unavailable: {e}")
+
+    return {"object": "list", "data": data}
+
+
 @app.get("/models")
 async def list_models():
     return {

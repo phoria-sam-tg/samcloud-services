@@ -675,12 +675,21 @@ class ModelManager:
         if not config.EXO_ENABLED:
             raise ExoUnavailable("exo backend is disabled (EXO_ENABLED=0)")
 
-        resident = self.exo.resident_model()   # raises ExoUnavailable if down
+        status = self.exo.pool_status()        # raises ExoUnavailable if down
+        resident = status["resident_model"]
         if not resident:
+            # Quote the runner states. Mid-swap these carry layer progress, so
+            # a caller learns "23/47 layers" instead of an opaque refusal on a
+            # wait that can run to ten minutes.
+            detail = "; ".join(
+                f"{i['model']}: {', '.join(i['runners'].values())}"
+                for i in status["instances"]
+            ) or "no instance placed"
             raise ExoUnavailable(
                 f"the exo pool at {config.EXO_BASE} is reachable but has no "
-                f"model resident and ready — it is most likely mid-swap, or "
-                f"was never placed after a reboot (it cannot restart itself)"
+                f"model resident and ready — it is most likely mid-swap, or was "
+                f"never placed after a reboot (it cannot restart itself). "
+                f"Runners: {detail}"
             )
 
         now = time.time()

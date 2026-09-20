@@ -590,6 +590,105 @@ def test_claim_leases_skips_the_pool():
     check("no lease requested for the pool", m.sc.request_lease.called, False)
 
 
+# --- runner states, against exo 0.3.70's actual enum --------------------------
+
+def test_all_eleven_states_classified():
+    """Every state exo defines must be classified, so none trips the warning.
+
+    The point of this test: the previous version of the unserviceable set was
+    written from observation and contained `RunnerStarting`, which does not
+    exist, while omitting six states that do. Normal startup would have logged
+    "not in this client's known set" for each one.
+    """
+    from ollama.exo_client import (
+        _SERVICEABLE_RUNNER_STATES, _PENDING_RUNNER_STATES,
+        _TERMINAL_RUNNER_STATES,
+    )
+    exo_states = {
+        "RunnerIdle", "RunnerConnecting", "RunnerConnected", "RunnerLoading",
+        "RunnerLoaded", "RunnerWarmingUp", "RunnerReady", "RunnerRunning",
+        "RunnerShuttingDown", "RunnerShutdown", "RunnerFailed",
+    }
+    known = (_SERVICEABLE_RUNNER_STATES | _PENDING_RUNNER_STATES
+             | _TERMINAL_RUNNER_STATES)
+    check("all 11 exo states classified", sorted(exo_states - known), [])
+    check("nothing invented", sorted(known - exo_states), [])
+    check("only Ready and Running serve",
+          sorted(_SERVICEABLE_RUNNER_STATES), ["RunnerReady", "RunnerRunning"])
+
+
+def test_pending_states_are_not_serviceable():
+    """Loading/Loaded/WarmingUp will serve shortly, but not now."""
+    for st in ("RunnerIdle", "RunnerConnecting", "RunnerConnected",
+               "RunnerLoading", "RunnerLoaded", "RunnerWarmingUp",
+               "RunnerShutdown"):
+        state = json.loads(json.dumps(REAL_STATE))
+        state["runners"]["00c6ed85"] = {st: {}}
+        check(f"{st} not serviceable", exo_with(state).resident_model(), None)
+
+
+def test_loading_reports_layer_progress():
+    """A swap in flight should say how far through, not just 'not ready'."""
+    from ollama.exo_client import describe_runner_state
+    got = describe_runner_state(
+        {"RunnerLoading": {"layers_loaded": 23, "total_layers": 47}}
+    )
+    check("layer progress surfaced", got, "RunnerLoading (23/47 layers)")
+    check("loading without counts still names the state",
+          describe_runner_state({"RunnerLoading": {}}), "RunnerLoading")
+
+
+def test_failed_reports_why():
+    from ollama.exo_client import describe_runner_state
+    got = describe_runner_state(
+        {"RunnerFailed": {"error_message": "metal OOM on shard 1"}}
+    )
+    check("failure reason surfaced", got, "RunnerFailed: metal OOM on shard 1")
+    check("failure without a message still names the state",
+          describe_runner_state({"RunnerFailed": {}}), "RunnerFailed")
+
+
+def test_describe_plain_states():
+    from ollama.exo_client import describe_runner_state
+    check("ready described", describe_runner_state({"RunnerReady": {}}),
+          "RunnerReady")
+    check("empty described", describe_runner_state({}), "unknown")
+
+
+def test_pool_status_reports_progress_for_a_swap():
+    """The whole point: mid-swap, the gateway can quote layer progress."""
+    state = {
+        "instances": {"new": {"MlxRingInstance": {
+            "instanceId": "new",
+            "shardAssignments": {"modelId": "mlx-community/GLM-5",
+                                 "runnerToShard": {"aaaaaaaa": {}, "bbbbbbbb": {}}},
+        }}},
+        "runners": {
+            "aaaaaaaa": {"RunnerLoading": {"layers_loaded": 12,
+                                           "total_layers": 47}},
+            "bbbbbbbb": {"RunnerReady": {}},
+        },
+    }
+    st = exo_with(state).pool_status()
+    check("not ready mid-swap", st["ready"], False)
+    check("no resident model mid-swap", st["resident_model"], None)
+    descriptions = list(st["instances"][0]["runners"].values())
+    check("progress is quotable", "RunnerLoading (12/47 layers)" in descriptions,
+          True)
+
+
+def test_pool_status_one_read():
+    """resident_model() must not fetch /state twice."""
+    calls = []
+    c = ExoClient()
+    def counting_state():
+        calls.append(1)
+        return REAL_STATE
+    c.state = counting_state
+    c.resident_model()
+    check("one /state read per resolve", len(calls), 1)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"Running {len(tests)} test groups\n")

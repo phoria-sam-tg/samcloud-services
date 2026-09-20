@@ -345,11 +345,11 @@ async def list_models():
         },
         "available_ollama": [m["name"] for m in mgr.ollama.list_models()],
         "available_gguf": mgr.llama.available_models(),
-        "exo_pool": _exo_pool_view(),
+        "exo_pool": await _exo_pool_view(),
     }
 
 
-def _exo_pool_view() -> dict:
+async def _exo_pool_view() -> dict:
     """What the pool can serve right now, for /models.
 
     Reports the resident model rather than exo's 121-entry catalogue: the
@@ -357,6 +357,21 @@ def _exo_pool_view() -> dict:
     invite requests for models that are a 30s-10min swap away. Never raises —
     a pool that is down should make this one key say so, not fail the whole
     listing.
+
+    Async, and the `/state` read goes to a thread, because `ExoClient` talks to
+    the pool over synchronous httpx. Calling it directly from this handler
+    blocked the event loop for the length of a few-hundred-KB fetch, which on
+    `main` also stalls `stats_loop` (15s) and, once the offering hold lifts,
+    `offering_loop` (30s) — an offering poll delayed behind a status read looks
+    like a memory-pressure change. Not newly broken; newly exposed, because
+    those two loops did not exist on the branch this came from.
+
+    `asyncio.to_thread` is the right tool *here* and was the wrong tool on the
+    generation path, which is worth stating so the two do not get unified later.
+    A thread cannot be cancelled: for a minutes-long generation holding an
+    exclusive lease that meant a disconnected client kept the pool, so that path
+    uses aiohttp. This is a bounded read of at most `timeout=15`, holds no lease,
+    and nothing is harmed by it finishing after the caller has gone.
     """
     if not config.EXO_ENABLED:
         return {"enabled": False}
@@ -368,7 +383,7 @@ def _exo_pool_view() -> dict:
         "allocation": "exclusive — one request at a time, leased per generation",
     }
     try:
-        status = mgr.exo.pool_status()
+        status = await asyncio.to_thread(mgr.exo.pool_status_cached)
         view["resident_model"] = status["resident_model"]
         view["ready"] = status["ready"]
         # A generation is in flight. Read from exo's runner states rather than

@@ -164,6 +164,11 @@ if EXO_LEASE_TTL < EXO_GENERATE_TIMEOUT + _EXO_TTL_MARGIN:
 # until it stops talking. Cap every request, and let the caller lower it but
 # never raise it past the cap.
 EXO_MAX_TOKENS = _env_int("EXO_MAX_TOKENS", 2048)
+
+# How long `GET /models` may reuse a pool status reading. Status display only —
+# the serving path always reads fresh, so this cannot route a request at a stale
+# resident model.
+EXO_STATUS_CACHE_S = _env_int("EXO_STATUS_CACHE_S", 5)
 EXO_MODEL_DEFAULTS = {
     # GLM-4.7-Flash has `thinking_toggle`, and at 6bit over two boxes its
     # thinking phase can run for minutes. We keep thinking ON — the tier is

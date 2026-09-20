@@ -726,6 +726,42 @@ def test_pool_status_one_read():
     check("one /state read per resolve", len(calls), 1)
 
 
+def test_status_cache_reuses_within_ttl():
+    calls = []
+    c = ExoClient()
+    def counting():
+        calls.append(1); return REAL_STATE
+    c.state = counting
+    a = c.pool_status_cached(ttl=60)
+    b = c.pool_status_cached(ttl=60)
+    check("cached within ttl", len(calls), 1)
+    check("same reading returned", a["resident_model"], b["resident_model"])
+
+
+def test_status_cache_refetches_after_ttl():
+    calls = []
+    c = ExoClient()
+    def counting():
+        calls.append(1); return REAL_STATE
+    c.state = counting
+    c.pool_status_cached(ttl=0)
+    c.pool_status_cached(ttl=0)
+    check("ttl=0 always refetches", len(calls), 2)
+
+
+def test_serving_path_never_uses_the_cache():
+    """resolve_exo_tier must read fresh: a stale resident model routes wrongly."""
+    calls = []
+    m = mgr()
+    def counting():
+        calls.append(1); return REAL_STATE
+    m.exo.state = counting
+    m.resolve_exo_tier("think")
+    m.models.pop("think", None)
+    m.resolve_exo_tier("think")
+    check("two resolves -> two /state reads", len(calls), 2)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"Running {len(tests)} test groups\n")

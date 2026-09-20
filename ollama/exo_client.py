@@ -27,6 +27,7 @@ Two things about this backend are unlike every other one behind the gateway:
 import asyncio
 import json
 import logging
+import time
 import httpx
 from dataclasses import dataclass, field
 from typing import Optional
@@ -222,6 +223,8 @@ def _runner_is_serviceable(runner_state: dict) -> bool:
 class ExoClient:
     base_url: str = EXO_BASE
     _http: httpx.Client = field(default=None, repr=False)
+    # (monotonic_timestamp, status) for pool_status_cached. Status reads only.
+    _status_cache: Optional[tuple] = field(default=None, repr=False)
 
     def __post_init__(self):
         # Short timeout for state/catalogue reads. Generation gets its own,
@@ -243,6 +246,27 @@ class ExoClient:
             return True
         except Exception:
             return False
+
+    def pool_status_cached(self, ttl: float = None) -> dict:
+        """`pool_status()`, memoised briefly. For status reads, never for serving.
+
+        `/state` is a few hundred KB on this pool and `GET /models` is polled,
+        so an uncached status view re-fetches the whole document per poll. A few
+        seconds of staleness is the right trade for a readiness display.
+
+        Deliberately NOT used on the serving path: `resolve_exo_tier()` calls
+        `pool_status()` directly, because routing a generation at a pool whose
+        resident model changed seconds ago is exactly the mistake this client
+        exists to avoid.
+        """
+        ttl = config.EXO_STATUS_CACHE_S if ttl is None else ttl
+        now = time.monotonic()
+        cached = self._status_cache
+        if cached is not None and (now - cached[0]) < ttl:
+            return cached[1]
+        status = self.pool_status()
+        self._status_cache = (now, status)
+        return status
 
     def pool_status(self) -> dict:
         """Everything the gateway needs about the pool, from one `/state` read.

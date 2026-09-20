@@ -445,6 +445,106 @@ def test_collect_accepts_full_message_shape():
     check("message shape read", out["choices"][0]["message"]["content"], "hello")
 
 
+def test_collect_propagates_pool_failure():
+    """A pool that fails the generation must raise, not return an empty answer.
+
+    An empty-but-successful answer would be indistinguishable from a model that
+    genuinely had nothing to say, and would be reported to the caller as a 200.
+    """
+    import asyncio
+    from ollama.exo_client import ExoRequestFailed
+
+    c = ExoClient()
+
+    async def failing_stream(model, messages, **kwargs):
+        raise ExoRequestFailed("the exo pool returned 500", status=500, body="boom")
+        yield  # pragma: no cover - makes this an async generator
+
+    c.chat_stream = failing_stream
+    try:
+        asyncio.run(c.chat_collect("m", [{"role": "user", "content": "hi"}]))
+        FAILS.append("chat_collect swallowed a pool failure")
+        print("  FAIL chat_collect swallowed a pool failure")
+    except ExoRequestFailed as e:
+        check("pool failure propagates", e.status, 500)
+        check("pool body kept", e.body, "boom")
+
+
+def test_collect_cancellation_propagates():
+    """Cancellation must not be swallowed — it is how the lease gets released."""
+    import asyncio
+
+    c = ExoClient()
+
+    async def hanging_stream(model, messages, **kwargs):
+        await asyncio.sleep(3600)
+        yield "data: {}"  # pragma: no cover
+
+    c.chat_stream = hanging_stream
+
+    async def run():
+        task = asyncio.ensure_future(
+            c.chat_collect("m", [{"role": "user", "content": "hi"}])
+        )
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+            return "completed"
+        except asyncio.CancelledError:
+            return "cancelled"
+
+    check("cancellation propagates", asyncio.run(run()), "cancelled")
+
+
+def test_exo_model_is_not_unloaded():
+    """unload() must never stop the pool, even with force=True."""
+    import time as _t
+    from ollama.manager import ManagedModel
+
+    m = mgr()
+    m.models["think"] = ManagedModel(
+        name="mlx-community/GLM-4.7-Flash-6bit", backend=Backend.EXO,
+        memory_mb=0, lease_id=None, port=0, loaded_at=_t.time(),
+        last_used=_t.time(), managed=False, tier="think",
+    )
+    out = m.unload("think", force=True)
+    check("pool is deregistered, not stopped", out["status"], "deregistered")
+    check("tier removed from registry", "think" in m.models, False)
+    check("no lease was released", m.sc.release_lease.called, False)
+
+
+def test_cooldown_never_touches_the_pool():
+    """The idle loop must not try to reclaim a pool it does not own."""
+    import time as _t
+    from ollama.manager import ManagedModel
+
+    m = mgr()
+    m.models["think"] = ManagedModel(
+        name="mlx-community/GLM-4.7-Flash-6bit", backend=Backend.EXO,
+        memory_mb=0, lease_id=None, port=0,
+        loaded_at=_t.time() - 99999, last_used=_t.time() - 99999,
+        managed=False, tier="think",
+    )
+    m.check_cooldowns()
+    check("pool tier survives cooldown", "think" in m.models, True)
+
+
+def test_claim_leases_skips_the_pool():
+    """Claiming a residency lease on an exclusive pool would close it at boot."""
+    import time as _t
+    from ollama.manager import ManagedModel
+
+    m = mgr()
+    m.models["think"] = ManagedModel(
+        name="mlx-community/GLM-4.7-Flash-6bit", backend=Backend.EXO,
+        memory_mb=0, lease_id=None, port=0, loaded_at=_t.time(),
+        last_used=_t.time(), managed=False, tier="think",
+    )
+    m.claim_leases()
+    check("no lease requested for the pool", m.sc.request_lease.called, False)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"Running {len(tests)} test groups\n")

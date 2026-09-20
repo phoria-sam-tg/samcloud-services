@@ -128,6 +128,7 @@ class PoolBusy(Exception):
         retry_after_s: Optional[int] = None,
         expires_at: Optional[str] = None,
         queue_position: Optional[int] = None,
+        error: str = "resource_busy",
     ):
         super().__init__(detail)
         self.detail = detail
@@ -135,11 +136,16 @@ class PoolBusy(Exception):
         self.retry_after_s = retry_after_s
         self.expires_at = expires_at
         self.queue_position = queue_position
+        # Lets a caller tell "someone holds the lease, come back" from "the
+        # pool says it is generating but holds no lease", which need different
+        # reactions: the first resolves itself, the second usually needs a
+        # human. Same body shape either way.
+        self.error = error
 
     def as_dict(self) -> dict:
         """Body for a 503, in the same shape as an insufficient_capacity one."""
         return {
-            "error": "resource_busy",
+            "error": self.error,
             "message": self.detail,
             "resource_id": self.resource_id,
             "queue_position": self.queue_position,

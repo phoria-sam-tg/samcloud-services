@@ -169,6 +169,12 @@ EXO_MAX_TOKENS = _env_int("EXO_MAX_TOKENS", 2048)
 # the serving path always reads fresh, so this cannot route a request at a stale
 # resident model.
 EXO_STATUS_CACHE_S = _env_int("EXO_STATUS_CACHE_S", 5)
+
+# Gap between the two `busy` samples the wedge guard takes before it declines.
+# One sample is an observation of a moving state; two a short interval apart
+# distinguish "a generation just finished" from "the slot is occupied and is
+# not progressing".
+EXO_WEDGE_RECHECK_S = float(_env("EXO_WEDGE_RECHECK_S", "1.0"))
 EXO_MODEL_DEFAULTS = {
     # GLM-4.7-Flash has `thinking_toggle`, and at 6bit over two boxes its
     # thinking phase can run for minutes. We keep thinking ON — the tier is

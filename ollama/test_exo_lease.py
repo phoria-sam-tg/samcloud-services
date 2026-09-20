@@ -21,11 +21,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from ollama.manager import ModelManager, Backend            # noqa: E402
 from ollama.exo_client import ExoClient, ExoUnavailable     # noqa: E402
 from ollama import capacity, config                         # noqa: E402
+
+# The wedge guard sleeps between its two samples; keep the suite quick.
+import ollama.manager as _mgr_mod                            # noqa: E402
+_mgr_mod.EXO_WEDGE_RECHECK_S = 0.01
 from ollama.samcloud import SamcloudClient                  # noqa: E402
 
 
+class _IdleExo:
+    """An exo client that reports a healthy, idle pool and touches no network.
+
+    `ModelManager` builds a real `ExoClient` by default, so any test calling
+    `acquire_pool()` was quietly reaching the live pool — which surfaced the
+    moment the wedge guard started reading it: the suite began failing because
+    the *actual* pool was wedged. An offline suite must not depend on that, in
+    either direction. Tests that want a busy or unreachable pool override this.
+    """
+    def pool_status(self):
+        return {"resident_model": "mlx-community/GLM-4.7-Flash-6bit",
+                "ready": True, "busy": False,
+                "instances": [{"model": "mlx-community/GLM-4.7-Flash-6bit",
+                               "serviceable": True, "busy": False,
+                               "runners": {"a": "RunnerReady",
+                                           "b": "RunnerReady"}}]}
+
+    def resident_model(self):
+        return self.pool_status()["resident_model"]
+
+
 def mgr() -> "ModelManager":
-    return ModelManager(sc=MagicMock())
+    m = ModelManager(sc=MagicMock())
+    m.exo = _IdleExo()
+    return m
 
 
 FAILS = []
@@ -751,16 +778,27 @@ def test_status_cache_refetches_after_ttl():
 
 
 def test_serving_path_never_uses_the_cache():
-    """resolve_exo_tier must read fresh: a stale resident model routes wrongly."""
+    """resolve_exo_tier must read fresh: a stale resident model routes wrongly.
+
+    Counts `pool_status` rather than `state`, because the uncached call is the
+    property under test — `pool_status_cached` is what the display path uses and
+    the serving path must not.
+    """
     calls = []
     m = mgr()
+    idle = m.exo.pool_status
+
     def counting():
-        calls.append(1); return REAL_STATE
-    m.exo.state = counting
+        calls.append(1)
+        return idle()
+
+    m.exo.pool_status = counting
+    m.exo.pool_status_cached = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("serving path must not use the cache"))
     m.resolve_exo_tier("think")
     m.models.pop("think", None)
     m.resolve_exo_tier("think")
-    check("two resolves -> two /state reads", len(calls), 2)
+    check("two resolves -> two uncached pool reads", len(calls), 2)
 
 
 # --- the serving path must not block the event loop ------------------------
@@ -984,6 +1022,117 @@ def test_v1_models_survives_a_dead_ollama():
         srv.mgr = real
     check("still returns a list", out["object"], "list")
     check("tier still listed", "think" in [m["id"] for m in out["data"]], True)
+
+
+# --- the wedge guard --------------------------------------------------------
+
+def _busy_status(busy: bool, runners=None):
+    return {"resident_model": "mlx-community/GLM-4.7-Flash-6bit",
+            "ready": True, "busy": busy,
+            "instances": [{"model": "mlx-community/GLM-4.7-Flash-6bit",
+                           "serviceable": True, "busy": busy,
+                           "runners": runners or {"a": "RunnerRunning",
+                                                  "b": "RunnerRunning"}}]}
+
+
+def test_wedged_pool_refuses_instead_of_hanging():
+    """Busy while we hold the only lease means wedged, not contended.
+
+    The real incident: a SIGKILL left exo's slot occupied with no reader, the
+    samcloud lease was free, so the gateway granted itself the lease and would
+    have dispatched into a runner that never answers — hanging for
+    EXO_GENERATE_TIMEOUT with the pool shut.
+    """
+    m = mgr()
+    m.sc.request_lease.return_value = {
+        "status_code": 200, "id": "lease_w", "status": "active",
+        "expires_at": "2999-01-01T00:00:00Z"}
+    m.exo.pool_status = lambda: _busy_status(True)
+    try:
+        m.acquire_pool("test")
+        FAILS.append("wedged pool did not refuse")
+        print("  FAIL wedged pool did not refuse")
+    except capacity.PoolBusy as e:
+        body = e.as_dict()
+        check("distinct error code", body["error"], "pool_busy_unleased")
+        check("not conflated with resource_busy", body["error"] != "resource_busy", True)
+        check("carries a retry hint", body["retry_after_s"], 60)
+        check("lease was given back", m.sc.release_lease.called, True)
+        check("nothing left tracked", len(m._pool_leases), 0)
+
+
+def test_idle_pool_still_acquires():
+    """The guard must not refuse a healthy pool."""
+    m = mgr()
+    m.sc.request_lease.return_value = {
+        "status_code": 200, "id": "lease_ok", "status": "active",
+        "expires_at": "2999-01-01T00:00:00Z"}
+    m.exo.pool_status = lambda: _busy_status(False, {"a": "RunnerReady",
+                                                     "b": "RunnerReady"})
+    check("idle pool grants", m.acquire_pool("test"), "lease_ok")
+    check("lease retained", "lease_ok" in m._pool_leases, True)
+    check("not released", m.sc.release_lease.called, False)
+
+
+def test_transient_busy_does_not_decline():
+    """One busy sample must not refuse a pool that is about to be free.
+
+    A generation finishing between acquire and the guard's read makes a single
+    sample say busy about a healthy pool — correct logic applied to one reading
+    of a moving thing, which is the shape of the RunnerReady-only bug.
+    """
+    m = mgr()
+    m.sc.request_lease.return_value = {
+        "status_code": 200, "id": "lease_t", "status": "active",
+        "expires_at": "2999-01-01T00:00:00Z"}
+    seq = [_busy_status(True), _busy_status(False, {"a": "RunnerReady",
+                                                    "b": "RunnerReady"})]
+    m.exo.pool_status = lambda: seq.pop(0)
+    check("busy-then-idle still grants", m.acquire_pool("test"), "lease_t")
+    check("lease kept", "lease_t" in m._pool_leases, True)
+    check("not released", m.sc.release_lease.called, False)
+
+
+def test_persistent_busy_takes_two_reads():
+    """And the refusal must be based on both samples, not the first."""
+    m = mgr()
+    m.sc.request_lease.return_value = {
+        "status_code": 200, "id": "lease_p", "status": "active",
+        "expires_at": "2999-01-01T00:00:00Z"}
+    reads = []
+    def counting():
+        reads.append(1); return _busy_status(True)
+    m.exo.pool_status = counting
+    try:
+        m.acquire_pool("test")
+        FAILS.append("persistently busy pool did not refuse")
+    except capacity.PoolBusy:
+        check("sampled twice before declining", len(reads), 2)
+
+
+def test_wedge_guard_tolerates_an_unreadable_pool():
+    """A failed guard read must not block a grant — it is a guard, not the gate."""
+    m = mgr()
+    m.sc.request_lease.return_value = {
+        "status_code": 200, "id": "lease_ok2", "status": "active",
+        "expires_at": "2999-01-01T00:00:00Z"}
+    def boom(): raise RuntimeError("state unreachable")
+    m.exo.pool_status = boom
+    check("grant survives an unreadable guard", m.acquire_pool("test"), "lease_ok2")
+
+
+def test_resource_busy_still_says_resource_busy():
+    """The 409 path keeps its own error code."""
+    m = mgr()
+    m.sc.request_lease.return_value = {
+        "status_code": 409,
+        "detail": {"detail": "held", "held_by": "x",
+                   "expires_at": "2999-01-01T00:00:00Z"}}
+    try:
+        m.acquire_pool("test")
+        FAILS.append("409 did not raise")
+    except capacity.PoolBusy as e:
+        check("409 keeps resource_busy", e.as_dict()["error"], "resource_busy")
 
 
 if __name__ == "__main__":

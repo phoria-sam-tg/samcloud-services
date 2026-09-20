@@ -66,6 +66,7 @@ VLM_DEFAULT_MEMORY_MB = 18700
 EXO_RESOURCE_ID = config.EXO_RESOURCE_ID
 EXO_TIERS = config.EXO_TIERS
 EXO_LEASE_TTL = config.EXO_LEASE_TTL
+EXO_WEDGE_RECHECK_S = config.EXO_WEDGE_RECHECK_S
 
 
 def match_exo_tier(model_name: str) -> bool:
@@ -968,6 +969,7 @@ class ModelManager:
                 f"Pool lease {outcome.lease_id} acquired for {purpose} "
                 f"(exclusive, TTL={EXO_LEASE_TTL}s)"
             )
+            self._refuse_if_wedged(outcome.lease_id)
             return outcome.lease_id
 
         if outcome.state == "queued":
@@ -993,6 +995,76 @@ class ModelManager:
             queue_position=outcome.queue_position,
             retry_after_s=retry_after,
             expires_at=outcome.expires_at,
+        )
+
+    def _refuse_if_wedged(self, lease_id: str):
+        """Having just won the exclusive lease, refuse if the pool says it is busy.
+
+        We hold the only lease, so a runner still reporting `RunnerRunning` is
+        not another lease-holder. It is one of two things and neither is safe to
+        dispatch into:
+
+        - **Wedged.** A previous client died mid-generation and exo was never
+          told, so its single slot is occupied by work nobody is reading. exo
+          has no cancellation path, so this does not clear itself.
+        - **Driven directly.** Someone is generating against `:52415` without
+          taking a lease, which the lease cannot prevent.
+
+        Without this check the gateway grants itself the lease and dispatches
+        anyway, and the caller hangs for EXO_GENERATE_TIMEOUT holding the pool
+        shut. That is not hypothetical: it is what this gateway did on
+        2026-09-20 after a SIGKILL stranded a generation, and the `busy` signal
+        that detects it already existed and was consumed by nothing.
+
+        exo dispatches `TextGeneration` only under `RunnerReady`, so refusing
+        here also matches the engine rather than merely being cautious.
+        """
+        # Two samples, not one. `busy` is an observation of something that
+        # moves: a generation finishing in the window between acquiring the
+        # lease and reading the pool makes a single sample say "busy" about a
+        # pool that is about to be free, and we would decline a working pool.
+        # That is the shape of the RunnerReady-only bug — correct logic applied
+        # to one reading of a moving thing — and the second read costs ~45ms on
+        # a path that routinely spends fifteen seconds.
+        runners = {}
+        for attempt in range(2):
+            if attempt:
+                time.sleep(EXO_WEDGE_RECHECK_S)
+            try:
+                status = self.exo.pool_status()
+            except Exception as e:
+                # A guard, not the readiness gate: if we cannot read the pool,
+                # let the generation attempt surface the real error rather than
+                # inventing a refusal from a failed probe.
+                log.warning(f"wedge guard could not read the pool: {e}")
+                return
+            if not status.get("busy"):
+                return
+            for inst in status.get("instances") or []:
+                if inst.get("busy"):
+                    runners = inst.get("runners") or {}
+                    break
+
+        log.error(
+            f"Pool busy across two reads while we hold the only lease — "
+            f"refusing to dispatch. Runners: {runners}"
+        )
+        self.release_pool(lease_id)
+        # Deliberately does not assert a wedge. Until every consumer goes
+        # through this gateway, a legitimate caller driving :52415 directly
+        # trips this too, and that is not a fault — the pool genuinely is busy.
+        # Naming the observation rather than the diagnosis keeps the next reader
+        # from being sent after a phantom.
+        raise capacity.PoolBusy(
+            "the pool is serving a request that holds no lease, so this gateway "
+            "cannot serialise against it: either something is driving exo "
+            "directly, or a client died mid-generation and left the slot "
+            "occupied (exo has no cancellation path, so that does not clear "
+            "itself and re-placing the model is the fix). Declining rather than "
+            "dispatching into it, which would hang instead of serving.",
+            resource_id=EXO_RESOURCE_ID,
+            retry_after_s=60,
+            error="pool_busy_unleased",
         )
 
     def release_pool(self, lease_id: Optional[str]):

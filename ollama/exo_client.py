@@ -366,17 +366,26 @@ class ExoClient:
     )
 
     def chat(self, model: str, messages: list[dict], **kwargs) -> dict:
-        """exo's own non-streaming endpoint. NOT used by the gateway — see below.
+        """exo's own non-streaming endpoint. Works; the gateway still prefers
+        `chat_collect()`, and the reason is no longer the one first recorded here.
 
-        Measured 2026-09-20, probing the pool directly and bypassing the gateway
-        entirely: `stream: false` returns `200` headers immediately and then
-        never sends a body. Two runs, 240s each, `size_download=0`. The gateway
-        therefore serves non-streaming callers through `chat_collect()`, which
-        streams and aggregates.
+        **Retraction.** This docstring used to say `stream: false` returns 200
+        headers and then never a body, "measured, two runs, 240s each,
+        size_download=0". That measurement was real and the conclusion drawn
+        from it was wrong: both probes hit a pool that was already occupied —
+        the first while an 11-minute generation was still running, the second
+        after a killed client had wedged the slot. A pool with no free slot
+        accepts the request and emits keep-alives, which is what was observed.
+        Re-measured 2026-09-20 against a healthy re-placed pool: `stream: false`
+        returns a complete body with usage in ~17s.
 
-        Kept because it is the obvious thing for the next person to reach for,
-        and a docstring saying "measured, does not return" is cheaper than them
-        rediscovering it against a resource that serves one request at a time.
+        So this is a working endpoint, and the note against reaching for it was
+        an artefact of measuring a busy resource. `chat_collect()` remains the
+        gateway's path for reasons that do not depend on the retracted claim:
+        it is cancellable, so a client that disconnects actually closes the
+        socket to exo instead of leaving a generation running with the pool
+        leased behind it, and it pins no worker thread for a generation that can
+        run for minutes. Both were measured independently.
         """
         payload = {"model": model, "messages": messages, "stream": False, **kwargs}
         r = self._http.post(
@@ -388,10 +397,10 @@ class ExoClient:
     async def chat_collect(self, model: str, messages: list[dict], **kwargs) -> dict:
         """A non-streaming answer, assembled from the streaming endpoint.
 
-        Gives a caller the plain OpenAI response shape they asked for without
-        using exo's `stream: false` (see `chat()` — it does not return a body).
-        Streaming and aggregating has two further properties that matter
-        specifically on an exclusive resource:
+        Gives a caller the plain OpenAI response shape they asked for. Not
+        because exo's `stream: false` is broken — see the retraction in `chat()`;
+        it works — but for two properties that matter on an exclusive resource
+        and were measured on their own:
 
         - **It is cancellable.** aiohttp drops the connection when the
           coroutine is cancelled, so a client that walks away actually closes

@@ -1246,6 +1246,30 @@ def test_httpx_is_resolvable_where_it_is_caught():
     """
     import ollama.manager as _m
     check("httpx at module scope", hasattr(_m, "httpx"), True)
+def test_stream_defaults_to_false_like_openai():
+    """An omitted `stream` must mean non-streaming, on both request models.
+
+    It defaulted to True, so a client that omitted the field got SSE where the
+    OpenAI contract promises a JSON object. The failure is expensive to diagnose
+    because the SSE is *correct* — Hermes reported "empty stream with no
+    finish_reason" against 121 well-formed chunks and three retries, which sends
+    the reader after a malformed-stream ghost that does not exist.
+
+    `/v1/completions` had the identical default, so fixing only the route one
+    client happens to use leaves the same trap for the next one.
+    """
+    import ollama.server as srv
+    for model_name in ("ChatRequest", "CompletionRequest"):
+        model = getattr(srv, model_name)
+        field = model.model_fields["stream"]
+        check(f"{model_name}.stream default is False", field.default, False)
+
+    built = srv.ChatRequest(model="think", messages=[{"role": "user", "content": "x"}])
+    check("omitted stream -> False on ChatRequest", built.stream, False)
+    built2 = srv.CompletionRequest(model="think", prompt="x")
+    check("omitted stream -> False on CompletionRequest", built2.stream, False)
+    explicit = srv.ChatRequest(model="think", messages=[], stream=True)
+    check("explicit stream=True still honoured", explicit.stream, True)
 
 
 if __name__ == "__main__":

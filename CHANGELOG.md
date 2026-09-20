@@ -116,10 +116,13 @@ by a TTL that `config.py` clamps to exceed `EXO_GENERATE_TIMEOUT` — the regist
 leases on time and cannot extend one, and renewing by release-then-reacquire would open a
 window for a third party to take the resource mid-generation.
 
-**Two things measured about exo itself.** Its `stream: false` returns `200` headers and
-then no body at all (two runs, 240s, zero bytes, probed directly with the gateway out of
-the path), so non-streaming callers are served by `chat_collect()`, which streams and
-aggregates. That also made the path cancellable: the first version used
+**Two things measured about exo itself.** Its `stream: false` was recorded here as
+returning `200` headers and then no body at all — **that conclusion is retracted.** Both
+probes hit a pool with no free slot (one mid-generation, one wedged), and a busy exo
+accepts the request and emits keep-alives. Re-measured against a healthy pool it returns
+a complete body with usage in ~17s. Non-streaming callers are still served by
+`chat_collect()`, for reasons that do not depend on the retracted claim: it is
+cancellable and pins no worker thread. That also made the path cancellable: the first version used
 `asyncio.to_thread` around a sync call, and because a thread cannot be cancelled, a
 client that disconnected held the pool for the rest of the generation and blocked the
 gateway's own graceful shutdown.

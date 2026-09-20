@@ -231,7 +231,14 @@ class UnloadRequest(BaseModel):
 class ChatRequest(BaseModel):
     model: str
     messages: list[dict]
-    stream: bool = True
+    # OpenAI's default is non-streaming, and a client that omits the field
+    # expects a JSON object. This defaulted to True, so an omitted `stream` got
+    # SSE — well-formed SSE, which is what made it expensive to diagnose: the
+    # caller reports a malformed or empty stream and the stream is fine, it is
+    # simply not what was asked for. Hermes omits the field and failed three
+    # retries with "empty stream with no finish_reason" against 121 correct
+    # chunks. Matching the standard is the fix.
+    stream: bool = False
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     tools: Optional[list[dict]] = None
@@ -240,7 +247,7 @@ class ChatRequest(BaseModel):
 class CompletionRequest(BaseModel):
     model: str
     prompt: str
-    stream: bool = True
+    stream: bool = False          # same reason as ChatRequest
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
 

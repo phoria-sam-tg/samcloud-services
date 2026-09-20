@@ -174,6 +174,38 @@ Request arrives
             3. GPU memory freed
 ```
 
+## Which launchd job actually runs this
+
+**Read the running process, not the file that claims to configure it.** Both services
+on `claude-services-slice` are started by labels that do *not* match the plists sitting
+in `~/Library/LaunchAgents`, and the stale plists carry settings that are not in force.
+
+| what runs | label | launcher | the plist that is **not** loaded |
+|---|---|---|---|
+| model-service | `com.samcloud.cs-model-service` | `/Library/LaunchDaemons/...plist` | `~/Library/LaunchAgents/com.samcloud.model-service.plist` |
+| ollama | `com.samcloud.cs-ollama` | `~/.local/bin/cs-ollama-run.sh` | `~/Library/LaunchAgents/com.samcloud.ollama.plist` |
+
+One line settles it, on any box, without knowing anything about that box —
+`XPC_SERVICE_NAME` in the process environment names the launchd label that
+actually started it:
+
+```bash
+ps eww $(pgrep -x ollama | head -1) | tr ' ' '\n' | grep XPC_SERVICE_NAME
+# -> XPC_SERVICE_NAME=com.samcloud.cs-ollama
+```
+
+If that does not match the plist you are about to trust, the plist is not in force.
+This cost a day on #748: `com.samcloud.ollama.plist` declares
+`OLLAMA_FLASH_ATTENTION` and `OLLAMA_KV_CACHE_TYPE=q8_0`, they were reported as
+live on two occasions, and the running process had neither — slice paid 1.79x for
+KV cache for weeks as a result. Both stale plists are left in place on purpose,
+with a header saying they are not loaded; an unexplained file disappearing is a
+worse artifact than a misleading one.
+
+Neither service can be restarted with `launchctl kickstart` from this seat
+(`cs-model-service` is a system daemon; `cs-ollama` is not in the user domain).
+Both have `KeepAlive` set, so `kill -TERM <pid>` and launchd respawns in ~1s.
+
 ## Configuration
 
 ### Environment Variables

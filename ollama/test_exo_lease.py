@@ -308,6 +308,51 @@ def test_resident_model_real_state():
           "mlx-community/GLM-4.7-Flash-6bit")
 
 
+def test_resident_model_with_ready_runners():
+    """RunnerReady is serviceable. Regression: accepting only RunnerRunning made
+    this gateway decline a re-placed pool that answered in 8.8s."""
+    state = json.loads(json.dumps(REAL_STATE))
+    state["runners"]["00c6ed85"] = {"RunnerReady": {}}
+    state["runners"]["3c7551f4"] = {"RunnerReady": {}}
+    check("ready runners are serviceable",
+          exo_with(state).resident_model(), "mlx-community/GLM-4.7-Flash-6bit")
+
+
+def test_resident_model_mixed_ready_and_running():
+    state = json.loads(json.dumps(REAL_STATE))
+    state["runners"]["00c6ed85"] = {"RunnerReady": {}}
+    check("ready + running is serviceable",
+          exo_with(state).resident_model(), "mlx-community/GLM-4.7-Flash-6bit")
+
+
+def test_resident_none_when_runner_failed():
+    """The state the wedged pool was actually in."""
+    state = json.loads(json.dumps(REAL_STATE))
+    state["runners"]["00c6ed85"] = {"RunnerFailed": {}}
+    check("failed runner is not serviceable",
+          exo_with(state).resident_model(), None)
+
+
+def test_resident_none_on_unknown_runner_state():
+    """An unrecognised state is refused, not guessed at."""
+    state = json.loads(json.dumps(REAL_STATE))
+    state["runners"]["00c6ed85"] = {"RunnerSomethingNew": {}}
+    check("unknown state refused",
+          exo_with(state).resident_model(), None)
+
+
+def test_resident_picks_serviceable_instance():
+    """A failed instance must not mask a good one for the same model."""
+    state = json.loads(json.dumps(REAL_STATE))
+    state["instances"]["dead"] = {"MlxRingInstance": {
+        "instanceId": "dead",
+        "shardAssignments": {"modelId": "mlx-community/Old-Model",
+                             "runnerToShard": {"e282ff2d": {}}},
+    }}
+    check("serviceable instance still found",
+          exo_with(state).resident_model(), "mlx-community/GLM-4.7-Flash-6bit")
+
+
 def test_resident_none_when_runner_shutting_down():
     """Mid-swap: the instance is still listed but its runner is going away."""
     state = json.loads(json.dumps(REAL_STATE))

@@ -1030,7 +1030,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                         # which surfaces as "empty stream with no finish_reason"
                         # while curl prints the text and looks correct. Measured:
                         # exo emits b': keep-alive\n\n', the gateway emitted b'...\n'.
-                        yield line + "\n\n"
+                        yield line + "\n"
                 except asyncio.CancelledError:
                     log.info(f"Client disconnected during pool stream for {mm.name}")
                     raise
@@ -1156,10 +1156,10 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                         timeout=None,
                     ) as resp:
                         async for line in resp.aiter_lines():
-                            if line:
+                            # blank lines are forwarded: they terminate SSE events
                                 # "\n\n": a blank line terminates an SSE event, and
                                 # aiter_lines() drops them. Same defect as the exo path.
-                                yield line + "\n\n"
+                                yield line + "\n"
             return StreamingResponse(stream(), media_type="text/event-stream")
         else:
             async with httpx.AsyncClient() as client:
@@ -1230,10 +1230,10 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                             timeout=None,
                         ) as resp:
                             async for line in resp.aiter_lines():
-                                if line:
+                                # blank lines are forwarded: they terminate SSE events
                                     # "\n\n": a blank line terminates an SSE event, and
                                     # aiter_lines() drops them. Same defect as the exo path.
-                                    yield line + "\n\n"
+                                    yield line + "\n"
                 return StreamingResponse(stream(), media_type="text/event-stream")
         else:
             async with httpx.AsyncClient() as client:
@@ -1308,10 +1308,10 @@ async def completions(req: CompletionRequest):
                         timeout=None,
                     ) as resp:
                         async for line in resp.aiter_lines():
-                            if line:
+                            # blank lines are forwarded: they terminate SSE events
                                 # "\n\n": a blank line terminates an SSE event, and
                                 # aiter_lines() drops them. Same defect as the exo path.
-                                yield line + "\n\n"
+                                yield line + "\n"
             return StreamingResponse(stream(), media_type="text/event-stream")
         else:
             async with httpx.AsyncClient() as client:

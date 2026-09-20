@@ -470,6 +470,11 @@ class ExoClient:
     async def chat_stream(self, model: str, messages: list[dict], **kwargs):
         """Streaming chat completion, yielding raw SSE lines for passthrough.
 
+        "Raw" includes the blank lines, which it did not before: this docstring
+        claimed passthrough while the loop filtered them. The stated intent was
+        right and the implementation quietly was not, which is how the framing
+        defect survived every review of this file.
+
         aiohttp rather than httpx for the same reason `ollama_client` uses it:
         it drops the connection when the coroutine is cancelled, so a client
         that disconnects mid-generation does not leave the socket — or, here,
@@ -495,9 +500,16 @@ class ExoClient:
                         status=resp.status, body=body,
                     )
                 async for raw in resp.content:
-                    line = raw.decode(errors="replace").rstrip("\r\n")
-                    if line:
-                        yield line
+                    # Blank lines are yielded too. In SSE a blank line is not
+                    # whitespace, it is the event terminator — dropping it and
+                    # letting the caller re-add a single newline collapsed the
+                    # whole response into one unterminated event whose data
+                    # field was every chunk's JSON concatenated, which parses as
+                    # nothing. Preserving them makes `line + "\n"` downstream an
+                    # exact reproduction of exo's framing, including a
+                    # multi-line event, rather than a reconstruction that is
+                    # only right while every event happens to be one line.
+                    yield raw.decode(errors="replace").rstrip("\r\n")
         except aiohttp.ClientError as e:
             raise ExoRequestFailed(f"exo transport error: {e}")
         except asyncio.TimeoutError:

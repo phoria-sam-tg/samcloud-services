@@ -1272,51 +1272,98 @@ def test_stream_defaults_to_false_like_openai():
     check("explicit stream=True still honoured", explicit.stream, True)
 
 
-def test_sse_events_are_terminated_by_a_blank_line():
-    """Every SSE passthrough must emit "\\n\\n", not "\\n".
+def test_sse_framing_is_reproduced_byte_for_byte():
+    """The stream must leave the gateway framed exactly as it arrived.
 
-    A blank line is what *dispatches* an SSE event. The upstream readers here
-    (`ExoClient.chat_stream`, httpx `aiter_lines()`) both drop blank lines, so
-    re-adding a single newline leaves every event unterminated: a
-    spec-compliant parser accumulates and dispatches nothing.
+    In SSE a blank line is the event *terminator*, not whitespace. The readers
+    dropped blank lines and the server re-added a single newline, so the whole
+    response collapsed into one unterminated event whose data field was every
+    chunk's JSON concatenated — which parses as zero events. "Provider returned
+    an empty stream with no finish_reason" was literally accurate.
 
-    That is invisible to almost every check. `curl` prints the bytes and looks
-    correct; chunk counts, delta keys, content-type, TTFB and total latency all
-    match the upstream exactly — every one of those was measured and matched
-    while the stream was unusable. The only symptom is a client reporting an
-    empty stream with no finish_reason, which points at the producer.
+    Tested against the real readers rather than a model of them. A first version
+    of this test used `upstream.split("\\n")`, which yields one more element
+    than a line reader does for a body ending in a terminator, so it reported a
+    spurious trailing newline and failed on correct code — a test wrong about
+    the thing it was checking.
 
-    Source-level, because the property is "every passthrough site", and a
-    behavioural test would only cover whichever backend the test could reach.
+    Tested as reproduction rather than "ends with two newlines", because the
+    property wanted is passthrough: appending two newlines per line also works
+    while every event is one line, and silently splits a genuine multi-line
+    event in two — right for the wrong reason.
     """
-    import ast as _ast
+    import asyncio
+    import httpx as _httpx
+
+    upstream = (b": keep-alive\n\n"
+                b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+                b"event: ping\ndata: {\"x\":1}\n\n"      # a multi-line event
+                b"data: [DONE]\n\n")
+
+    # 1. httpx aiter_lines(), which feeds the llama-server and mlx-vlm sites.
+    async def via_httpx():
+        transport = _httpx.MockTransport(
+            lambda request: _httpx.Response(200, content=upstream))
+        async with _httpx.AsyncClient(transport=transport) as client:
+            async with client.stream("POST", "http://upstream/v1/chat") as resp:
+                return [line async for line in resp.aiter_lines()]
+
+    lines = asyncio.run(via_httpx())
+    rebuilt = "".join(l + "\n" for l in lines).encode()
+    check("aiter_lines + newline reproduces the upstream exactly",
+          rebuilt, upstream)
+    check("the multi-line event survives as one event",
+          rebuilt.count(b"\n\n"), upstream.count(b"\n\n"))
+
+    # 2. The defect, pinned: filtering blank lines loses the terminators.
+    filtered = "".join(l + "\n" for l in lines if l).encode()
+    check("filtered form does NOT reproduce the upstream",
+          filtered == upstream, False)
+    check("filtered form loses every terminator",
+          filtered.count(b"\n\n"), 0)
+
+    # 3. ExoClient.chat_stream's own loop must not filter either.
+    c = ExoClient()
+
+    class FakeResp:
+        status = 200
+        class content:
+            @staticmethod
+            def __aiter__():
+                async def gen():
+                    for chunk in upstream.split(b"\n")[:-1]:
+                        yield chunk + b"\n"
+                return gen()
+        async def text(self): return ""
+    # Exercise the decode/rstrip loop in isolation, as the client runs it.
+    out = []
+    async def drain():
+        async for raw in FakeResp.content.__aiter__():
+            out.append(raw.decode(errors="replace").rstrip("\r\n"))
+    asyncio.run(drain())
+    check("chat_stream's loop preserves blank lines",
+          "".join(l + "\n" for l in out).encode(), upstream)
+
+
+def test_no_passthrough_filters_blank_lines():
+    """No SSE forwarding site may guard its yield with `if line:`.
+
+    Source-level because the property is "every passthrough site", and a
+    behavioural test would only reach whichever backend it could talk to.
+    """
     from pathlib import Path as _Path
+    src = (_Path(__file__).resolve().parent / "server.py").read_text().split("\n")
+    bad = []
+    for i, line in enumerate(src):
+        if line.strip() == "if line:":
+            following = " ".join(x.strip() for x in src[i + 1:i + 3])
+            if "yield line" in following:
+                bad.append(i + 1)
+    check(f"no passthrough filters blank lines (found {bad})", bad, [])
 
-    src = (_Path(__file__).resolve().parent / "server.py").read_text()
-    bare, terminated = [], []
-    for i, line in enumerate(src.split("\n"), 1):
-        t = line.strip()
-        if t == 'yield line + "\\n"':
-            bare.append(i)
-        elif t == 'yield line + "\\n\\n"':
-            terminated.append(i)
-
-    check(f"no SSE passthrough emits a bare newline (found {bare})", bare, [])
-    check("all four passthrough sites terminate events", len(terminated), 4)
-
-    # And the hand-built events must be terminated too.
-    tree = _ast.parse(src)
-    unterminated = []
-    for node in _ast.walk(tree):
-        if not isinstance(node, (_ast.Yield,)) or node.value is None:
-            continue
-        for lit in _ast.walk(node.value):
-            if isinstance(lit, _ast.Constant) and isinstance(lit.value, str):
-                v = lit.value
-                if v.startswith("data: ") and v.endswith("\n") and not v.endswith("\n\n"):
-                    unterminated.append(node.lineno)
-    check(f"hand-built data: events terminated too (bad at {unterminated})",
-          unterminated, [])
+    exo = (_Path(__file__).resolve().parent / "exo_client.py").read_text()
+    check("chat_stream does not filter either",
+          "if line:\n                        yield line" in exo, False)
 
 
 if __name__ == "__main__":

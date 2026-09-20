@@ -93,24 +93,49 @@ def _instance_runners(entry: dict) -> list[str]:
     return []
 
 
-# Runner states that mean "this shard can take a request". Runner state is
-# variant-tagged like the instance: `{"RunnerRunning": {}}`, `{"RunnerReady": {}}`.
+# exo's runner lifecycle, from `src/exo/shared/types/worker/runners.py`
+# (exo 0.3.70), confirmed by the engine's author rather than inferred from a
+# reading of `/state`. Runner state is variant-tagged like the instance:
+# `{"RunnerReady": {}}`, `{"RunnerLoading": {...}}`.
 #
-# Both of these are serviceable, and getting that wrong is not a small error in
-# either direction. The first version of this accepted only `RunnerRunning`,
-# which was the state the pool happened to be in when it was first read. A
-# re-placement on 2026-09-20 brought the new instance up with both runners in
-# `RunnerReady` — a pool that provably answered in 8.8s — and this gateway
-# reported it unavailable and declined every request with a 503. Accepting too
-# few states refuses a working pool; accepting too many routes a request into a
-# shard that is failed or on its way out, which is worse. So the set is
-# explicit, and anything outside it is refused *and logged* rather than guessed
-# at, because an unknown state on an exclusive resource is not a safe default.
-_SERVICEABLE_RUNNER_STATES = frozenset({"RunnerRunning", "RunnerReady"})
+#   RunnerIdle          pre-load
+#   RunnerConnecting    pre-load, ring dialling
+#   RunnerConnected     pre-load, ring formed, no weights
+#   RunnerLoading       loading weights (carries layers_loaded / total_layers)
+#   RunnerLoaded        weights in, not warm
+#   RunnerWarmingUp     warming
+#   RunnerReady         loaded, warm, idle      <- serviceable
+#   RunnerRunning       mid-generation          <- serviceable
+#   RunnerShuttingDown  going away
+#   RunnerShutdown      gone
+#   RunnerFailed        carries error_message and diagnostics
+#
+# Only `Ready` and `Running` can take a request. `Ready -> Running -> Ready` is
+# the runtime toggle and `Loading -> Loaded -> WarmingUp -> Ready` the startup
+# progression, so the same name means "idle" in one reading and the pool is
+# mid-generation in another — exo's own `BaseRunnerStatus.is_running()` is
+# exactly `isinstance(self, RunnerRunning)`.
+#
+# Getting this set wrong is not a small error in either direction, and it has
+# been wrong both ways. The first version accepted only `RunnerRunning` —
+# the state the pool happened to be in the first time it was read — so when the
+# pool was re-placed with both runners `RunnerReady`, this gateway declined a
+# pool that provably answered in 8.8s. Accepting too few refuses a working
+# pool; accepting too many routes a generation into a shard that is failed or
+# on its way out, which is worse.
+_SERVICEABLE_RUNNER_STATES = frozenset({"RunnerReady", "RunnerRunning"})
 
-# Known-bad, listed so an expected failure is not logged as a surprise.
-_UNSERVICEABLE_RUNNER_STATES = frozenset({
-    "RunnerShuttingDown", "RunnerFailed", "RunnerStarting", "RunnerLoading",
+# Will be serviceable shortly, is not now. Failing closed on these is right,
+# and naming them means a decline during a model swap is an expected event in
+# the log rather than an unknown-state warning.
+_PENDING_RUNNER_STATES = frozenset({
+    "RunnerIdle", "RunnerConnecting", "RunnerConnected",
+    "RunnerLoading", "RunnerLoaded", "RunnerWarmingUp",
+})
+
+# Will not become serviceable without intervention.
+_TERMINAL_RUNNER_STATES = frozenset({
+    "RunnerShuttingDown", "RunnerShutdown", "RunnerFailed",
 })
 
 
@@ -120,6 +145,37 @@ def _runner_state_name(runner_state: dict) -> Optional[str]:
         for key in runner_state:
             return key
     return None
+
+
+def _runner_state_body(runner_state: dict) -> dict:
+    """The payload inside a runner state variant, if it carries one."""
+    if isinstance(runner_state, dict):
+        for value in runner_state.values():
+            return value if isinstance(value, dict) else {}
+    return {}
+
+
+def describe_runner_state(runner_state: dict) -> str:
+    """A runner's state as something worth putting in front of a person.
+
+    `RunnerLoading` carries `layers_loaded` / `total_layers`, which turns the
+    30-second-to-10-minute model swap from an opaque refusal into a progress
+    report, and `RunnerFailed` carries `error_message`, so a pool that dies at
+    3am says why in this gateway's log instead of only in exo's.
+    """
+    name = _runner_state_name(runner_state)
+    if name is None:
+        return "unknown"
+    body = _runner_state_body(runner_state)
+    if name == "RunnerLoading":
+        loaded, total = body.get("layers_loaded"), body.get("total_layers")
+        if loaded is not None and total:
+            return f"{name} ({loaded}/{total} layers)"
+    if name == "RunnerFailed":
+        why = body.get("error_message") or body.get("error")
+        if why:
+            return f"{name}: {str(why)[:300]}"
+    return name
 
 
 def _runner_is_serviceable(runner_state: dict) -> bool:
@@ -132,11 +188,14 @@ def _runner_is_serviceable(runner_state: dict) -> bool:
     name = _runner_state_name(runner_state)
     if name in _SERVICEABLE_RUNNER_STATES:
         return True
-    if name is not None and name not in _UNSERVICEABLE_RUNNER_STATES:
+    if name is not None and name not in (
+        _PENDING_RUNNER_STATES | _TERMINAL_RUNNER_STATES
+    ):
         log.warning(
-            "exo runner state %r is not in this client's known set; treating the "
-            "shard as not serviceable. If it means the runner is ready, add it to "
-            "_SERVICEABLE_RUNNER_STATES — until then the pool reads as unavailable.",
+            "exo runner state %r is not in this client's known set (exo 0.3.70 "
+            "has eleven); treating the shard as not serviceable. If it means the "
+            "runner can serve, add it to _SERVICEABLE_RUNNER_STATES — until then "
+            "the pool reads as unavailable.",
             name,
         )
     return False
@@ -168,14 +227,16 @@ class ExoClient:
         except Exception:
             return False
 
-    def resident_model(self) -> Optional[str]:
-        """The model the pool is holding and ready to serve, or None.
+    def pool_status(self) -> dict:
+        """Everything the gateway needs about the pool, from one `/state` read.
 
-        "Ready" means every runner backing the instance reports
-        `RunnerRunning`. During a model swap the old instance's runners go
-        `RunnerShuttingDown` while the new one's come up, and for that window
-        there is genuinely nothing resident — which is the honest answer to
-        give a caller, rather than naming a model that cannot serve.
+        One read rather than one per question: `/state` is a few hundred KB on
+        this pool, and `resident_model()` plus a separate readiness probe would
+        fetch it twice per request and could disagree between the two.
+
+        Returns `resident_model` (the model that can serve a request now, or
+        None) alongside a per-runner description of whatever instance was
+        examined — so a decline can say *why* and, mid-swap, *how far through*.
         """
         try:
             state = self.state()
@@ -183,22 +244,48 @@ class ExoClient:
             raise ExoUnavailable(f"exo pool at {self.base_url} unreachable: {e}")
 
         runners = state.get("runners") or {}
+        instances = []
         for entry in (state.get("instances") or {}).values():
             model_id = _instance_model(entry)
             if not model_id:
                 continue
             runner_ids = _instance_runners(entry)
-            if runner_ids and all(
+            described = {
+                rid[:8]: describe_runner_state(runners.get(rid) or {})
+                for rid in runner_ids
+            }
+            serviceable = bool(runner_ids) and all(
                 _runner_is_serviceable(runners.get(rid) or {}) for rid in runner_ids
-            ):
-                return model_id
-            log.info(
-                "exo instance for %s is not serviceable: runner states %s",
-                model_id,
-                {rid[:8]: _runner_state_name(runners.get(rid) or {})
-                 for rid in runner_ids},
             )
-        return None
+            instances.append({
+                "model": model_id,
+                "serviceable": serviceable,
+                "runners": described,
+            })
+
+        live = next((i for i in instances if i["serviceable"]), None)
+        if live is None and instances:
+            log.info(
+                "no serviceable exo instance: %s",
+                {i["model"]: i["runners"] for i in instances},
+            )
+        return {
+            "resident_model": live["model"] if live else None,
+            "ready": live is not None,
+            "instances": instances,
+        }
+
+    def resident_model(self) -> Optional[str]:
+        """The model the pool is holding and ready to serve, or None.
+
+        "Ready" means every runner backing the instance reports a state that can
+        take a request (`RunnerReady` or `RunnerRunning`). During a model swap
+        the old instance's runners go `RunnerShuttingDown` while the new one's
+        climb `Loading -> Loaded -> WarmingUp`, and for that window there is
+        genuinely nothing resident — which is the honest answer to give a
+        caller, rather than naming a model that cannot serve.
+        """
+        return self.pool_status()["resident_model"]
 
     def list_models(self) -> list[dict]:
         """exo's model *catalogue* — everything it could run, not what is resident.

@@ -368,11 +368,19 @@ def _exo_pool_view() -> dict:
         "allocation": "exclusive — one request at a time, leased per generation",
     }
     try:
-        resident = mgr.exo.resident_model()
-        view["resident_model"] = resident
-        view["ready"] = resident is not None
-        if resident is None:
-            view["note"] = "reachable but no model resident and ready (mid-swap, or never placed)"
+        status = mgr.exo.pool_status()
+        view["resident_model"] = status["resident_model"]
+        view["ready"] = status["ready"]
+        # Per-runner states, which carry layer progress while a swap is in
+        # flight — the difference between "not ready" and "23/47 layers in".
+        view["runners"] = {
+            i["model"]: i["runners"] for i in status["instances"]
+        }
+        if not status["ready"]:
+            view["note"] = (
+                "reachable but no model resident and ready (mid-swap, or never "
+                "placed — the pool cannot restart itself)"
+            )
     except Exception as e:
         view["ready"] = False
         view["resident_model"] = None

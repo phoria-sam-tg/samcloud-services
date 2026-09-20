@@ -49,21 +49,54 @@ class SamcloudClient:
     def request_lease(
         self,
         resource_id: str,
-        service_id: str,
-        memory_mb: int,
+        service_id: Optional[str] = None,
+        memory_mb: Optional[int] = None,
         ttl_seconds: int = 3600,
+        exclusive: bool = False,
     ) -> dict:
-        """Request a memory lease. Returns 201 granted, 202 queued, 409 conflict."""
-        r = self._http.post(
-            f"/resources/{resource_id}/leases",
-            json={
-                "service_id": service_id,
-                "memory_mb": memory_mb,
-                "ttl_seconds": ttl_seconds,
-            },
-        )
-        r.raise_for_status()
-        return {"status_code": r.status_code, **r.json()}
+        """Request a lease. Returns `{"status_code": int, ...body}`.
+
+        Does NOT raise on 409. A conflict is an *answer* this caller has to
+        read — the body carries the current holder and its `expires_at`, which
+        is the only way to tell a caller when to come back — so raising here
+        would throw away the useful half of the response. Genuine faults (5xx,
+        network, 404 on an unregistered resource) still raise.
+
+        `memory_mb=None` omits the field entirely rather than sending a zero,
+        and that distinction is load-bearing on a resource that leases no
+        bytes. The registry queues a request when `memory_mb > available`,
+        where `available` is `total - leased` and `total` is read from
+        `vram_mb`/`gpu_memory_mb`/`unified_memory_mb`/`ram_mb` in the
+        resource's specs. An instance-style resource like `exo-pool` carries
+        none of those, so `total` is 0 and *any* positive `memory_mb` is
+        instantly oversubscribed: the request would be queued forever instead
+        of granted, no matter how idle the resource is. Send no byte count and
+        the queue branch is never entered.
+
+        `exclusive=True` asks for the resource itself rather than a slice of
+        its memory. Passing `service_id` is worth doing even though it is
+        optional: the registry renders a 409's `held_by` from the holder's
+        `service_id`, so a lease taken without one reports as "held by None"
+        to whoever collides with it.
+        """
+        payload: dict = {"ttl_seconds": ttl_seconds}
+        if service_id is not None:
+            payload["service_id"] = service_id
+        if memory_mb is not None:
+            payload["memory_mb"] = memory_mb
+        if exclusive:
+            payload["exclusive"] = True
+
+        r = self._http.post(f"/resources/{resource_id}/leases", json=payload)
+        if r.status_code not in (200, 201, 202, 409):
+            r.raise_for_status()
+        try:
+            body = r.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {"detail": body}
+        return {"status_code": r.status_code, **body}
 
     def release_lease(self, lease_id: str) -> dict:
         r = self._http.delete(f"/leases/{lease_id}")

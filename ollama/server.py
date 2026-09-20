@@ -12,6 +12,13 @@ Endpoints:
   POST /models/unload       - Unload a model (releases lease)
   POST /v1/chat/completions - OpenAI-compatible chat (routes to correct backend)
   POST /v1/completions      - OpenAI-compatible completion
+
+Backends: Ollama (MLX), llama-server (llama.cpp), mlx-vlm (vision), and the
+exo pool. The first three are owned by this gateway, which loads and unloads
+them against a byte-metered lease on gpu-0. The pool is not: it is placed out
+of band, spans two machines, serves one request at a time, and is held with an
+**exclusive** lease taken around each generation and released after. Ask for
+it by tier (`model: "think"`), not by model name.
 """
 
 import asyncio
@@ -31,7 +38,11 @@ from typing import Optional
 
 from . import capacity
 from . import config
-from .manager import ModelManager, Backend, VLM_PORT, match_vlm_model, match_gguf_model
+from .manager import (
+    ModelManager, Backend, VLM_PORT,
+    match_vlm_model, match_gguf_model, match_exo_tier,
+)
+from .exo_client import ExoUnavailable
 from .samcloud import SamcloudClient
 from .ollama_client import OllamaClient
 from .llama_client import LlamaServerClient
@@ -180,7 +191,7 @@ app.add_middleware(
 
 class LoadRequest(BaseModel):
     model: str
-    backend: str = "auto"  # "ollama", "llama-server", or "auto"
+    backend: str = "auto"  # "ollama", "llama-server", "mlx-vlm", "exo", or "auto"
     port: int = 8000  # for llama-server
     ctx_size: int = 12288
     gpu_layers: int = 99
@@ -334,7 +345,39 @@ async def list_models():
         },
         "available_ollama": [m["name"] for m in mgr.ollama.list_models()],
         "available_gguf": mgr.llama.available_models(),
+        "exo_pool": _exo_pool_view(),
     }
+
+
+def _exo_pool_view() -> dict:
+    """What the pool can serve right now, for /models.
+
+    Reports the resident model rather than exo's 121-entry catalogue: the
+    catalogue is what a swap *could* reach, and advertising it here would
+    invite requests for models that are a 30s-10min swap away. Never raises —
+    a pool that is down should make this one key say so, not fail the whole
+    listing.
+    """
+    if not config.EXO_ENABLED:
+        return {"enabled": False}
+    view = {
+        "enabled": True,
+        "tiers": list(config.EXO_TIERS),
+        "endpoint": config.EXO_BASE,
+        "resource_id": config.EXO_RESOURCE_ID,
+        "allocation": "exclusive — one request at a time, leased per generation",
+    }
+    try:
+        resident = mgr.exo.resident_model()
+        view["resident_model"] = resident
+        view["ready"] = resident is not None
+        if resident is None:
+            view["note"] = "reachable but no model resident and ready (mid-swap, or never placed)"
+    except Exception as e:
+        view["ready"] = False
+        view["resident_model"] = None
+        view["error"] = str(e)
+    return view
 
 
 def _capacity_503(e: "capacity.InsufficientCapacity") -> HTTPException:
@@ -347,6 +390,44 @@ def _capacity_503(e: "capacity.InsufficientCapacity") -> HTTPException:
     return HTTPException(status_code=503, detail=e.as_dict())
 
 
+def _busy_503(e: "capacity.PoolBusy") -> HTTPException:
+    """The pool is taken. Same 503 shape as a capacity refusal, plus Retry-After.
+
+    A caller must be able to tell "busy, come back" from "does not fit here"
+    and from "the gateway is broken" without parsing prose, and must never get
+    a hang or a 500 for either of the first two. `Retry-After` is set as a real
+    header as well as in the body, so an HTTP client that already understands
+    it backs off correctly without reading our JSON.
+    """
+    log.info(f"Declined on exclusive lease: {e}")
+    headers = {}
+    if e.retry_after_s:
+        headers["Retry-After"] = str(e.retry_after_s)
+    return HTTPException(status_code=503, detail=e.as_dict(), headers=headers or None)
+
+
+def _pool_unavailable_503(e: Exception) -> HTTPException:
+    """The pool is not there — distinct from it being busy.
+
+    Deliberately not a 404: the tier is configured and real, so "no such model"
+    would send a caller looking for a typo. And deliberately not a retry hint —
+    the pool cannot restart itself after a reboot (a headless launch is denied
+    local-network access on macOS), so a swap or a relaunch needs a human at a
+    Terminal and a tight retry loop would just spin.
+    """
+    log.warning(f"Pool unavailable: {e}")
+    return HTTPException(status_code=503, detail={
+        "error": "pool_unavailable",
+        "message": str(e),
+        "resource_id": config.EXO_RESOURCE_ID,
+        "endpoint": config.EXO_BASE,
+        "note": (
+            "the exo pool is placed out of band and cannot start itself after a "
+            "reboot; it needs to be launched from a Terminal on the host"
+        ),
+    })
+
+
 @app.post("/models/load")
 async def load_model(req: LoadRequest):
     try:
@@ -356,7 +437,14 @@ async def load_model(req: LoadRequest):
         if req.backend in ("auto", "llama-server"):
             gguf_match = match_gguf_model(req.model, mgr.llama.available_models())
 
-        if req.backend == "mlx-vlm" or (
+        if req.backend == "exo" or (
+            req.backend == "auto" and match_exo_tier(req.model)
+        ):
+            # "Loading" the pool only registers the tier and reports what is
+            # resident — nothing is placed and no lease is taken, because the
+            # pool's lease is per generation. Useful as a readiness probe.
+            mm = mgr.resolve_exo_tier(req.model.strip().lower())
+        elif req.backend == "mlx-vlm" or (
             req.backend == "auto" and match_vlm_model(req.model)
         ):
             mm = mgr.load_vlm_model(req.model)
@@ -390,6 +478,10 @@ async def load_model(req: LoadRequest):
         }
     except capacity.InsufficientCapacity as e:
         raise _capacity_503(e)
+    except capacity.PoolBusy as e:
+        raise _busy_503(e)
+    except ExoUnavailable as e:
+        raise _pool_unavailable_503(e)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
@@ -525,6 +617,18 @@ def _openai_messages_to_ollama(messages: list[dict]) -> list[dict]:
 
 def _resolve_model(model_name: str):
     """Find a managed model, or auto-load it. Never returns None for known models."""
+    # The pool first, and before the partial-match scan below. Two reasons it
+    # cannot be folded in with the others: a tier is matched exactly (see
+    # match_exo_tier) where every other backend matches on substrings, and
+    # resolving a tier must re-read what the pool currently holds rather than
+    # trust a cached name. Putting it after the substring scan would also let a
+    # loaded model whose name happens to contain "think" shadow the tier.
+    if match_exo_tier(model_name):
+        try:
+            return mgr.resolve_exo_tier(model_name.strip().lower())
+        except ExoUnavailable as e:
+            raise _pool_unavailable_503(e)
+
     # Check already-loaded models (exact then partial match)
     matched_name = None
     if model_name in mgr.models:
@@ -537,9 +641,20 @@ def _resolve_model(model_name: str):
                 break
 
     if matched_name:
-        mgr.ensure_running(matched_name)
+        alive = mgr.ensure_running(matched_name)
+        mm = mgr.models[matched_name]
+        if not alive and mm.backend == Backend.EXO:
+            # For local backends ensure_running() reloads and a False is worth
+            # attempting anyway. For the pool there is nothing to reload: False
+            # means it is unreachable or mid-swap, and proxying into that
+            # produces a 500 several minutes later instead of an answer now.
+            raise _pool_unavailable_503(
+                ExoUnavailable(
+                    f"the pool is not ready to serve tier '{matched_name}'"
+                )
+            )
         mgr.touch(matched_name)
-        return mgr.models[matched_name]
+        return mm
 
     # Model not loaded — try to auto-load it transparently.
 
@@ -587,8 +702,24 @@ def _resolve_model(model_name: str):
     return None
 
 
+async def _watch_disconnect(request: Optional[Request], poll_s: float = 2.0):
+    """Resolve when the caller goes away. Never resolves if we cannot tell.
+
+    Used only on the pool path. Every other backend either streams (where a
+    disconnect surfaces as CancelledError in the generator) or finishes fast
+    enough that nobody is harmed by running to completion. The pool is the one
+    backend where an abandoned request denies the resource to everyone else.
+    """
+    if request is None:
+        await asyncio.Event().wait()      # nothing to watch; never fires
+    while True:
+        if await request.is_disconnected():
+            return
+        await asyncio.sleep(poll_s)
+
+
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatRequest):
+async def chat_completions(req: ChatRequest, http_request: Request = None):
     mm = _resolve_model(req.model)
     if not mm:
         raise HTTPException(status_code=404, detail=f"Model '{req.model}' not available (not pulled or no GGUF file)")
@@ -678,6 +809,136 @@ async def chat_completions(req: ChatRequest):
                 "model": mm.name,
                 "usage": usage,
             }
+
+    elif mm.backend == Backend.EXO:
+        # exo speaks OpenAI already, so this is a proxy and not a translation:
+        # no native-format detour, no tool-call reshaping, no system-prompt
+        # injection. What this branch adds over a bare reverse proxy is the
+        # exclusive lease, held for exactly as long as the generation runs.
+        payload = {
+            "model": mm.name,   # the resident model id, not the tier the caller named
+            "messages": req.messages,
+            "stream": req.stream,
+        }
+        if req.temperature is not None:
+            payload["temperature"] = req.temperature
+        if req.tools:
+            payload["tools"] = req.tools
+        if req.tool_choice is not None:
+            payload["tool_choice"] = req.tool_choice
+
+        # Per-model defaults, with max_tokens treated as a ceiling rather than
+        # a default: a caller may ask for less, never for more. On a shared
+        # backend an over-long generation is rude; on this one it is a denial
+        # of service, because one request owns the whole pool while it runs.
+        defaults = mgr.exo_request_defaults(mm.name)
+        cap = defaults.pop("max_tokens", None)
+        if cap is not None:
+            payload["max_tokens"] = min(req.max_tokens, cap) if req.max_tokens else cap
+        elif req.max_tokens is not None:
+            payload["max_tokens"] = req.max_tokens
+        for key, value in defaults.items():
+            payload.setdefault(key, value)
+
+        purpose = f"chat:{mm.name}"
+
+        if req.stream:
+            # Acquire BEFORE returning the response. Once StreamingResponse is
+            # returned the 200 is committed, and a busy pool discovered after
+            # that could only be reported inside the stream body — which is
+            # precisely the "not a hang, not a 500, a structured decline" case
+            # this is supposed to get right.
+            try:
+                lease_id = mgr.acquire_pool(purpose)
+            except capacity.PoolBusy as e:
+                raise _busy_503(e)
+
+            async def stream():
+                try:
+                    async for line in mgr.exo.chat_stream(
+                        mm.name, req.messages,
+                        **{k: v for k, v in payload.items()
+                           if k not in ("model", "messages", "stream")}
+                    ):
+                        yield line + "\n"
+                except asyncio.CancelledError:
+                    log.info(f"Client disconnected during pool stream for {mm.name}")
+                    raise
+                except Exception as e:
+                    log.warning(f"Pool stream error for {mm.name}: {e}")
+                finally:
+                    # Covers a clean finish, an error, and a client that walked
+                    # away mid-generation (CancelledError unwinds through here).
+                    mgr.release_pool(lease_id)
+
+            return StreamingResponse(stream(), media_type="text/event-stream")
+
+        try:
+            with mgr.pool_lease(purpose):
+                # Streamed and aggregated rather than sent with stream:false —
+                # exo's non-streaming endpoint returns headers and no body (see
+                # ExoClient.chat). This also keeps the call cancellable and off
+                # the worker threads, which is what lets the disconnect watch
+                # below actually stop the work.
+                gen = asyncio.ensure_future(mgr.exo.chat_collect(
+                    mm.name,
+                    req.messages,
+                    **{k: v for k, v in payload.items()
+                       if k not in ("model", "messages", "stream")},
+                ))
+                watch = asyncio.ensure_future(_watch_disconnect(http_request))
+                try:
+                    done, _ = await asyncio.wait(
+                        {gen, watch}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                finally:
+                    watch.cancel()
+                if gen not in done:
+                    # The client gave up first. Starlette does not cancel a
+                    # plain handler on disconnect, so without this the pool
+                    # would stay leased for the rest of a generation nobody is
+                    # waiting for — on an exclusive resource that is not a
+                    # wasted computation, it is a closed pool.
+                    gen.cancel()
+                    try:
+                        await gen
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    log.info(
+                        f"Client disconnected before the pool answered; "
+                        f"cancelled the generation and released the lease"
+                    )
+                    raise HTTPException(status_code=499, detail={
+                        "error": "client_disconnected",
+                        "message": "caller went away before the pool answered",
+                    })
+                data = gen.result()
+        except capacity.PoolBusy as e:
+            raise _busy_503(e)
+        except httpx.HTTPStatusError as e:
+            log.warning(f"Pool returned {e.response.status_code} for {mm.name}")
+            raise HTTPException(status_code=502, detail={
+                "error": "pool_error",
+                "message": f"the exo pool returned {e.response.status_code}",
+                "body": e.response.text[:2000],
+            })
+        except httpx.HTTPError as e:
+            log.warning(f"Pool transport error for {mm.name}: {e}")
+            raise HTTPException(status_code=502, detail={
+                "error": "pool_error", "message": str(e),
+            })
+
+        # Report the tier the caller asked for alongside what actually served
+        # it, so a swap on the pool is visible in the answer rather than silent.
+        if isinstance(data, dict):
+            data.setdefault("model", mm.name)
+            data["served_by"] = {
+                "backend": Backend.EXO.value,
+                "tier": mm.tier,
+                "model": mm.name,
+                "resource_id": config.EXO_RESOURCE_ID,
+            }
+        return data
 
     elif mm.backend == Backend.LLAMA:
         # Forward to llama-server's OpenAI-compatible endpoint
@@ -804,6 +1065,23 @@ async def completions(req: CompletionRequest):
     mm = _resolve_model(req.model)
     if not mm:
         raise HTTPException(status_code=404, detail=f"Model '{req.model}' not available (not pulled or no GGUF file)")
+
+    if mm.backend == Backend.EXO:
+        # exo serves no /v1/completions route — its surface is
+        # /v1/chat/completions, /v1/messages and /v1/responses. Declining
+        # plainly beats silently wrapping the prompt in a single user message
+        # and handing back a chat-shaped body from a completions endpoint,
+        # which would be a worse surprise than a 400. Note this decline costs
+        # no lease: it is refused before the pool is touched.
+        raise HTTPException(status_code=400, detail={
+            "error": "unsupported_route",
+            "message": (
+                f"the exo pool has no text-completion endpoint; send tier "
+                f"'{mm.tier}' to /v1/chat/completions instead"
+            ),
+            "tier": mm.tier,
+            "model": mm.name,
+        })
 
     if mm.backend == Backend.OLLAMA:
         if req.stream:

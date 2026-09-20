@@ -72,3 +72,40 @@ VLM_STARTUP_TIMEOUT = _env_int("VLM_STARTUP_TIMEOUT", 120)
 # OFF by default: the contract is "publish what is available and let the
 # handshake pick a model that fits", not "evict to satisfy every ask".
 AUTO_EVICT = _env_bool("AUTO_EVICT", False)
+
+
+# --- exo pool (Backend.EXO) ---
+# ONE exo instance spanning slice + wafer, serving ONE request at a time.
+# Unlike every other backend the gateway owns, we neither start it nor place
+# its model: it must be launched from Terminal.app (macOS grants local-network
+# access per responsible process, so a headless launch is denied), and the
+# resident model is swapped out of band by whoever operates the pool.
+EXO_BASE = _env("EXO_BASE", "http://192.168.1.3:52415")
+EXO_ENABLED = _env_bool("EXO_ENABLED", True)
+EXO_RESOURCE_ID = _env("EXO_RESOURCE_ID", f"{SC_DEVICE}/exo-pool")
+
+# Tier names that route to the pool. Callers ask for a tier, not a model:
+# swapping the resident model costs 30s-10min, so the model is a property of
+# the instance and naming one in a request would be a promise we cannot keep.
+EXO_TIERS = tuple(
+    t.strip() for t in _env("EXO_TIERS", "think").split(",") if t.strip()
+)
+
+# Ceiling on how long an exclusive lease can outlive the request that took it.
+# This is a leak bound, not an expected generation length — the happy path
+# releases in a `finally`. It matters because a lease stranded on an exclusive
+# resource does not degrade the pool, it closes it.
+EXO_LEASE_TTL = _env_int("EXO_LEASE_TTL", 1800)
+
+# Per-model request defaults — the same shape model-service already uses for
+# its Ollama `think:false` workaround. On an exclusive resource an unbounded
+# generation is not slow, it is a denial of service: one caller owns the pool
+# until it stops talking. Cap every request, and let the caller lower it but
+# never raise it past the cap.
+EXO_MAX_TOKENS = _env_int("EXO_MAX_TOKENS", 2048)
+EXO_MODEL_DEFAULTS = {
+    # GLM-4.7-Flash has `thinking_toggle`, and at 6bit over two boxes its
+    # thinking phase can run for minutes. We keep thinking ON — the tier is
+    # called `think` and that is what it is for — and bound the total instead.
+    "glm-4.7-flash": {"max_tokens": EXO_MAX_TOKENS},
+}

@@ -1,6 +1,5 @@
 """Ollama API client for model management."""
 
-import re
 import httpx
 import json
 from dataclasses import dataclass, field
@@ -25,33 +24,12 @@ MODEL_MEMORY_ESTIMATES = {
 }
 
 
-# Match a parameter-count tag only on a digit boundary. Plain substring
-# matching read "qwen3.8:27b-mlx" as 7b and leased 5000MB for a model that
-# actually resides at 17530MB — the registry under-counted GPU memory by 3.5x,
-# so a second service could be told there was room that did not exist.
-# "13b" hit "3b" the same way. Anchor it.
-_SIZE_TAG_RE = re.compile(r"(?<![0-9.])(\d+(?:\.\d+)?)b(?![a-z0-9])")
-
-
 def estimate_memory_mb(model_name: str) -> int:
-    """Estimate memory needed based on model name/size tag.
-
-    Only a fallback — prefer OllamaClient.memory_estimate_mb(), which reads the
-    real weight size from Ollama instead of guessing from the name.
-    """
+    """Estimate memory needed based on model name/size tag."""
     name = model_name.lower()
-    m = _SIZE_TAG_RE.search(name)
-    if m:
-        raw = m.group(1)
-        # "1.0" -> "1", but never turn "70" into "7".
-        tag = f"{raw[:-2] if raw.endswith('.0') else raw}b"
-        if tag in MODEL_MEMORY_ESTIMATES:
-            return MODEL_MEMORY_ESTIMATES[tag]
-        # Unlisted size: interpolate at ~0.65 GB per billion params (Q4-ish).
-        try:
-            return max(1024, round(float(m.group(1)) * 650))
-        except ValueError:
-            pass
+    for size_tag, mb in MODEL_MEMORY_ESTIMATES.items():
+        if size_tag in name:
+            return mb
     # Default conservative estimate for unknown models
     return 4000
 
@@ -69,25 +47,6 @@ class OllamaClient:
         r = self._http.get("/api/version")
         r.raise_for_status()
         return r.json().get("version", "unknown")
-
-    def memory_estimate_mb(self, model_name: str) -> int:
-        """Memory to lease for a model, from its real weight size where known.
-
-        Ollama reports on-disk size in /api/tags; resident size tracks it
-        closely (18GB on disk -> 17530MB resident for qwen3.8:27b-mlx). That
-        beats guessing from the name, which is only used for models we have
-        not pulled yet.
-        """
-        try:
-            for m in self.list_models():
-                name = m.get("name", "")
-                if name == model_name or name == f"{model_name}:latest":
-                    size = int(m.get("size", 0))
-                    if size > 0:
-                        return max(1024, round(size / 1024 / 1024))
-        except Exception:
-            pass
-        return estimate_memory_mb(model_name)
 
     def list_models(self) -> list[dict]:
         r = self._http.get("/api/tags")

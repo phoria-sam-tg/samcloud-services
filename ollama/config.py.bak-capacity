@@ -67,8 +67,3 @@ VLM_PYTHON = _env(
     str(Path.home() / "code" / "mlx-vlm-server" / ".venv" / "bin" / "python"),
 )
 VLM_STARTUP_TIMEOUT = _env_int("VLM_STARTUP_TIMEOUT", 120)
-
-# Force-fit a requested model by unloading whatever is resident.
-# OFF by default: the contract is "publish what is available and let the
-# handshake pick a model that fits", not "evict to satisfy every ask".
-AUTO_EVICT = _env_bool("AUTO_EVICT", False)

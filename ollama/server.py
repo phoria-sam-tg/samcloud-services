@@ -233,16 +233,40 @@ class ChatRequest(BaseModel):
     messages: list[dict]
     # OpenAI's default is non-streaming, and a client that omits the field
     # expects a JSON object. This defaulted to True, so an omitted `stream` got
-    # SSE — well-formed SSE, which is what made it expensive to diagnose: the
-    # caller reports a malformed or empty stream and the stream is fine, it is
-    # simply not what was asked for. Hermes omits the field and failed three
-    # retries with "empty stream with no finish_reason" against 121 correct
-    # chunks. Matching the standard is the fix.
+    # well-formed SSE where the contract promises JSON.
+    #
+    # Corrected: an earlier version of this comment said Hermes omits the field
+    # and that this was its failure. A logging proxy on the wire showed Hermes
+    # sends `stream: true`, so it never hit this path — the client's own
+    # pre-send dump omitted it and the dump was mistaken for the socket. The
+    # contract bug was real; the causal claim attached to it was not.
     stream: bool = False
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     tools: Optional[list[dict]] = None
     tool_choice: Optional[str | dict] = None
+    # Declared because pydantic's default is extra="ignore": an OpenAI-shaped
+    # field this model does not name is dropped without trace, which makes the
+    # field list an allowlist by accident rather than by design. These three
+    # were all observed on the wire from Hermes and all silently discarded.
+    #
+    # `reasoning_effort` is a real functional loss rather than a dropped string:
+    # exo resolves it into its task params (resolve_reasoning_params ->
+    # TextGenerationTaskParams), so on a model that spent 377 of 393 tokens
+    # thinking, a caller asking for less was asking for something the backend
+    # can give and the gateway was throwing away.
+    reasoning_effort: Optional[str] = None
+    # Carries `include_usage`, so dropping it silently costs a caller its token
+    # accounting.
+    stream_options: Optional[dict] = None
+    # Declared to make the drop *visible*, not to honour it: neither this
+    # gateway nor exo implements structured output (exo declares the field in
+    # its API model and never reads it). A caller asking for JSON and getting
+    # well-formed prose with a 200 is the failure shape that cost hours on this
+    # ticket, so the request path logs it loudly. Refusing outright with a 400
+    # is the better answer and is deliberately NOT done here — see the note on
+    # the ticket.
+    response_format: Optional[dict] = None
 
 class CompletionRequest(BaseModel):
     model: str
@@ -984,6 +1008,24 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
             payload["tools"] = req.tools
         if req.tool_choice is not None:
             payload["tool_choice"] = req.tool_choice
+        # Forwarded because exo honours them. `reasoning_effort` reaches its
+        # task params via resolve_reasoning_params; `stream_options` carries
+        # include_usage. Both were being dropped by this gateway, so a caller
+        # asking exo for less thinking, or for its token accounting, silently
+        # got neither.
+        if req.reasoning_effort is not None:
+            payload["reasoning_effort"] = req.reasoning_effort
+        if req.stream_options is not None:
+            payload["stream_options"] = req.stream_options
+        if req.response_format is not None:
+            # Loud, because the alternative is a caller receiving well-formed
+            # prose where it asked for structured output, with a 200 and nothing
+            # in any log. Neither this gateway nor exo implements it.
+            log.warning(
+                f"response_format={req.response_format!r} requested for tier "
+                f"'{mm.tier}' and IGNORED — structured output is not supported "
+                f"by this backend. The answer will be free-form text."
+            )
 
         # Per-model defaults, with max_tokens treated as a ceiling rather than
         # a default: a caller may ask for less, never for more. On a shared

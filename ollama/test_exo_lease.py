@@ -1366,6 +1366,41 @@ def test_no_passthrough_filters_blank_lines():
           "if line:\n                        yield line" in exo, False)
 
 
+def test_observed_openai_fields_are_not_silently_dropped():
+    """Fields seen on the wire from Hermes must be declared, not discarded.
+
+    pydantic's default is extra="ignore", so `ChatRequest`'s field list is an
+    allowlist by accident: any OpenAI-shaped field it does not name vanishes
+    without trace. A logging proxy on the wire showed Hermes sending
+    `reasoning_effort`, `stream_options` and `response_format`, and all three
+    were being dropped.
+
+    `reasoning_effort` is the one that costs something real — exo resolves it
+    into its task params, so a caller asking a 377-reasoning-token model for
+    less was asking for something the backend can give.
+    """
+    import ollama.server as srv
+    for field in ("reasoning_effort", "stream_options", "response_format"):
+        check(f"ChatRequest declares {field}",
+              field in srv.ChatRequest.model_fields, True)
+
+    built = srv.ChatRequest(
+        model="think", messages=[{"role": "user", "content": "x"}],
+        reasoning_effort="low", stream_options={"include_usage": True},
+        response_format={"type": "json_object"})
+    check("reasoning_effort survives parsing", built.reasoning_effort, "low")
+    check("stream_options survives parsing",
+          built.stream_options, {"include_usage": True})
+    check("response_format survives parsing",
+          built.response_format, {"type": "json_object"})
+
+    # And omitting them stays None rather than becoming a default we invent.
+    bare = srv.ChatRequest(model="think", messages=[])
+    check("omitted reasoning_effort is None", bare.reasoning_effort, None)
+    check("omitted stream_options is None", bare.stream_options, None)
+    check("omitted response_format is None", bare.response_format, None)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"Running {len(tests)} test groups\n")

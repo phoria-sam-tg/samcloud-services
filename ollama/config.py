@@ -62,11 +62,21 @@ OLLAMA_KEEP_ALIVE = _env_int("OLLAMA_KEEP_ALIVE", -1)
 # Signal: LOCAL unified-memory availability via capacity.collect(), the same
 # collector the stats loop and the fit gate use — so `offering:full` means the
 # same thing on every box. We compute from local memory rather than the
-# registry's lease-based available_memory_mb because the gateway runs under a
-# service token, which is scope-filtered out of resource reads
-# (GET /resources/{id} -> 403). On a unified-memory Mac real memory pressure is
-# in any case the truer "can I serve a model" signal, and it also captures work
-# that spikes memory without holding a formal lease.
+# registry's lease-based available_memory_mb because on a unified-memory Mac
+# real memory pressure is the truer "can I serve a model" signal: it captures
+# work that spikes memory without holding a formal lease, and
+# available_memory_mb is spec minus leases and never consults utilisation at
+# all (#750 — it reported 36864 MB on wafer at 70.6%).
+#
+# This comment used to give a second reason — that the gateway runs under a
+# service token scope-filtered out of resource reads (GET /resources/{id} ->
+# 403). That was true when it was written: wafer's server.log has six such 403s
+# on 2026-07-02, the day of this workaround, and the endpoint was never called
+# again. It is not true now — the gateway runs as a dedicated agent identity
+# (wafer-model-service, user 60, scopes exactly ["device:wafer-services"]) and
+# reads resources fine (#760). An earlier edit "corrected" the 403 to 404 and
+# was wrong to: the code changed under the comment, the comment did not
+# misreport it.
 #
 # There are deliberately no MB thresholds here. OFFERING_MINI_MB /
 # _DEGRADED_MB / _FULL_MB used to band `total - used` into tiers; they were

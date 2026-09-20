@@ -51,7 +51,7 @@ def main():
     step(1, "Baseline state")
     running = ollama.list_running()
     print(f"  Running Ollama models: {[m['name'] for m in running]}")
-    leases_before = sc.list_leases(resource=RESOURCE_ID, status="active")
+    leases_before = sc.list_leases(resource_id=RESOURCE_ID, status="active")
     print(f"  Active leases: {len(leases_before)}")
 
     # 2. Load model via manager
@@ -106,7 +106,7 @@ def main():
     running = ollama.list_running()
     print(f"  Running Ollama models: {[m['name'] for m in running]}")
     print(f"  Manager models: {list(manager.models.keys())}")
-    leases_after = sc.list_leases(resource=RESOURCE_ID, status="active")
+    leases_after = sc.list_leases(resource_id=RESOURCE_ID, status="active")
     active_mine = [l for l in leases_after if l.get("service_id") == SERVICE_ID]
     print(f"  My active leases: {len(active_mine)}")
 

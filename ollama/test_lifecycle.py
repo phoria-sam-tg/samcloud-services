@@ -49,7 +49,7 @@ def main():
             print(f"  Available: {r['available_memory_mb']}MB")
             break
 
-    leases_before = sc.list_leases(resource=RESOURCE_ID)
+    leases_before = sc.list_leases(resource_id=RESOURCE_ID, status="active")
     print(f"  Active leases: {len(leases_before)}")
 
     # 2. Pull model
@@ -129,7 +129,7 @@ def main():
 
     # 8. Verify
     step(8, "Verify resource state")
-    leases_after = sc.list_leases(resource=RESOURCE_ID)
+    leases_after = sc.list_leases(resource_id=RESOURCE_ID, status="active")
     print(f"  Active leases now: {len(leases_after)}")
     dash = sc.resource_dashboard()
     for r in dash:

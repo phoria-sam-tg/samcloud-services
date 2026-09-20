@@ -164,12 +164,28 @@ class ModelManager:
             size_mb = int(m.get("size", 0) / 1024 / 1024)
             if name not in self.models:
                 # Re-apply the configured keep_alive so the model honours the
-                # idle timer (OLLAMA_KEEP_ALIVE). Previously this pinned -1 and
-                # marked the model managed=False, which exempted it from cooldown
-                # (check_cooldowns / unload both skip non-managed) — so an
-                # on-demand load became stuck in memory forever and was re-pinned
-                # on every restart. Adopt it as a managed Ollama model instead so
-                # the cooldown loop can spin it back down when idle (ticket #97).
+                # idle timer (OLLAMA_KEEP_ALIVE), and adopt it as MANAGED so the
+                # cooldown loop can spin it back down when idle (ticket #97).
+                #
+                # Previously this marked the model managed=False, and
+                # check_cooldowns / unload both skip non-managed entries. With
+                # OLLAMA_KEEP_ALIVE=-1 (the config default) that pinned the model
+                # in memory forever. Both boxes actually run 300, so ollama's own
+                # timer frees the memory and what leaks is the BOOKKEEPING: the
+                # entry never leaves self.models, because cooldown is the only
+                # thing that removes it. Three consequences, all from that flag:
+                #   1. /status reports the model resident after ollama dropped it
+                #   2. load_ollama_model short-circuits on `name in self.models`
+                #      and returns the stale entry without reloading
+                #   3. a capacity refusal lies to the caller. `resident` and
+                #      `reclaimable` build the 503 detail ungated, so the body
+                #      names a model ollama dropped long ago, quotes memory that
+                #      is already free, and promises it is "released on idle"
+                #      when check_cooldowns skips that entry permanently. Every
+                #      clause false, in the one message a caller has to trust.
+                #      (The same sum also over-counts evictable memory in the
+                #      fit path itself, but that read is behind AUTO_EVICT,
+                #      which defaults False and is set on neither box.)
                 try:
                     self.ollama.load_model(name, keep_alive=OLLAMA_KEEP_ALIVE)
                     log.info(f"Re-applied keep_alive={OLLAMA_KEEP_ALIVE} to adopted Ollama model {name}")

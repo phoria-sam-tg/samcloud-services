@@ -17,13 +17,18 @@ other box is reading the wrong box's identity. Read the box's own env file
 (`~/.config/samcloud-services/env`, 600, sourced by the start script) before
 assuming any of them.
 
-| | `config.py` fallback | wafer-services runs |
-|---|---|---|
-| `SC_DEVICE` | `claude-services-slice` | `wafer-services` |
-| `SC_RESOURCE_ID` | `<device>/gpu-0` | `wafer-services/gpu-metal` |
-| `SC_REQUIRED_SCOPE` | `device:<device>` | `group:services` |
-| `SC_BASE` | `https://cloud.samtg.xyz/api/v1` | same |
-| `SC_SERVICE_NAME` | `model-service` | same |
+| | `config.py` fallback | wafer-services runs | claude-services-slice runs |
+|---|---|---|---|
+| `SC_DEVICE` | `claude-services-slice` | `wafer-services` | `claude-services-slice` |
+| `SC_RESOURCE_ID` | `<device>/gpu-0` | `wafer-services/gpu-metal` | `claude-services-slice/gpu-0` |
+| `SC_REQUIRED_SCOPE` | `device:<device>` | `group:services` | `group:services` |
+| `SC_BASE` | `https://cloud.samtg.xyz/api/v1` | same | same |
+| `SC_SERVICE_NAME` | `model-service` | same | same |
+
+`SC_REQUIRED_SCOPE` is the one row no box runs as written. It is what the auth
+middleware checks every caller's token against, so the fallback describes a
+narrower access policy than either gateway actually enforces — read it as a safe
+default for a new box, not as a description of this one.
 
 **Token**: always via `SC_TOKEN` env — never hardcode; a hardcoded copy is what
 silently 401'd a box for fourteen days after a rotation (#760). It need not be a

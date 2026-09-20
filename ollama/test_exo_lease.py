@@ -1135,6 +1135,52 @@ def test_resource_busy_still_says_resource_busy():
         check("409 keeps resource_busy", e.as_dict()["error"], "resource_busy")
 
 
+def test_no_lease_acquire_left_on_the_event_loop():
+    """Every acquire_pool() in the request path must go through a thread.
+
+    Source-level rather than behavioural on purpose. Acquiring is sync httpx to
+    the registry plus, on a busy pool, the wedge guard's two reads and the
+    deliberate gap between them — up to ~31s. On the event loop that stalls
+    every other route while this one decides to *decline*, which turns the
+    decline path into the outage it exists to report.
+
+    Asserted against the AST rather than by grep, because "is this call inside
+    an asyncio.to_thread" is a question about structure and grep answers
+    questions about text. Same reason claude-wafer-services walked `ast.With`
+    to check lock scope rather than counting lines.
+    """
+    import ast as _ast
+    from pathlib import Path as _Path
+
+    src = (_Path(__file__).resolve().parent / "server.py").read_text()
+    tree = _ast.parse(src)
+
+    def is_to_thread(node):
+        f = node.func
+        return (isinstance(f, _ast.Attribute) and f.attr == "to_thread"
+                and isinstance(f.value, _ast.Name) and f.value.id == "asyncio")
+
+    threaded, bare = [], []
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Call):
+            continue
+        if is_to_thread(node):
+            for a in node.args:
+                if isinstance(a, _ast.Attribute) and a.attr in (
+                        "acquire_pool", "resolve_exo_tier", "ensure_running",
+                        "pool_status_cached"):
+                    threaded.append((a.attr, node.lineno))
+            continue
+        f = node.func
+        if isinstance(f, _ast.Attribute) and f.attr in ("acquire_pool", "pool_lease"):
+            bare.append((f.attr, node.lineno))
+
+    check(f"no un-threaded acquire_pool/pool_lease in server.py (found {bare})",
+          bare, [])
+    check("acquire_pool is threaded on both request paths",
+          sorted(n for n, _ in threaded).count("acquire_pool"), 2)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"Running {len(tests)} test groups\n")

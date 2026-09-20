@@ -972,7 +972,12 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
             # precisely the "not a hang, not a 500, a structured decline" case
             # this is supposed to get right.
             try:
-                lease_id = mgr.acquire_pool(purpose)
+                # Threaded: acquiring is sync httpx to the registry plus, on a
+                # busy pool, the wedge guard's two reads and the gap between
+                # them. On the loop that is up to ~31s of every other route
+                # stalling while this one decides to decline — the decline path
+                # becoming the outage it exists to report.
+                lease_id = await asyncio.to_thread(mgr.acquire_pool, purpose)
             except capacity.PoolBusy as e:
                 raise _busy_503(e)
 
@@ -1008,7 +1013,16 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
             return StreamingResponse(stream(), media_type="text/event-stream")
 
         try:
-            with mgr.pool_lease(purpose):
+            # `pool_lease()` is a sync context manager, so using it here ran
+            # both acquire and release on the event loop. Acquire is threaded
+            # for the reason above; release stays synchronous deliberately —
+            # it is one DELETE (~100ms) and it must run even while this task is
+            # being cancelled, which an `await` in a `finally` cannot promise.
+            # Trading ~100ms of loop for a guaranteed release is the right way
+            # round on an exclusive resource, where a stranded lease does not
+            # slow the pool down, it closes it.
+            lease_id = await asyncio.to_thread(mgr.acquire_pool, purpose)
+            try:
                 # Streamed and aggregated rather than sent with stream:false —
                 # exo's non-streaming endpoint returns headers and no body (see
                 # ExoClient.chat). This also keeps the call cancellable and off
@@ -1047,6 +1061,8 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                         "message": "caller went away before the pool answered",
                     })
                 data = gen.result()
+            finally:
+                mgr.release_pool(lease_id)
         except capacity.PoolBusy as e:
             raise _busy_503(e)
         except ExoRequestFailed as e:

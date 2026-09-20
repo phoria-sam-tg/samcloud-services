@@ -53,6 +53,49 @@ USABLE_FRACTION = 0.9
 MIN_HEADROOM_MB = 1024
 
 
+class InsufficientCapacity(Exception):
+    """A load refused because it does not fit right now — not a broken gateway.
+
+    `manager` has raised this by name and `server` has caught it by name since
+    the capacity migration on 2026-08-30, but nothing ever defined it. Every
+    refusal therefore raised AttributeError instead; worse, evaluating the
+    `except capacity.InsufficientCapacity` clause raised it a second time, so
+    the error escaped the whole `try` without reaching the fallback below it
+    and every capacity answer surfaced as a bare 500. The gate held the whole
+    time — it just could not say why, which is the one thing a refusal is for.
+
+    Carries the reading it was refused against so the caller gets told what
+    does fit, instead of being told the box is broken.
+    """
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        need_mb: Optional[int] = None,
+        usable_mb: Optional[int] = None,
+        available_mb: Optional[int] = None,
+        fits_now: Optional[list] = None,
+    ):
+        super().__init__(detail)
+        self.detail = detail
+        self.need_mb = need_mb
+        self.usable_mb = usable_mb
+        self.available_mb = available_mb
+        self.fits_now = list(fits_now or [])
+
+    def as_dict(self) -> dict:
+        """Body for a 503, with the numbers a caller needs to choose again."""
+        return {
+            "error": "insufficient_capacity",
+            "message": self.detail,
+            "need_mb": self.need_mb,
+            "usable_mb": self.usable_mb,
+            "available_mb": self.available_mb,
+            "fits_now": self.fits_now,
+        }
+
+
 def usable_mb(available_mb: int) -> int:
     """How much of `available_mb` we are willing to commit."""
     return max(0, min(int(available_mb * USABLE_FRACTION),

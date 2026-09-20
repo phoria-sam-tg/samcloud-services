@@ -282,7 +282,7 @@ class ModelManager:
 
     def _get_active_leases(self) -> list[dict]:
         try:
-            return self.sc.list_leases(resource=RESOURCE_ID, status="active")
+            return self.sc.list_leases(resource_id=RESOURCE_ID, status="active")
         except Exception:
             return []
 

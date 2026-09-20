@@ -1181,6 +1181,73 @@ def test_no_lease_acquire_left_on_the_event_loop():
           sorted(n for n, _ in threaded).count("acquire_pool"), 2)
 
 
+def test_lease_failures_are_not_reported_as_resource_busy():
+    """A registry we cannot reach is not a pool someone else holds.
+
+    These used to share `resource_busy`, which is indistinguishable from the
+    409 in the 503 body — so a caller honouring the retry hint loops forever
+    through a plane outage, and whoever debugs it hunts for the holder of a
+    lease that was never taken.
+    """
+    import httpx as _httpx
+
+    # transport failure
+    m = mgr()
+    m.sc.request_lease.side_effect = _httpx.ConnectError("dns")
+    try:
+        m.acquire_pool("t"); FAILS.append("transport failure did not raise")
+    except capacity.PoolBusy as e:
+        check("transport -> lease_unavailable", e.as_dict()["error"], "lease_unavailable")
+        check("transport keeps a retry hint", e.as_dict()["retry_after_s"], 30)
+
+    # 404: the resource does not exist -> misconfiguration, no retry hint
+    m = mgr()
+    resp = _httpx.Response(404, request=_httpx.Request("POST", "http://x"))
+    m.sc.request_lease.side_effect = _httpx.HTTPStatusError(
+        "not found", request=resp.request, response=resp)
+    try:
+        m.acquire_pool("t"); FAILS.append("404 did not raise")
+    except capacity.PoolBusy as e:
+        b = e.as_dict()
+        check("404 -> pool_resource_missing", b["error"], "pool_resource_missing")
+        check("404 offers no retry hint", b["retry_after_s"], None)
+        check("404 names the resource", b["resource_id"], config.EXO_RESOURCE_ID)
+
+    # 500 from the registry
+    m = mgr()
+    resp = _httpx.Response(500, request=_httpx.Request("POST", "http://x"))
+    m.sc.request_lease.side_effect = _httpx.HTTPStatusError(
+        "boom", request=resp.request, response=resp)
+    try:
+        m.acquire_pool("t"); FAILS.append("500 did not raise")
+    except capacity.PoolBusy as e:
+        check("500 -> lease_unavailable", e.as_dict()["error"], "lease_unavailable")
+
+    # and a real conflict still says resource_busy
+    m = mgr()
+    m.sc.request_lease.side_effect = None
+    m.sc.request_lease.return_value = {
+        "status_code": 409,
+        "detail": {"detail": "held", "held_by": "x",
+                   "expires_at": "2999-01-01T00:00:00Z"}}
+    try:
+        m.acquire_pool("t"); FAILS.append("409 did not raise")
+    except capacity.PoolBusy as e:
+        check("409 still resource_busy", e.as_dict()["error"], "resource_busy")
+
+
+def test_httpx_is_resolvable_where_it_is_caught():
+    """The except clause must not be the thing that raises.
+
+    `httpx` was imported inside one function only, so an `except
+    httpx.HTTPStatusError` in acquire_pool would have raised NameError while
+    handling the original error — the same shape as the InsufficientCapacity
+    bug this codebase already carries a docstring about.
+    """
+    import ollama.manager as _m
+    check("httpx at module scope", hasattr(_m, "httpx"), True)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"Running {len(tests)} test groups\n")

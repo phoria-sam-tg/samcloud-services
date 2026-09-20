@@ -163,6 +163,34 @@ async def lifespan(app: FastAPI):
     for l in leases:
         log.info(f"Lease: {l}")
 
+    # Check the pool's resource id resolves, once, at boot. At runtime the code
+    # genuinely cannot tell a missing resource from a registry outage — both
+    # arrive as a failed request — so the honest place to catch a
+    # misconfiguration is here, where a 404 means exactly one thing. The default
+    # EXO_RESOURCE_ID is `<device>/exo-pool`, and the pool is one node fronted
+    # by one resource, so any box enabling EXO without overriding it would
+    # otherwise emit confusing 503s on every request instead of saying so once.
+    if config.EXO_ENABLED:
+        try:
+            sc.get_resource(config.EXO_RESOURCE_ID)
+            log.info(f"exo pool resource {config.EXO_RESOURCE_ID} resolves")
+        except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 404:
+                log.error(
+                    f"EXO_ENABLED is on but {config.EXO_RESOURCE_ID} does not "
+                    f"exist on the registry. Every `think` request will decline "
+                    f"with pool_resource_missing. The exo pool is ONE node "
+                    f"fronted by ONE resource — point EXO_RESOURCE_ID at the "
+                    f"existing one rather than registering a second, which "
+                    f"would let two boxes hold 'the exclusive lease' at once."
+                )
+            else:
+                log.warning(
+                    f"could not verify exo pool resource "
+                    f"{config.EXO_RESOURCE_ID}: {e}"
+                )
+
     mgr.start_background_tasks()
     log.info(f"Model Service ready - managing {len(mgr.models)} models")
 

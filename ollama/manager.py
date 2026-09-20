@@ -22,6 +22,8 @@ import subprocess
 import time
 import logging
 import threading
+
+import httpx
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -610,6 +612,8 @@ class ModelManager:
         and tears both down on cooldown/unload. Only one VLM runs at a time on
         VLM_PORT — a request for a different VLM swaps the current one out.
         """
+        # httpx is imported at module level now — kept here harmlessly so this
+        # function reads the same as before.
         import httpx
 
         match = match_vlm_model(model_name)
@@ -946,14 +950,48 @@ class ModelManager:
                 ttl_seconds=EXO_LEASE_TTL,
                 exclusive=True,
             )
+        except httpx.HTTPStatusError as e:
+            # A 404 here is a misconfiguration, not a transient. It means this
+            # gateway is asking for a resource that does not exist on the
+            # registry — the default `EXO_RESOURCE_ID` is `<device>/exo-pool`,
+            # and the pool is ONE physical node fronted by ONE plane resource
+            # (`claude-services-slice/exo-pool`), so any other box enabling EXO
+            # without overriding it lands here forever. Retrying cannot fix it,
+            # so it gets no retry hint and its own code.
+            if e.response.status_code == 404:
+                raise capacity.PoolBusy(
+                    f"{EXO_RESOURCE_ID} does not exist on the registry. The exo "
+                    f"pool is one node fronted by one resource; a second box "
+                    f"must point EXO_RESOURCE_ID at the existing one rather than "
+                    f"register its own, or both would hold 'the exclusive lease' "
+                    f"at once and generate into the same slot.",
+                    resource_id=EXO_RESOURCE_ID,
+                    error="pool_resource_missing",
+                )
+            raise capacity.PoolBusy(
+                f"cannot determine whether the pool is free — the registry "
+                f"answered {e.response.status_code}: {e}",
+                resource_id=EXO_RESOURCE_ID,
+                retry_after_s=30,
+                error="lease_unavailable",
+            )
         except Exception as e:
             # A registry we cannot reach is not a free pool. Refusing to start
             # work we cannot announce is the safe direction on an exclusive
             # resource: the alternative collides with whoever does hold it.
+            #
+            # But it is NOT `resource_busy`, which is what this used to report.
+            # That conflated "someone else holds the lease" with "I cannot
+            # reach or resolve my own resource" — indistinguishable from the
+            # 503, so a caller honouring the retry hint loops forever through a
+            # plane outage or a misconfiguration, and whoever debugs it goes
+            # looking for the holder of a lease that was never taken.
             raise capacity.PoolBusy(
-                f"cannot confirm the pool is free — registry unreachable: {e}",
+                f"cannot determine whether the pool is free — registry "
+                f"unreachable: {e}",
                 resource_id=EXO_RESOURCE_ID,
                 retry_after_s=30,
+                error="lease_unavailable",
             )
 
         outcome = self._lease_outcome(resp)

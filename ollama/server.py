@@ -472,7 +472,9 @@ async def load_model(req: LoadRequest):
             # "Loading" the pool only registers the tier and reports what is
             # resident — nothing is placed and no lease is taken, because the
             # pool's lease is per generation. Useful as a readiness probe.
-            mm = mgr.resolve_exo_tier(req.model.strip().lower())
+            mm = await asyncio.to_thread(
+                mgr.resolve_exo_tier, req.model.strip().lower()
+            )
         elif req.backend == "mlx-vlm" or (
             req.backend == "auto" and match_vlm_model(req.model)
         ):
@@ -644,8 +646,29 @@ def _openai_messages_to_ollama(messages: list[dict]) -> list[dict]:
     return converted
 
 
-def _resolve_model(model_name: str):
-    """Find a managed model, or auto-load it. Never returns None for known models."""
+async def _resolve_model(model_name: str):
+    """Find a managed model, or auto-load it. Never returns None for known models.
+
+    Async only because of the pool. Resolving a tier reads exo's `/state` over
+    synchronous httpx with a 15s timeout, and this runs inside the request
+    handlers — so on the happy path that was tens of milliseconds nobody
+    noticed, and against a wedged or unreachable pool it froze the **entire**
+    gateway (every route, health reporting, the stats loop, every other model's
+    traffic) for up to 15s per request before raising. That is the failure this
+    backend was built to decline gracefully, so blocking the process while
+    detecting it is the wrong way round.
+
+    The reads therefore go to a thread. This is the same rule as
+    `_exo_pool_view` and NOT the rule for a generation: a tier resolve takes no
+    lease and loads nothing, so it is bounded and strands nothing if it outlives
+    its caller. A generation is neither, which is why that path uses aiohttp.
+
+    Only the pool's calls are moved. The three local backends keep their
+    existing behaviour deliberately — `load_ollama_model` and `load_vlm_model`
+    block this loop today for as long as a model takes to load, which is a
+    larger, pre-existing problem than this commit should quietly change. Making
+    this function async is the seam that lets it be fixed separately.
+    """
     # The pool first, and before the partial-match scan below. Two reasons it
     # cannot be folded in with the others: a tier is matched exactly (see
     # match_exo_tier) where every other backend matches on substrings, and
@@ -654,7 +677,9 @@ def _resolve_model(model_name: str):
     # loaded model whose name happens to contain "think" shadow the tier.
     if match_exo_tier(model_name):
         try:
-            return mgr.resolve_exo_tier(model_name.strip().lower())
+            return await asyncio.to_thread(
+                mgr.resolve_exo_tier, model_name.strip().lower()
+            )
         except ExoUnavailable as e:
             raise _pool_unavailable_503(e)
 
@@ -670,8 +695,12 @@ def _resolve_model(model_name: str):
                 break
 
     if matched_name:
-        alive = mgr.ensure_running(matched_name)
         mm = mgr.models[matched_name]
+        if mm.backend == Backend.EXO:
+            # Re-reads /state to pick up a swap; same blocking read as above.
+            alive = await asyncio.to_thread(mgr.ensure_running, matched_name)
+        else:
+            alive = mgr.ensure_running(matched_name)
         if not alive and mm.backend == Backend.EXO:
             # For local backends ensure_running() reloads and a False is worth
             # attempting anyway. For the pool there is nothing to reload: False
@@ -749,7 +778,7 @@ async def _watch_disconnect(request: Optional[Request], poll_s: float = 2.0):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest, http_request: Request = None):
-    mm = _resolve_model(req.model)
+    mm = await _resolve_model(req.model)
     if not mm:
         raise HTTPException(status_code=404, detail=f"Model '{req.model}' not available (not pulled or no GGUF file)")
 
@@ -1100,7 +1129,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
 
 @app.post("/v1/completions")
 async def completions(req: CompletionRequest):
-    mm = _resolve_model(req.model)
+    mm = await _resolve_model(req.model)
     if not mm:
         raise HTTPException(status_code=404, detail=f"Model '{req.model}' not available (not pulled or no GGUF file)")
 

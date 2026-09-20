@@ -762,6 +762,61 @@ def test_serving_path_never_uses_the_cache():
     check("two resolves -> two /state reads", len(calls), 2)
 
 
+# --- the serving path must not block the event loop ------------------------
+
+def test_resolve_model_does_not_block_the_loop():
+    """A slow pool must not freeze the gateway while a tier is resolved.
+
+    The regression this pins: `_resolve_model` used to be a plain `def` calling
+    sync httpx, so against a wedged pool it blocked every route, health
+    reporting and the stats loop for the full 15s timeout before raising —
+    while detecting exactly the condition the decline path exists to report.
+
+    Measured by racing the resolve against a ticker on the same loop: if the
+    read blocks, the ticker cannot advance.
+    """
+    import asyncio, time as _t, types
+
+    import ollama.server as srv
+
+    slow = 0.4
+    class SlowExo:
+        def resident_model(self):
+            _t.sleep(slow)          # deliberately blocking, like sync httpx
+            return "mlx-community/GLM-4.7-Flash-6bit"
+        def pool_status(self):
+            _t.sleep(slow)
+            return {"resident_model": "mlx-community/GLM-4.7-Flash-6bit",
+                    "ready": True, "busy": False, "instances": []}
+
+    real_mgr = getattr(srv, "mgr", None)
+    m = mgr()
+    m.exo = SlowExo()
+    srv.mgr = m
+    try:
+        async def run():
+            ticks = 0
+            async def ticker():
+                nonlocal ticks
+                while True:
+                    await asyncio.sleep(0.02)
+                    ticks += 1
+            t = asyncio.ensure_future(ticker())
+            mm = await srv._resolve_model("think")
+            t.cancel()
+            return ticks, mm
+
+        ticks, mm = asyncio.run(run())
+        check("resolve is a coroutine fn",
+              asyncio.iscoroutinefunction(srv._resolve_model), True)
+        check("tier still resolved", mm.name, "mlx-community/GLM-4.7-Flash-6bit")
+        # A blocked loop yields ~0 ticks; an unblocked one gets ~slow/0.02.
+        check(f"loop kept running during a {slow}s pool read (ticks={ticks})",
+              ticks >= 5, True)
+    finally:
+        srv.mgr = real_mgr
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"Running {len(tests)} test groups\n")

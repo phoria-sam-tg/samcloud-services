@@ -247,7 +247,7 @@ class ExoClient:
         except Exception:
             return False
 
-    def pool_status_cached(self, ttl: float = None) -> dict:
+    def pool_status_cached(self, ttl: Optional[float] = None) -> dict:
         """`pool_status()`, memoised briefly. For status reads, never for serving.
 
         `/state` is a few hundred KB on this pool and `GET /models` is polled,

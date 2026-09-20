@@ -278,7 +278,8 @@ class ModelManager:
     def _safe_ollama_list(self) -> list[str]:
         try:
             return [m["name"] for m in self.ollama.list_models()]
-        except Exception:
+        except Exception as e:
+            log.warning(f"Could not list Ollama models: {e}")
             return []
 
     def _get_resource_summary(self) -> dict:
@@ -304,12 +305,15 @@ class ModelManager:
         direction — so neither spelling is safe to depend on. `?status=` is
         documented and works, and the fleet-wide active set is small, so this
         asks for the one filter that is in the contract and matches the
-        resource itself. The `except` is deliberately narrow: a filter that
-        stops working must not become a silent empty list again.
+        resource itself. The `try` covers only the call, so a mistake in the
+        match raises rather than being swallowed; the read failure is logged,
+        because `[]` here is indistinguishable in `/status` from "nothing is
+        leased" and that confusion is what #774 was filed over.
         """
         try:
             leases = self.sc.list_leases(status="active")
-        except Exception:
+        except Exception as e:
+            log.warning(f"Could not read active leases: {e}")
             return []
         return [lease for lease in leases if lease.get("resource_id") == RESOURCE_ID]
 
@@ -905,8 +909,10 @@ class ModelManager:
                 try:
                     self.sc.release_lease(mm.lease_id)
                     results.append({"model": name, "status": "lease_released", "process": "kept"})
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning(f"Could not release lease {mm.lease_id} for {name}: {e}")
+                    results.append({"model": name, "status": "lease_release_failed",
+                                    "process": "kept", "error": str(e)})
         for task in [self._cooldown_task, self._health_task, getattr(self, '_renewal_task', None), self._stats_task, self._offering_task]:
             if task and not task.done():
                 task.cancel()

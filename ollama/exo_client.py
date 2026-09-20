@@ -24,6 +24,7 @@ Two things about this backend are unlike every other one behind the gateway:
    in this file estimates a memory figure, on purpose.
 """
 
+import asyncio
 import json
 import httpx
 from dataclasses import dataclass, field
@@ -32,6 +33,27 @@ from typing import Optional
 from . import config
 
 EXO_BASE = config.EXO_BASE
+
+
+class ExoRequestFailed(Exception):
+    """The pool accepted a request and then failed it.
+
+    Exists so `server` has one exception to catch for a failed generation. The
+    two code paths here use different HTTP libraries for good reasons — sync
+    httpx for short state reads, aiohttp for generation because it drops the
+    socket on cancellation — and they raise unrelated exception hierarchies.
+    Leaving that to the caller meant the `except httpx.*` clauses in the chat
+    route silently did not cover the aiohttp path, so an error from the pool
+    surfaced as a bare gateway 500: the one outcome this route is specified
+    never to produce.
+    """
+
+    def __init__(self, detail: str, *, status: Optional[int] = None,
+                 body: Optional[str] = None):
+        super().__init__(detail)
+        self.detail = detail
+        self.status = status
+        self.body = body
 
 
 class ExoUnavailable(Exception):
@@ -266,10 +288,24 @@ class ExoClient:
                     total=config.EXO_GENERATE_TIMEOUT, sock_connect=10
                 ),
             ) as resp:
-                resp.raise_for_status()
+                if resp.status >= 400:
+                    # Read the body before raising: exo puts the reason in it,
+                    # and once the context manager exits it is gone.
+                    body = (await resp.text())[:2000]
+                    raise ExoRequestFailed(
+                        f"the exo pool returned {resp.status}",
+                        status=resp.status, body=body,
+                    )
                 async for raw in resp.content:
                     line = raw.decode(errors="replace").rstrip("\r\n")
                     if line:
                         yield line
+        except aiohttp.ClientError as e:
+            raise ExoRequestFailed(f"exo transport error: {e}")
+        except asyncio.TimeoutError:
+            raise ExoRequestFailed(
+                f"the exo pool produced no answer within "
+                f"{config.EXO_GENERATE_TIMEOUT}s"
+            )
         finally:
             await session.close()

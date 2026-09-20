@@ -42,7 +42,7 @@ from .manager import (
     ModelManager, Backend, VLM_PORT,
     match_vlm_model, match_gguf_model, match_exo_tier,
 )
-from .exo_client import ExoUnavailable
+from .exo_client import ExoUnavailable, ExoRequestFailed
 from .samcloud import SamcloudClient
 from .ollama_client import OllamaClient
 from .llama_client import LlamaServerClient
@@ -864,6 +864,17 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                 except asyncio.CancelledError:
                     log.info(f"Client disconnected during pool stream for {mm.name}")
                     raise
+                except ExoRequestFailed as e:
+                    # Headers are already sent, so this cannot become a 502.
+                    # Emit it as a terminal SSE error event rather than just
+                    # closing the stream, so the caller can tell a failed
+                    # generation from a short one.
+                    log.warning(f"Pool failed the stream for {mm.name}: {e}")
+                    yield "data: " + json.dumps({
+                        "error": {"message": e.detail, "type": "pool_error",
+                                  "pool_status": e.status},
+                    }) + "\n\n"
+                    yield "data: [DONE]\n\n"
                 except Exception as e:
                     log.warning(f"Pool stream error for {mm.name}: {e}")
                 finally:
@@ -915,17 +926,15 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                 data = gen.result()
         except capacity.PoolBusy as e:
             raise _busy_503(e)
-        except httpx.HTTPStatusError as e:
-            log.warning(f"Pool returned {e.response.status_code} for {mm.name}")
+        except ExoRequestFailed as e:
+            # A pool that fails a generation is a bad gateway, not a bad
+            # request and not a broken model-service. 502 keeps those apart.
+            log.warning(f"Pool failed the generation for {mm.name}: {e}")
             raise HTTPException(status_code=502, detail={
                 "error": "pool_error",
-                "message": f"the exo pool returned {e.response.status_code}",
-                "body": e.response.text[:2000],
-            })
-        except httpx.HTTPError as e:
-            log.warning(f"Pool transport error for {mm.name}: {e}")
-            raise HTTPException(status_code=502, detail={
-                "error": "pool_error", "message": str(e),
+                "message": e.detail,
+                "pool_status": e.status,
+                "body": e.body,
             })
 
         # Report the tier the caller asked for alongside what actually served

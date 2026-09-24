@@ -86,6 +86,56 @@ def match_exo_tier(model_name: str) -> bool:
     return model_name.strip().lower() in EXO_TIERS
 
 
+def vlm_cache_dir():
+    """Where mlx-vlm will look for a repo's weights.
+
+    Reads the same env huggingface_hub reads, in its order, because the VLM is
+    spawned as a child of this process (`load_vlm_model`) and so inherits it.
+    Do not shortcut to `~/.cache/huggingface/hub` -- that is only the default.
+    """
+    from pathlib import Path
+    v = os.environ.get("HF_HUB_CACHE")
+    if v:
+        return Path(v)
+    home = os.environ.get("HF_HOME")
+    if home:
+        return Path(home) / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def vlm_installed(repo_id: str) -> bool:
+    """Are this VLM's weights already on local disk?
+
+    The other two local backends only advertise what is installed -- Ollama
+    lists what has been pulled, llama-server lists GGUF files that exist -- and
+    this is the VLM equivalent, so `/v1/models` can hold to the same meaning
+    across all three.
+
+    It matters more here than the symmetry suggests, because the fit gate in
+    `capacity.py` measures RAM and nothing measures disk. Measured 2026-09-24
+    on slice: gemma-4-31b needs 18700MB of RAM, which fit, against 15GB of free
+    disk and ~18.7GB of weights not yet fetched. Nothing in the load path would
+    have refused that -- `load_vlm_model` would have spawned mlx-vlm, which
+    downloads on demand, and the box would have run itself out of disk before
+    `VLM_STARTUP_TIMEOUT` expired. Advertising a model is an invitation to
+    request it, so the listing is the honest place to draw the line.
+
+    False is the safe answer on any error: it hides a model from discovery,
+    which `/models` still shows with `installed: false`, and costs nothing else
+    -- `match_vlm_model` is not gated on this, so a caller who asks for the
+    model by name anyway still reaches the existing load path.
+    """
+    from pathlib import Path
+    try:
+        p = Path(repo_id).expanduser()
+        if p.is_dir():          # a pinned local directory, not a hub repo
+            return True
+        snapshots = vlm_cache_dir() / ("models--" + repo_id.replace("/", "--")) / "snapshots"
+        return any(any(s.iterdir()) for s in snapshots.iterdir())
+    except OSError:
+        return False
+
+
 def match_vlm_model(model_name: str):
     """Map a requested name to a known VLM. Returns (resolved_id, memory_mb) or None.
 

@@ -39,7 +39,7 @@ from typing import Optional
 from . import capacity
 from . import config
 from .manager import (
-    ModelManager, Backend, VLM_PORT,
+    ModelManager, Backend, VLM_PORT, VLM_MODELS, vlm_installed,
     match_vlm_model, match_gguf_model, match_exo_tier,
 )
 from .exo_client import ExoUnavailable, ExoRequestFailed
@@ -438,6 +438,32 @@ async def list_models_openai():
         if mm.backend != Backend.EXO:      # tiers already added under their tier name
             add(name, mm.backend.value)
 
+    # The VLM catalogue. Unlike the two catalogue reads below it needs no
+    # try/except: VLM_MODELS is a static dict in manager.py, not a backend that
+    # can be down. And unlike them it is the *only* record of what these models
+    # are -- an mlx-vlm model is not "pulled" and has no GGUF on disk, so if it
+    # is not listed from here it is not listed at all. That was the gap: the
+    # gateway has served vision since the mlx-vlm backend landed, and because
+    # the process is on-demand and unloads after COOLDOWN_SECONDS, `mgr.models`
+    # above held it only for the few minutes after a request. So discovery
+    # showed a text-only gateway to anyone who asked while it was idle, which
+    # is the same discovery-failure-on-a-working-backend this endpoint was
+    # added to fix (ticket #815).
+    #
+    # Listed by resolved id, not by alias, so the entry is the same string
+    # whether or not the model is resident -- load_vlm_model registers under
+    # the resolved id, so a loaded VLM has already added itself above and
+    # `seen` collapses the two. The alias ("qwen2.5-vl") still resolves on
+    # request; match_vlm_model takes either.
+    #
+    # Only the ones whose weights are on disk, which is what "can be asked for"
+    # means for the other two local backends as well -- see vlm_installed for
+    # why an uninstalled VLM is worse than merely slow. `/models` lists the
+    # whole catalogue with the flag, so nothing is hidden from an operator.
+    for info in VLM_MODELS.values():
+        if vlm_installed(info["default"]):
+            add(info["default"], Backend.VLM.value)
+
     try:
         for m in mgr.ollama.list_models():
             add(m.get("name", ""), "ollama")
@@ -469,6 +495,19 @@ async def list_models():
         },
         "available_ollama": [m["name"] for m in mgr.ollama.list_models()],
         "available_gguf": mgr.llama.available_models(),
+        # Both names, because they are not interchangeable to a caller: the
+        # alias survives a change of `default` in the catalogue, the resolved
+        # id is what a request actually gets and what `managed` above keys on.
+        "available_vlm": [
+            {"alias": alias, "model": info["default"],
+             "memory_mb": info["memory_mb"],
+             # Weights on disk. False means a request for it would download
+             # first, uncapped and unmeasured -- so it is absent from
+             # /v1/models, but named here so the gap is visible rather than
+             # looking like the model was never configured.
+             "installed": vlm_installed(info["default"])}
+            for alias, info in VLM_MODELS.items()
+        ],
         "exo_pool": await _exo_pool_view(),
     }
 
@@ -900,6 +939,45 @@ async def _watch_disconnect(request: Optional[Request], poll_s: float = 2.0):
         await asyncio.sleep(poll_s)
 
 
+def _openai_shape_vlm(data: dict) -> dict:
+    """Give mlx-vlm's reply the shape this gateway's other backends return.
+
+    Measured 2026-09-24 on this box, same prompt to each backend: the Ollama
+    path builds `usage.prompt_tokens`/`completion_tokens` and sets
+    `choices[].index` (see the chunk assembly above); mlx-vlm answers with
+    `usage.input_tokens`/`output_tokens` and no `index`. So a caller reading
+    `usage.prompt_tokens` -- which is what the OpenAI SDKs read -- got a number
+    from every text model here and `None` from the only vision one, for the
+    same request shape. Backends should not be tellable apart by the envelope.
+
+    mlx-vlm's own keys are kept beside the OpenAI ones rather than renamed
+    away: `input_tokens`, and the `prompt_tps`/`generation_tps`/`peak_memory`
+    it reports and the others do not, are real measurements and cost nothing to
+    carry. Unknown keys are ignored by OpenAI clients.
+
+    Not touched: `id`, `object` and `created`, which mlx-vlm omits -- and so
+    does the Ollama path, so adding them here would make the vision backend the
+    odd one out in the other direction. That gap is real but fleet-wide, and
+    belongs in one change across every backend rather than in this one.
+    """
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        if "prompt_tokens" not in usage and "input_tokens" in usage:
+            usage["prompt_tokens"] = usage["input_tokens"]
+        if "completion_tokens" not in usage and "output_tokens" in usage:
+            usage["completion_tokens"] = usage["output_tokens"]
+        if "total_tokens" not in usage:
+            have = usage.get("prompt_tokens"), usage.get("completion_tokens")
+            if all(isinstance(v, int) for v in have):
+                usage["total_tokens"] = sum(have)
+
+    for i, choice in enumerate(data.get("choices") or []):
+        if isinstance(choice, dict):
+            choice.setdefault("index", i)
+
+    return data
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest, http_request: Request = None):
     mm = await _resolve_model(req.model)
@@ -1297,7 +1375,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                     if tool_calls:
                         data["choices"][0]["message"]["tool_calls"] = tool_calls
                         data["choices"][0]["finish_reason"] = "tool_calls"
-                return data
+                return _openai_shape_vlm(data)
 
 
 @app.post("/v1/completions")

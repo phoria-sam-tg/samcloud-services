@@ -42,7 +42,7 @@ from .manager import (
     ModelManager, Backend, VLM_PORT,
     match_vlm_model, match_gguf_model, match_exo_tier,
 )
-from .exo_client import ExoUnavailable, ExoRequestFailed
+from .exo_client import ExoUnavailable, ExoRequestFailed, ExoStalled
 from .samcloud import SamcloudClient
 from .ollama_client import OllamaClient
 from .llama_client import LlamaServerClient
@@ -1080,6 +1080,23 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                 except asyncio.CancelledError:
                     log.info(f"Client disconnected during pool stream for {mm.name}")
                     raise
+                except ExoStalled as e:
+                    # Same constraint as below — headers are gone, so this
+                    # cannot be a 504. Named separately from ExoRequestFailed
+                    # because the caller's correct response differs: retrying a
+                    # stalled instance hits the same stuck runner, and what the
+                    # caller should do is wait for the guard to rebuild it.
+                    log.error(
+                        f"Pool STALLED mid-stream for {mm.name}: {e.tokens} chunks "
+                        f"then {e.silent_for:.0f}s of silence — releasing the lease "
+                        f"so the placement guard can recover the instance"
+                    )
+                    yield "data: " + json.dumps({
+                        "error": {"message": str(e), "type": "pool_stalled",
+                                  "tokens_before_stall": e.tokens,
+                                  "silent_for_s": round(e.silent_for, 1)},
+                    }) + "\n\n"
+                    yield "data: [DONE]\n\n"
                 except ExoRequestFailed as e:
                     # Headers are already sent, so this cannot become a 502.
                     # Emit it as a terminal SSE error event rather than just
@@ -1153,6 +1170,24 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                 mgr.release_pool(lease_id)
         except capacity.PoolBusy as e:
             raise _busy_503(e)
+        except ExoStalled as e:
+            # 504, not 502: the pool did not fail the request, it stopped
+            # answering one it had already begun. The distinction is worth a
+            # status code because the remedies differ — a 502 invites a retry,
+            # and retrying this one lands on the same stuck instance until the
+            # placement guard rebuilds it (#830).
+            log.error(
+                f"Pool STALLED for {mm.name}: {e.tokens} chunks then "
+                f"{e.silent_for:.0f}s of silence — lease released, the guard "
+                f"should now see an unleased busy pool and rebuild it"
+            )
+            raise HTTPException(status_code=504, detail={
+                "error": "pool_stalled",
+                "message": str(e),
+                "tokens_before_stall": e.tokens,
+                "silent_for_s": round(e.silent_for, 1),
+                "resource_id": config.EXO_RESOURCE_ID,
+            })
         except ExoRequestFailed as e:
             # A pool that fails a generation is a bad gateway, not a bad
             # request and not a broken model-service. 502 keeps those apart.

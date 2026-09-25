@@ -134,6 +134,28 @@ EXO_TIERS = tuple(
 # request after a placement is the slowest (cold KV cache).
 EXO_GENERATE_TIMEOUT = _env_int("EXO_GENERATE_TIMEOUT", 1500)
 
+# How long a generation may go silent AFTER it has started producing tokens.
+#
+# Distinct from EXO_GENERATE_TIMEOUT, which bounds the whole request and has to
+# be generous because prefill is legitimately slow (42s measured on a
+# 12,252-token prompt). This one bounds the gap BETWEEN tokens, and only once
+# the first has arrived — so it can be tight without ever cutting a slow start.
+#
+# Measured on this pool (#830): a healthy decode emits a chunk every ~29ms,
+# p99 52-65ms, and the largest gap ever seen between two tokens was 3.511s.
+# A blocked decode, by contrast, produces nothing at all — three times on
+# 2026-09-25, for 12, 27 and 58 minutes. 60s is ~17x the worst healthy gap and
+# still an order of magnitude faster than EXO_GENERATE_TIMEOUT at noticing.
+#
+# WHY THIS MATTERS BEYOND ONE REQUEST: while we wait, we hold the pool's
+# exclusive lease. The placement guard treats "runners busy with no lease" as
+# its wedge signal, so a gateway that waits the full 1500s also hides the wedge
+# from the thing that can repair it. Aborting here releases the lease and lets
+# the guard act, which turns ~26 minutes of unattended recovery into ~2-3.
+# exo skips PrefillProgressChunk in its OpenAI adapter, so every SSE line we
+# see is already a real token — "first line" and "first token" are the same.
+EXO_STALL_TIMEOUT = _env_int("EXO_STALL_TIMEOUT", 60)
+
 # Ceiling on how long an exclusive lease can outlive the request that took it.
 # This is a leak bound, not an expected generation length — the happy path
 # releases in a `finally`. It matters because a lease stranded on an exclusive

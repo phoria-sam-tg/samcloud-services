@@ -3,3 +3,9 @@ uvicorn>=0.20.0
 httpx>=0.24.0
 aiohttp>=3.9.0
 pydantic>=2.0.0
+
+# Counts a prompt with the resident model's own tokenizer before the gateway
+# dispatches it to the pool (ticket #837). Optional at runtime — prompt_size
+# falls back to a conservative chars/token estimate if it is missing — but a box
+# without it refuses good prompts it did not need to refuse.
+tokenizers>=0.22.0

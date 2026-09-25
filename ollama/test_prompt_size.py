@@ -8,8 +8,12 @@ prompt before dispatching it, so any client could do that, and one did.
 
 What this pins down:
 
-  1. The prompt is counted with the resident model's own tokenizer when that
-     tokenizer is on disk, and the count is close to what exo itself reports.
+  1. The prompt is counted through the resident model's own chat template and
+     tokenizer — the same two files exo uses — so our number and exo's mean the
+     same thing.
+  6. Tool definitions count. This template renders every tool inline, and a
+     counter that reads `messages` alone read a live request as 11,742 tokens
+     that exo then prefilled as 18,118.
   2. A prompt over the limit is refused — 413, with the limit, the measurement
      and the method in the body.
   3. The refusal says the limit is about the HOST and not the model's context
@@ -68,7 +72,7 @@ def main():
     else:
         n, how = prompt_size.count([{"role": "user", "content": words(1000)}],
                                    MODEL, config.EXO_MODELS_DIR, config.EXO_CHARS_PER_TOKEN)
-        check(how == "tokenizer", f"counted exactly, not estimated ({how})")
+        check(how == "chat template", f"counted through the model's template ({how})")
         check(800 < n < 1400, f"count is in the right neighbourhood ({n} tokens)")
         check(ctx and ctx > 100000,
               f"model's declared context window read from config.json ({ctx})")
@@ -156,7 +160,33 @@ def main():
     finally:
         server.mgr, server._resolve_model = real_mgr, real_resolve
 
-    step(4, "an absurd body is refused without being tokenized")
+    step(4, "tool definitions count toward the limit")
+    tiny = [{"role": "user", "content": "hi"}]
+    fat_tools = [{
+        "type": "function",
+        "function": {
+            "name": f"tool_{i}",
+            "description": words(200),
+            "parameters": {"type": "object", "properties": {"q": {"type": "string",
+                                                                  "description": words(60)}}},
+        },
+    } for i in range(20)]
+    bare, _ = prompt_size.count(tiny, MODEL, config.EXO_MODELS_DIR,
+                                config.EXO_CHARS_PER_TOKEN)
+    withtools, _ = prompt_size.count(tiny, MODEL, config.EXO_MODELS_DIR,
+                                     config.EXO_CHARS_PER_TOKEN, tools=fat_tools)
+    check(withtools > bare + 1000,
+          f"tools move the count ({bare} -> {withtools} tokens for the same messages)")
+    try:
+        prompt_size.check(tiny, MODEL, limit=config.EXO_MAX_PROMPT_TOKENS,
+                          completion_budget=0, models_dir=config.EXO_MODELS_DIR,
+                          chars_per_token=config.EXO_CHARS_PER_TOKEN,
+                          resource_id=config.EXO_RESOURCE_ID, tools=fat_tools * 3)
+        check(False, "a two-word prompt with oversized tools is refused")
+    except prompt_size.PromptTooLarge as e:
+        check(True, f"a two-word prompt with oversized tools is refused ({e.tokens} tokens)")
+
+    step(5, "an absurd body is refused without being tokenized")
     huge = [{"role": "user", "content": "x" * (config.EXO_MAX_PROMPT_TOKENS * 600)}]
     try:
         prompt_size.check(huge, MODEL, limit=config.EXO_MAX_PROMPT_TOKENS,
@@ -167,7 +197,7 @@ def main():
     except prompt_size.PromptTooLarge as e:
         check(True, f"a body past any possible limit is refused ({e.method})")
 
-    step(5, "with no tokenizer, the estimate still refuses")
+    step(6, "with no tokenizer, the estimate still refuses")
     prompt_size._CACHE.pop("no-such/model", None)
     try:
         prompt_size.check([{"role": "user", "content": words(config.EXO_MAX_PROMPT_TOKENS)}],

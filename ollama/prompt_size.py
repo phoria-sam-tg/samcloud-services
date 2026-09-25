@@ -24,10 +24,12 @@ this module deliberately is not:
   and is quadratic, not linear, which is exactly why a limit set by intuition
   lands in the wrong place.
 
-Counting is exact when the resident model's `tokenizer.json` is on disk — the same
-file exo tokenizes with — and falls back to a conservative chars/token estimate
-when it is not. The fallback overestimates on ordinary prose; that is the safe
-direction, and the refusal says which method produced the number.
+Counting goes through the model's own chat template and tokenizer — the same two
+files exo renders and tokenizes with — so the number means what the measurements
+behind the limit mean: tokens the model is actually handed. Tools count, because
+this template renders every definition inline. Missing template or tokenizer fall
+back to the serialised request and then to a chars/token estimate, both of which
+over-count; the refusal always says which method produced its number.
 """
 
 import json
@@ -144,6 +146,56 @@ def _load(model_id: str, models_dir: str):
     return _CACHE[model_id]
 
 
+def _template(model_id: str, models_dir: str):
+    """The model's own chat template, compiled, or None.
+
+    Counting message text alone is not counting the prompt. Measured on live
+    traffic 2026-09-25: the gateway read a hermes request as 11,742 tokens while
+    exo prefilled 18,118 — the model sees the template's own markup and, on this
+    template, every tool definition rendered inline. 6,376 tokens of the
+    difference was invisible to a counter that reads `messages`, and the limit
+    was set from measurements of what exo actually prefills, so the two numbers
+    have to mean the same thing.
+
+    Rendered the way `apply_chat_template` renders it: sandboxed, `trim_blocks`
+    and `lstrip_blocks` on, with the two globals templates reach for.
+    """
+    key = ("tmpl", model_id)
+    if key in _CACHE:
+        return _CACHE[key]
+    tmpl = None
+    path = os.path.join(models_dir, model_id.replace("/", "--"), "chat_template.jinja")
+    try:
+        from jinja2.sandbox import ImmutableSandboxedEnvironment  # noqa: PLC0415
+        import datetime  # noqa: PLC0415
+
+        def raise_exception(msg):
+            raise RuntimeError(msg)
+
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+        env.globals["raise_exception"] = raise_exception
+        env.globals["strftime_now"] = lambda fmt: datetime.datetime.now().strftime(fmt)
+        with open(path) as fh:
+            tmpl = env.from_string(fh.read())
+        log.info(f"prompt-size: counting {model_id} through its chat template")
+    except Exception as e:
+        log.warning(f"prompt-size: no chat template for {model_id} at {path} ({e}); "
+                    f"counting the message text instead, which undercounts tools")
+    _CACHE[key] = tmpl
+    return tmpl
+
+
+def _serialised(messages: list, tools: Optional[list]) -> str:
+    """Everything outbound, as JSON — the fallback when the template is missing.
+
+    Deliberately the whole object rather than a chosen set of keys. Picking keys
+    is what missed the tools: a field nobody thought of is a field nobody counts,
+    and on this path the cost of being wrong is the host.
+    """
+    return json.dumps({"messages": messages or [], "tools": tools or []},
+                      ensure_ascii=False)
+
+
 def _text_of(messages: list) -> str:
     """Every character the model will see, flattened.
 
@@ -176,22 +228,38 @@ def _text_of(messages: list) -> str:
 
 
 def count(messages: list, model_id: str, models_dir: str, chars_per_token: float,
+          tools: Optional[list] = None,
           per_message_overhead: int = 8, fixed_overhead: int = 8) -> tuple:
-    """(tokens, method) for a message list.
+    """(tokens, method) for what the model will actually be handed.
 
-    The overheads cover the chat template, which wraps every message in role
-    markers this function never sees. Measured against exo's own `usage` on this
-    model: a 4096-token user message was reported as 4102 prompt tokens, 2048 as
-    2053, 8192 as 8197 — so the true overhead is 5-6 tokens for a single message.
-    8 per message plus 8 fixed is deliberately above that, since the whole point
-    is to be wrong in the direction that refuses.
+    Three ways down, most accurate first:
+
+    1. **chat template** — render the model's own template over the messages and
+       tools and tokenize the result. This is what exo does, so the number means
+       the same thing as the measurements the limit was set from.
+    2. **serialised** — tokenize the JSON of messages plus tools. Over-counts
+       (keys, quotes) and misses the template's markup, but misses no field.
+    3. **estimate** — characters over a conservative ratio, when there is no
+       tokenizer at all.
+
+    The overheads apply to 2 and 3, where the template's own wrapping is unseen.
     """
-    text = _text_of(messages)
     tok, longest, _ctx = _load(model_id, models_dir)
     n_msgs = len(messages or [])
     overhead = fixed_overhead + per_message_overhead * n_msgs
     if tok is not None:
-        return len(tok.encode(text, add_special_tokens=False).ids) + overhead, "tokenizer"
+        tmpl = _template(model_id, models_dir)
+        if tmpl is not None:
+            try:
+                rendered = tmpl.render(messages=messages or [], tools=tools or None,
+                                       add_generation_prompt=True)
+                return len(tok.encode(rendered, add_special_tokens=False).ids), "chat template"
+            except Exception as e:
+                log.warning(f"prompt-size: chat template failed to render ({e}); "
+                            f"counting the serialised request instead")
+        return (len(tok.encode(_serialised(messages, tools), add_special_tokens=False).ids)
+                + overhead), "serialised"
+    text = _serialised(messages, tools)
     # No tokenizer: divide by the most token-dense ratio we measured rather than
     # an average one. Measured on this tokenizer, chars per token: prose 4.50,
     # python 3.86, JSON 3.38, log lines 2.76, CJK 2.00, base64-like 1.50. A
@@ -202,7 +270,7 @@ def count(messages: list, model_id: str, models_dir: str, chars_per_token: float
 
 def check(messages: list, model_id: str, limit: int, completion_budget: int,
           models_dir: str, chars_per_token: float, resource_id: str,
-          context_length: Optional[int] = None) -> tuple:
+          context_length: Optional[int] = None, tools: Optional[list] = None) -> tuple:
     """Raise PromptTooLarge if this request should not be dispatched. Else (tokens, method).
 
     The limit is on the **prompt**, not on prompt plus answer, because the two
@@ -221,7 +289,7 @@ def check(messages: list, model_id: str, limit: int, completion_budget: int,
     """
     tok, longest, declared_ctx = _load(model_id, models_dir)
     context_length = context_length or declared_ctx
-    chars = sum(len(str(m)) for m in (messages or []))
+    chars = sum(len(str(m)) for m in (messages or [])) + len(str(tools or ""))
     # Refuse an absurd body without tokenizing it. Sound because one token can
     # stand for at most `longest` characters, so anything longer than
     # limit*longest cannot possibly come in under the limit. Only a guard against
@@ -229,7 +297,7 @@ def check(messages: list, model_id: str, limit: int, completion_budget: int,
     if longest and chars > (limit * longest):
         raise PromptTooLarge(chars // max(longest, 1), limit, "unmeasured: body far over any possible limit",
                              completion_budget, resource_id, model_id, context_length)
-    tokens, method = count(messages, model_id, models_dir, chars_per_token)
+    tokens, method = count(messages, model_id, models_dir, chars_per_token, tools=tools)
     if tokens > limit:
         raise PromptTooLarge(tokens, limit, method, completion_budget,
                              resource_id, model_id, context_length)

@@ -115,10 +115,27 @@ AUTO_EVICT = _env_bool("AUTO_EVICT", False)
 # --- exo pool (Backend.EXO) ---
 # ONE exo instance spanning slice + wafer, serving ONE request at a time.
 # Unlike every other backend the gateway owns, we neither start it nor place
-# its model: it must be launched from Terminal.app (macOS grants local-network
-# access per responsible process, so a headless launch is denied), and the
-# resident model is swapped out of band by whoever operates the pool.
-EXO_BASE = _env("EXO_BASE", "http://192.168.1.3:52415")
+# its model: the resident model is swapped out of band by whoever operates the
+# pool. That part is unchanged. The *launch* half is not:
+#
+# This used to say the pool had to be started from Terminal.app, because macOS
+# grants local-network access per responsible process and a headless launch was
+# believed to be denied. Measured 2026-09-22 (#806), as unix `claude-services`
+# spawned by sshd with no GUI session and no Terminal: UDP multicast receive on
+# exo's discovery group ff12::e0a1:de89 joined on all 14 interfaces and took 23
+# announcement packets from the same peers `sam` sees, in the same 12 seconds;
+# a node started that way then formed the ring. Both nodes now run under their
+# box's services account. What would disconfirm it: a node that discovers no
+# peer when started from a LaunchDaemon specifically — the daemon domain is the
+# one launch shape not yet exercised, and the earlier claim was about the GUI
+# launchd *agent* domain, which is a different thing again.
+#
+# The endpoint is localhost because each box now runs its own node, so the pool
+# is reachable in-process-tree with no LAN hop and no dependence on which node
+# holds master. Read `/state` from both ends before concluding a node is out of
+# the ring: a node that has just joined an established master serves a stale,
+# incomplete replica for up to a minute (#806).
+EXO_BASE = _env("EXO_BASE", "http://localhost:52415")
 EXO_ENABLED = _env_bool("EXO_ENABLED", True)
 EXO_RESOURCE_ID = _env("EXO_RESOURCE_ID", f"{SC_DEVICE}/exo-pool")
 
@@ -163,7 +180,80 @@ if EXO_LEASE_TTL < EXO_GENERATE_TIMEOUT + _EXO_TTL_MARGIN:
 # generation is not slow, it is a denial of service: one caller owns the pool
 # until it stops talking. Cap every request, and let the caller lower it but
 # never raise it past the cap.
-EXO_MAX_TOKENS = _env_int("EXO_MAX_TOKENS", 2048)
+# 2048 was sized for a non-thinking tier and became the floor the caller could
+# not get past: `think` is GLM-4.7-Flash-6bit, whose reasoning tokens come out of
+# this same budget. Measured 2026-09-22 (#806): a one-line smoke test
+# ("what is 17*23") spent 187 of 200 tokens on reasoning and returned
+# finish_reason=length with the answer cut off. hermes-exo asks for 6000 and got
+# min(6000, 2048) = 2048 — so it received empty content, no error, and burned its
+# turn budget on answers that were truncated before they began (#808 timed out at
+# the adapter's 600s wall with chars_out: 0).
+#
+# 8192 is chosen to clear hermes' 6000 with headroom, so the gateway stops being
+# the binding constraint, while still bounding one generation: the pool measured
+# ~33 tok/s on this model, so 8192 caps a single request at roughly four minutes
+# of an exclusive resource. Raise it only with a matching view on how long one
+# caller may own the pool.
+EXO_MAX_TOKENS = _env_int("EXO_MAX_TOKENS", 8192)
+
+# Largest prompt this gateway will hand to the pool, in tokens (ticket #837).
+#
+# THIS PROTECTS THE HOST, NOT THE MODEL'S CONTEXT WINDOW. GLM-4.7-Flash
+# advertises 202,752 tokens and exo will honestly try to serve them; slice has
+# 64 GB and cannot survive the attempt. On 2026-09-25 a 108,753-token prompt
+# arrived here, exo began prefilling it, and at 47,104 tokens macOS's GPU driver
+# panicked the box instead of failing the allocation ("completeMemory() prepare
+# count underflow" @IOGPUMemory.cpp:492, wired ~53 GB of 64). Three hours down.
+#
+# MEASURED 2026-09-25 on the current placement (2-node ring: slice holds layers
+# 13-47, wafer 0-13; the 34-layer shard is on slice, confirmed from the live
+# process rather than `hostsByNode`, which reads inverted). Cold prefill through
+# this gateway, max_tokens=1, sampling `vm_stat` every second. Slice baseline
+# with the model resident and idle: 21.2 GB wired, 23.0 GB available.
+#
+#     prompt tokens   peak wired    over baseline   available at peak
+#         4,096         24.7 GB        +3.5 GB          21.1 GB
+#         8,192         29.3 GB        +8.1 GB          ~17 GB
+#        16,384         46.1 GB       +24.9 GB           8.5 GB
+#
+# The cost is NOT linear in prompt length, which is the whole reason this
+# constant is measured rather than picked: 4x the tokens cost 7x the memory.
+# Fitting peak = 21.2 + 6.32e-4*N + 5.41e-8*N^2 (GB, N tokens) reproduces the
+# 8,192 point to within 0.8 GB. Reading the panic level (53 GB wired) off that
+# curve puts it at about 19,000 tokens — i.e. a single ~19k-token prompt is
+# enough to reach the state that took the box down, with no other load.
+#
+# The inference, kept separate from the measurement above: the linear term is
+# the KV cache itself (this model caches the MLA latent, 576 values per token
+# per layer) and the quadratic term is the attention score matrix materialised
+# per prefill chunk over the whole sequence so far, retained by MLX's buffer
+# cache. What would disconfirm it: a run where peak memory tracks tokens
+# linearly, or one where `mx.clear_cache()` between chunks flattens the curve.
+#
+# 12,288 puts the predicted peak at 36.8 GB wired — 16 GB below the level that
+# panicked the host, and it leaves room for the decode that follows, which adds
+# to the same cache at the linear rate (EXO_MAX_TOKENS=8192 more tokens is about
+# 5 GB on top). It is a per-host number: it moves if the placement moves, if the
+# resident model changes, or if anything else large starts running on slice.
+#
+# Note the *other* box is the tighter one in a different way: wafer carries 13
+# of 47 layers with 36 GB total, and was measured at 14.0 GB available with
+# 17.0 of 18.4 GB of swap already in use while this ran. A limit sized only off
+# slice is not automatically safe for wafer.
+EXO_MAX_PROMPT_TOKENS = _env_int("EXO_MAX_PROMPT_TOKENS", 12288)
+
+# Where to find the resident model's own `tokenizer.json`, so the prompt is
+# counted with the same tokenizer that will prefill it rather than estimated.
+EXO_MODELS_DIR = _env("EXO_MODELS_DIR", "/Users/Shared/exo/models")
+
+# Fallback when that tokenizer is not on disk: characters per token, used as
+# `tokens = chars / ratio`. Measured on GLM-4.7-Flash-6bit's tokenizer, chars
+# per token by input kind: prose 4.50, Python 3.86, JSON 3.38, log lines 2.76,
+# CJK 2.00, base64-like 1.50. 1.5 is the densest of those, so the estimate
+# over-counts ordinary prose roughly 3x. That is deliberate: the fallback exists
+# to keep refusing safely when we cannot count exactly, and a refusal says which
+# method produced its number so an over-count is legible rather than mysterious.
+EXO_CHARS_PER_TOKEN = float(_env("EXO_CHARS_PER_TOKEN", "1.5"))
 
 # How long `GET /models` may reuse a pool status reading. Status display only —
 # the serving path always reads fresh, so this cannot route a request at a stale

@@ -38,6 +38,7 @@ from typing import Optional
 
 from . import capacity
 from . import config
+from . import prompt_size
 from .manager import (
     ModelManager, Backend, VLM_PORT, VLM_MODELS, vlm_installed,
     match_vlm_model, match_gguf_model, match_exo_tier,
@@ -598,14 +599,49 @@ def _busy_503(e: "capacity.PoolBusy") -> HTTPException:
     return HTTPException(status_code=503, detail=e.as_dict(), headers=headers or None)
 
 
+def _prompt_too_large_413(e: "prompt_size.PromptTooLarge") -> HTTPException:
+    """The prompt is too big for this host to prefill. 413, with the limit named.
+
+    413 rather than 400 because the request is well-formed and the problem is
+    its size, and rather than 503 because retrying unchanged will never work —
+    the three declines a pool caller can meet (`too big`, `busy`, `not there`)
+    should be distinguishable without parsing prose, and only one of them is
+    worth waiting out.
+
+    No `Retry-After`. Nothing about this host will change in a minute that makes
+    a 100k-token prompt safe.
+    """
+    log.warning(
+        f"Refused a prompt for the pool: {e.tokens} tokens by {e.method}, "
+        f"limit {e.limit} (#837)"
+    )
+    return HTTPException(status_code=413, detail=e.as_dict())
+
+
+def _exo_completion_budget(model_id: str, requested: Optional[int]) -> int:
+    """How many tokens the answer may add to the same KV cache.
+
+    Mirrors the cap arithmetic on the serving path below — a caller may ask for
+    less than the cap, never for more — so the number quoted in a refusal is the
+    number that would actually have been sent.
+    """
+    cap = mgr.exo_request_defaults(model_id).get("max_tokens")
+    if cap is None:
+        return requested or 0
+    return min(requested, cap) if requested else cap
+
+
 def _pool_unavailable_503(e: Exception) -> HTTPException:
     """The pool is not there — distinct from it being busy.
 
     Deliberately not a 404: the tier is configured and real, so "no such model"
     would send a caller looking for a typo. And deliberately not a retry hint —
-    the pool cannot restart itself after a reboot (a headless launch is denied
-    local-network access on macOS), so a swap or a relaunch needs a human at a
-    Terminal and a tight retry loop would just spin.
+    the gateway does not place the pool's model, so a swap needs an operator and
+    a tight retry loop would just spin.
+
+    The relaunch half of that used to be true as well, and is not: a node no
+    longer needs a human at a Terminal (see `config.EXO_BASE`). Under launchd it
+    restarts itself; what it cannot do is place a model.
     """
     log.warning(f"Pool unavailable: {e}")
     return HTTPException(status_code=503, detail={
@@ -614,8 +650,9 @@ def _pool_unavailable_503(e: Exception) -> HTTPException:
         "resource_id": config.EXO_RESOURCE_ID,
         "endpoint": config.EXO_BASE,
         "note": (
-            "the exo pool is placed out of band and cannot start itself after a "
-            "reboot; it needs to be launched from a Terminal on the host"
+            "the exo pool's model is placed out of band — the gateway does not "
+            "place it. The nodes themselves are supervised and need no human at "
+            "a Terminal; ask whoever operates the pool to place a model on it"
         ),
     })
 
@@ -1071,6 +1108,28 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
             }
 
     elif mm.backend == Backend.EXO:
+        # Measure the prompt BEFORE anything else happens to it (ticket #837).
+        # Before the lease, before the wedge guard, before a byte reaches exo:
+        # a prompt large enough to panic the host must cost the host nothing at
+        # all, and a refusal that had to take an exclusive lease to say no would
+        # be its own small outage. This is the check that was missing when a
+        # 108,753-token prompt came through here and took slice down for three
+        # hours.
+        try:
+            n_tokens, how = prompt_size.check(
+                req.messages,
+                mm.name,
+                limit=config.EXO_MAX_PROMPT_TOKENS,
+                completion_budget=_exo_completion_budget(mm.name, req.max_tokens),
+                models_dir=config.EXO_MODELS_DIR,
+                chars_per_token=config.EXO_CHARS_PER_TOKEN,
+                resource_id=config.EXO_RESOURCE_ID,
+            )
+        except prompt_size.PromptTooLarge as e:
+            raise _prompt_too_large_413(e)
+        log.info(f"Pool prompt: {n_tokens} tokens by {how} "
+                 f"(limit {config.EXO_MAX_PROMPT_TOKENS})")
+
         # exo speaks OpenAI already, so this is a proxy and not a translation:
         # no native-format detour, no tool-call reshaping, no system-prompt
         # injection. What this branch adds over a bare reverse proxy is the

@@ -10,10 +10,12 @@ leasing for GPU memory management. Models spin up on demand, unload after 5 min 
 
 A fourth backend, the **exo pool** (`Backend.EXO`), is reached the same way but owned
 differently: the gateway neither starts it nor places its model, and holds an exclusive
-lease around each generation. It cannot restart itself after a reboot — macOS grants
-local-network access per responsible process, so a headless launch is denied and the
-pool must be started from a Terminal on the host. Known limitation, documented not
-solved.
+lease around each generation. Placing the model is still out of band — that limitation
+stands. Starting the node is not: the pool ran as `sam` and was believed to need
+Terminal.app for local-network access, and as of 2026-09-22 (#806) both nodes run
+headless under their box's services account (`claude-services` on slice,
+`wafer-services` on wafer) from a shared store at `/Users/Shared/exo`. See
+`ollama/config.py` for what was measured.
 
 ## SAMcloud Identity
 
@@ -53,6 +55,7 @@ Staging (legacy) used `slice-test/*` identities pointing at `stg.samtg.xyz:9443`
 | `ollama/server.py` | FastAPI server + auth middleware. Thin routing — delegates to manager |
 | `ollama/manager.py` | Core logic. `ModelManager` handles lifecycle, leases, cooldown, adoption, the fit gate on load, and the stats + offering background loops. Discovery is resilient to any backend being down |
 | `ollama/capacity.py` | **The one capacity signal.** Byte-identical on every box so an `offering:` means the same thing fleet-wide. Every fit decision, offering tier and resource-stats push reads from here — do not re-derive memory anywhere else |
+| `ollama/prompt_size.py` | **The prompt gate for the pool** (#837). Counts a prompt with the resident model's own tokenizer before dispatch and refuses over `EXO_MAX_PROMPT_TOKENS`. Falls back to a conservative chars/token estimate |
 | `ollama/samcloud.py` | SAMcloud API client. All registry calls go through this |
 | `ollama/ollama_client.py` | Ollama API. Note: `chat()` passes `**kwargs` so `think=False` works |
 | `ollama/llama_client.py` | llama-server process management. `discover_running()` parses `ps aux` |
@@ -71,6 +74,7 @@ python -m ollama.test_capacity_refusal   # Refusal path: 503 + the numbers, not 
 cd ollama && python test_lifecycle.py   # Full lease cycle
 cd ollama && python test_cooldown.py    # Idle unload verification
 python ollama/test_exo_lease.py        # Pool lease verdict + resident model (no network)
+python -m ollama.test_prompt_size      # Prompt gate: 413 shape, and that a refusal takes no lease
 ```
 
 `test_capacity_refusal` loads nothing and leases nothing — the refusal precedes
@@ -136,6 +140,18 @@ the 503 path the test exists for.
   cannot check. So: record what was measured and how, keep the inference visibly
   separate from it, and prefer "measured X under conditions Y" to "X because Y".
   If a comment asserts *why*, it should say what would disconfirm it.
+- **A prompt is measured before it is dispatched** (ticket #837) — the pool's
+  backend is two Macs, and a prompt long enough to fill their memory does not
+  fail an allocation, it panics the host: a 108,753-token prompt through this
+  gateway took slice down for three hours on 2026-09-25. `prompt_size.check()`
+  runs at the top of the `Backend.EXO` branch, **before the lease and before any
+  `/state` read**, and refuses over `EXO_MAX_PROMPT_TOKENS` with a 413 that
+  names the limit. Two things it must keep saying: the limit protects the
+  **host**, not the model's context window (GLM-4.7-Flash advertises 202,752
+  tokens and exo will try to serve them), and the number is **measured** —
+  prefill memory grows faster than linearly with prompt length, so 4x the tokens
+  cost 7x the memory and an intuited limit lands in the wrong place. It is a
+  property of the boxes and the placement: re-measure when either changes.
 - **Three pillars** — SAMcloud provides routing, resources, and auth
 
 ## Current State

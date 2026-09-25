@@ -647,6 +647,17 @@ class ModelManager:
                 continue
             if pid in owned or pid == os.getpid():
                 continue
+            # `pgrep -f` is a SUBSTRING match over the whole command line, so it
+            # also returns any process that merely *mentions* "mlx_vlm.server" —
+            # a grep, an editor, a shell script quoting it — and this loop sends
+            # SIGTERM to everything it returns. Verify each candidate is really a
+            # `python -m mlx_vlm.server` of ours before signalling it.
+            # (#806: the seventh instance of a pattern search matching something
+            # that was not the thing; the only one wired to a kill with no uid
+            # filter, in a long-running daemon.)
+            if not self._is_vlm_server(pid):
+                log.debug(f"pid {pid} matched the vlm pattern but is not one; leaving it")
+                continue
             try:
                 os.kill(pid, signal.SIGTERM)
                 log.info(f"Killed stray mlx-vlm process {pid}")
@@ -654,6 +665,36 @@ class ModelManager:
                 pass
             except Exception as e:
                 log.warning(f"Failed to kill stray mlx-vlm process {pid}: {e}")
+
+    @staticmethod
+    def _is_vlm_server(pid: int) -> bool:
+        """True only if `pid` is genuinely a `python -m mlx_vlm.server` we own.
+
+        Checks the uid and requires `-m mlx_vlm.server` as adjacent whitespace-
+        delimited argv tokens — the exact shape load_vlm_model spawns. A process
+        whose command line merely contains the string does not qualify.
+        """
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "uid=,command=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            )
+        except Exception:
+            return False
+        line = out.stdout.strip()
+        if not line:
+            return False
+        uid_s, _, cmd = line.partition(" ")
+        try:
+            if int(uid_s.strip()) != os.getuid():
+                return False
+        except ValueError:
+            return False
+        toks = cmd.split()
+        return any(
+            t == "-m" and toks[i + 1] == "mlx_vlm.server"
+            for i, t in enumerate(toks[:-1])
+        )
 
     def load_vlm_model(self, model_name: str) -> ManagedModel:
         """Start an mlx-vlm server for a vision-language model on demand.
@@ -1094,7 +1135,12 @@ class ModelManager:
 
         - **Wedged.** A previous client died mid-generation and exo was never
           told, so its single slot is occupied by work nobody is reading. exo
-          has no cancellation path, so this does not clear itself.
+          *does* have cancellation (`POST /v1/cancel/{command_id}`, and a
+          disconnect handler), but neither fired for the two clients that
+          wedged this pool on 2026-09-22, so in practice it does not clear
+          itself and someone has to cancel it explicitly. Why the disconnect
+          handler did not fire on a non-streaming response is unmeasured
+          (#806) — do not assume it will.
         - **Driven directly.** Someone is generating against `:52415` without
           taking a lease, which the lease cannot prevent.
 
@@ -1147,9 +1193,13 @@ class ModelManager:
             "the pool is serving a request that holds no lease, so this gateway "
             "cannot serialise against it: either something is driving exo "
             "directly, or a client died mid-generation and left the slot "
-            "occupied (exo has no cancellation path, so that does not clear "
-            "itself and re-placing the model is the fix). Declining rather than "
-            "dispatching into it, which would hang instead of serving.",
+            "occupied. Declining rather than dispatching into it, which would "
+            "hang instead of serving. To clear it: read the stuck task's "
+            "commandId from GET /state on the pool and POST /v1/cancel/"
+            "{commandId} — that frees the runner and keeps the model loaded. "
+            f"Re-placing the model on {EXO_RESOURCE_ID} also works but costs a "
+            "30s-10min reload, so it is the fallback, not the first move. This "
+            "gateway does neither; ask whoever operates the pool (#806).",
             resource_id=EXO_RESOURCE_ID,
             retry_after_s=60,
             error="pool_busy_unleased",
@@ -1257,9 +1307,10 @@ class ModelManager:
         if mm.backend == Backend.EXO:
             # Deregister the tier, never touch the pool. We did not start the
             # exo instance and stopping it would strand whoever else is using
-            # it — and it cannot be restarted unattended, so a stop here is
-            # effectively permanent until a human opens a Terminal. `force`
-            # deliberately does not override this.
+            # it. The pool is restartable unattended now (#806), so a stop here
+            # is no longer permanent — but it would still drop the resident
+            # model, which only an operator can place back. `force` deliberately
+            # does not override this.
             del self.models[model_name]
             log.info(f"Deregistered pool tier '{model_name}' (pool left running)")
             return {

@@ -71,6 +71,7 @@ python -m ollama.test_capacity_refusal   # Refusal path: 503 + the numbers, not 
 cd ollama && python test_lifecycle.py   # Full lease cycle
 cd ollama && python test_cooldown.py    # Idle unload verification
 python ollama/test_exo_lease.py        # Pool lease verdict + resident model (no network)
+python ollama/test_exo_stall.py        # Abort a generation that starts then stops (no network)
 ```
 
 `test_capacity_refusal` loads nothing and leases nothing — the refusal precedes

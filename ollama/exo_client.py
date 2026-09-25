@@ -60,6 +60,23 @@ class ExoRequestFailed(Exception):
         self.body = body
 
 
+class ExoStalled(Exception):
+    """A generation produced tokens and then stopped, without ending.
+
+    Deliberately not an ExoRequestFailed: that one means the pool refused or the
+    transport broke, and both are retryable against the same instance. This one
+    means the instance itself is stuck and the next request will stick too. The
+    caller turns it into a 504 that says so, and — the part that matters beyond
+    this request — releases the pool's exclusive lease, which is what lets the
+    placement guard see the wedge and rebuild the instance (#830).
+    """
+
+    def __init__(self, message: str, *, tokens: int = 0, silent_for: float = 0.0):
+        super().__init__(message)
+        self.tokens = tokens
+        self.silent_for = silent_for
+
+
 class ExoUnavailable(Exception):
     """The pool is unreachable, or has no model resident and ready to serve.
 
@@ -499,7 +516,41 @@ class ExoClient:
                         f"the exo pool returned {resp.status}",
                         status=resp.status, body=body,
                     )
-                async for raw in resp.content:
+                # Iterated by hand rather than `async for`, so each line can
+                # carry its own deadline. Before the first token the budget is
+                # the whole-request one — prefill is silent and legitimately
+                # slow. After it, a gap longer than EXO_STALL_TIMEOUT is not a
+                # slow pool, it is a stopped one (#830).
+                stream = resp.content.__aiter__()
+                seen = 0
+                last = time.monotonic()
+                while True:
+                    budget = (
+                        config.EXO_STALL_TIMEOUT if seen
+                        else config.EXO_GENERATE_TIMEOUT
+                    )
+                    try:
+                        raw = await asyncio.wait_for(
+                            stream.__anext__(), timeout=budget
+                        )
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        if not seen:
+                            raise ExoRequestFailed(
+                                f"the exo pool produced no answer within "
+                                f"{config.EXO_GENERATE_TIMEOUT}s"
+                            )
+                        silent = time.monotonic() - last
+                        raise ExoStalled(
+                            f"the exo pool stopped mid-generation: {seen} chunks, "
+                            f"then nothing for {silent:.0f}s "
+                            f"(limit {config.EXO_STALL_TIMEOUT}s). The instance is "
+                            f"stuck, not slow — abandoning it so the pool can be "
+                            f"rebuilt rather than holding its lease for "
+                            f"{config.EXO_GENERATE_TIMEOUT}s.",
+                            tokens=seen, silent_for=silent,
+                        )
                     # Blank lines are yielded too. In SSE a blank line is not
                     # whitespace, it is the event terminator — dropping it and
                     # letting the caller re-add a single newline collapsed the
@@ -509,7 +560,14 @@ class ExoClient:
                     # exact reproduction of exo's framing, including a
                     # multi-line event, rather than a reconstruction that is
                     # only right while every event happens to be one line.
-                    yield raw.decode(errors="replace").rstrip("\r\n")
+                    line = raw.decode(errors="replace").rstrip("\r\n")
+                    # Arm on the first line with content. Blank lines are SSE
+                    # event terminators, not progress, so they must not start
+                    # the clock on a pool that has sent nothing yet.
+                    if line:
+                        seen += 1
+                        last = time.monotonic()
+                    yield line
         except aiohttp.ClientError as e:
             raise ExoRequestFailed(f"exo transport error: {e}")
         except asyncio.TimeoutError:

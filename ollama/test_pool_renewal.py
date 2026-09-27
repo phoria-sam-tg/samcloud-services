@@ -107,6 +107,14 @@ def http_error(code, body=None):
 
 
 # Verbatim from #33's handler, the branch for status != "active".
+#
+# PROVENANCE: this and the `sc.reply` dicts below are hand-written COPIES of
+# response shapes owned by ANOTHER REPO — samcloud's registry/main.py, the
+# /renew and /leases handlers, as of samcloud v0.12.54. They are stale by
+# default, not authoritative. samcloud pins its own key set on the producer
+# side; the client-side defence against a rename is the totality check in
+# _renew_pool_leases, not these dicts. Do not treat a green suite here as
+# evidence that the plane still answers this way.
 REAPED_404_BODY = {
     "detail": "Lease lease_x is expired, not active",
     "status": "expired",
@@ -245,17 +253,36 @@ def main():
     check("the pre-split value still lists both candidates",
           errs and "Either the renewal TTL is below the granted one" in errs[0], str(errs))
 
-    print("  [2g] a response with no `reason` is inferred AND said out loud")
+    print("  [2g] a response with no `reason` is a CONTRACT VIOLATION, not an inference")
     # A quiet fallback to the old two-boolean inference is the failure this whole
     # ticket keeps turning up, so the inference announces itself.
+    # It used to infer the reason from extended_by_s/capped. That guess cannot
+    # tell an OLD plane from a RENAMED field, so it is gone: absent is a third
+    # outcome, not a falsy one.
     sc = Recorder(reply={"extended_by_s": 0, "capped": True, "max_total_s": 1800})
     m = manager_holding("lease_B6", 250, sc)
     seen = logs_from(m._renew_pool_leases)
-    check("it warns that `reason` was missing",
-          any(lvl == "warning" and "no `reason` field" in msg for lvl, msg in seen),
-          str(seen))
-    check("and still classifies it correctly from the booleans",
-          any("NO extension" in msg for _, msg in seen), str(seen))
+    errs = [msg for lvl, msg in seen if lvl == "error"]
+    check("it is an error naming the missing key", len(errs) == 1 and "reason" in errs[0], str(seen))
+    check("it says contract violation", errs and "contract violation" in errs[0], str(errs))
+    check("it does NOT guess a branch",
+          not any("NO extension" in msg or "+" in msg for _, msg in seen), str(seen))
+
+    print("  [11] a RENAMED field is caught — the case no fixture can catch")
+    # The whole point. A plane that renamed extended_by_s produces a response the
+    # old code read as a real zero: "NO extension" forever, 62 checks green.
+    for renamed, gone in (({"extension_s": 60, "capped": False, "reason": "extended",
+                            "max_total_s": 1800}, "extended_by_s"),
+                          ({"extended_by_s": 60, "was_capped": False, "reason": "extended",
+                            "max_total_s": 1800}, "capped")):
+        sc = Recorder(reply=renamed)
+        m = manager_holding(f"lease_R_{gone}", 300, sc)
+        seen = logs_from(m._renew_pool_leases)
+        errs = [msg for lvl, msg in seen if lvl == "error"]
+        check(f"a renamed {gone} is an error, not a silent branch",
+              len(errs) == 1 and gone in errs[0], str(seen))
+        check(f"and it lists the keys that DID arrive, so the rename is visible",
+              errs and "Keys present" in errs[0], str(errs))
 
     print("  [2h] at_ceiling logs once, and a CHANGE always logs")
     # admin, reviewing #35: past the ceiling the line repeats forever. At stage (a)

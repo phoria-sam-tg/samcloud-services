@@ -1614,6 +1614,38 @@ class ModelManager:
             shown = f"{age:.0f}s" if age is not None else "unknown"
             try:
                 resp = self.sc.renew_lease(lease_id, EXO_LEASE_TTL) or {}
+
+                # ABSENT IS A THIRD OUTCOME, not a falsy one
+                # (claude-wafer-services, #827). `resp.get("extended_by_s") or 0`
+                # reads a RENAMED field as a real zero and takes the at_ceiling
+                # branch, logging "NO extension" forever while every renewal is in
+                # fact unaccounted for. No fixture catches that — a live plane that
+                # renamed the field produces exactly the same silence — so the check
+                # has to be here, where the read happens.
+                #
+                # Only the keys we BRANCH on are required. expires_at and
+                # max_total_s appear solely inside log messages, where a missing
+                # value degrades a line rather than choosing a path, and `note` is
+                # conditional by design (the registry returns it only for an
+                # indefinite lease). Requiring everything read would log a
+                # violation on every ordinary renewal, and a check that fires on
+                # the normal path carries no more information than one that never
+                # fires.
+                missing = [k for k in ("extended_by_s", "capped", "reason")
+                           if k not in resp]
+                if missing:
+                    log.error(
+                        f"contract violation: renewal answered without "
+                        f"{', '.join(missing)} for {lease_id} after {shown} held. "
+                        f"Keys present: {sorted(resp)}. The gateway branches on "
+                        f"those fields, so it cannot tell an extension from a "
+                        f"ceiling — treating this renewal as unknown rather than "
+                        f"guessing. #827."
+                    )
+                    with self._pool_lock:
+                        self._pool_lease_last_reason[lease_id] = "contract_violation"
+                    continue
+
                 extended = resp.get("extended_by_s") or 0
                 # `reason` (#33) rather than deriving one from two booleans. The
                 # registry knows which of four things happened; inferring it here
@@ -1621,16 +1653,17 @@ class ModelManager:
                 # already. When it is absent we say so instead of guessing —
                 # a quiet fallback to the old inference is the failure this
                 # whole ticket keeps turning up.
-                reason = resp.get("reason")
+                # No inference fallback any more. `reason` is one of the three
+                # keys the totality check above requires, so an absent one is a
+                # contract violation and never reaches here. The old code guessed
+                # it from extended_by_s/capped for a registry predating #827 P3 —
+                # but that guess cannot distinguish an OLD plane from a RENAMED
+                # field, which is the case that matters, and guessing is the exact
+                # behaviour being removed. A plane older than 0.12.51 now fails
+                # renewals loudly instead of silently, which is the right
+                # direction for a mechanism exclusivity will depend on.
+                reason = resp["reason"]
                 every = f"renewing every {config.EXO_LEASE_RENEW_INTERVAL_S}s"
-                if reason is None:
-                    reason = ("extended" if extended else
-                              "at_ceiling" if resp.get("capped") else "unknown")
-                    log.warning(
-                        f"Pool lease renewal response carried no `reason` field; "
-                        f"inferred {reason!r} from extended_by_s/capped. The "
-                        f"registry may predate #827 P3."
-                    )
 
                 if reason == "extended":
                     # capped and extended arrive together on the LAST renewal
@@ -1759,7 +1792,7 @@ class ModelManager:
             self._stats_task = asyncio.create_task(self.stats_loop())
         if config.OFFERING_ENABLED and (self._offering_task is None or self._offering_task.done()):
             self._offering_task = asyncio.create_task(self.offering_loop())
-        log.info("Background tasks started (cooldown, health, lease renewal, stats, offering)")
+        log.info("Background tasks started (cooldown, health, lease renewal, POOL lease renewal, stats, offering)")
 
     def shutdown(self) -> list[dict]:
         """Release all leases. Only stop processes we started (managed=True)."""

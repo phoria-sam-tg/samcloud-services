@@ -171,12 +171,20 @@ def main():
                                                                   "description": words(60)}}},
         },
     } for i in range(20)]
-    bare, _ = prompt_size.count(tiny, MODEL, config.EXO_MODELS_DIR,
-                                config.EXO_CHARS_PER_TOKEN)
-    withtools, _ = prompt_size.count(tiny, MODEL, config.EXO_MODELS_DIR,
-                                     config.EXO_CHARS_PER_TOKEN, tools=fat_tools)
+    bare, how_bare = prompt_size.count(tiny, MODEL, config.EXO_MODELS_DIR,
+                                       config.EXO_CHARS_PER_TOKEN)
+    withtools, how_tools = prompt_size.count(tiny, MODEL, config.EXO_MODELS_DIR,
+                                             config.EXO_CHARS_PER_TOKEN, tools=fat_tools)
     check(withtools > bare + 1000,
           f"tools move the count ({bare} -> {withtools} tokens for the same messages)")
+    # The template path has to survive tools, not just messages. It did not:
+    # this template calls `tojson(ensure_ascii=False)` per tool and jinja2's own
+    # filter rejects that keyword, so for two days every request carrying tools
+    # rendered nothing and fell through to the serialised count — the blunt path,
+    # in precisely the case the template was added for. Silent, because a
+    # fallback that works looks like success.
+    check(how_tools == "chat template",
+          f"tools still count through the template, not the fallback ({how_tools})")
     try:
         prompt_size.check(tiny, MODEL, limit=config.EXO_MAX_PROMPT_TOKENS,
                           completion_budget=0, models_dir=config.EXO_MODELS_DIR,

@@ -172,7 +172,21 @@ def _template(model_id: str, models_dir: str):
         def raise_exception(msg):
             raise RuntimeError(msg)
 
+        def tojson(obj, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
+            # jinja2's own `tojson` takes no `ensure_ascii`, and this template
+            # calls `{{ tool | tojson(ensure_ascii=False) }}` for every tool it
+            # renders. Without this the render raises and counting silently
+            # drops to the serialised fallback for exactly the requests the
+            # template path exists to measure — the ones carrying tools.
+            # Measured: 32 such falls in two days, every one of them a tool call.
+            # Same signature transformers installs for apply_chat_template, and
+            # deliberately not jinja2's HTML-escaping variant: exo renders
+            # through transformers, and the escaping changes the token count.
+            return json.dumps(obj, ensure_ascii=ensure_ascii, indent=indent,
+                              separators=separators, sort_keys=sort_keys)
+
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+        env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         env.globals["strftime_now"] = lambda fmt: datetime.datetime.now().strftime(fmt)
         with open(path) as fh:

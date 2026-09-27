@@ -1646,7 +1646,9 @@ class ModelManager:
                         f"Keys present: {sorted(resp)}. The gateway branches on "
                         f"those fields, so it cannot tell an extension from a "
                         f"ceiling — treating this renewal as unknown rather than "
-                        f"guessing. #827."
+                        f"guessing. This is a RENAMED field, not an old plane: "
+                        f"`reason` shipped with /renew in 0.12.51, and a registry "
+                        f"without /renew answers 404 rather than a 200. #827."
                     )
                     with self._pool_lock:
                         self._pool_lease_last_reason[lease_id] = "contract_violation"
@@ -1750,16 +1752,40 @@ class ModelManager:
                     self._pool_lease_last_reason[lease_id] = reason
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:
-                    # The registry no longer knows this lease while we are still
-                    # generating against it: exclusivity is already gone and the
-                    # pool can be granted to someone else at any moment. Loudest
-                    # thing this class says, because nothing downstream can tell.
-                    log.error(
-                        f"Pool lease {lease_id} is GONE from the registry after "
-                        f"{shown} held — it was reaped while the generation was "
-                        f"still running, so the pool is no longer exclusively "
-                        f"ours. Check the lease TTL against #827 staging."
-                    )
+                    # A 404 means two different things and they need different
+                    # volumes (claude-wafer-services, #827).
+                    #
+                    # The loop reads the held-lease map under `_pool_lock` and then
+                    # POSTs OUTSIDE it — deliberately, because holding a lock
+                    # across a 10s HTTP call is the wrong trade. So a generation
+                    # that finishes in that window releases its lease and the
+                    # renewal 404s on a lease we no longer own. That is BENIGN and
+                    # entirely normal: the median lease is 9.4s against a 60s tick.
+                    #
+                    # Reporting it as a reap would be a false alarm on the normal
+                    # path, which is as bad as silence — an error that fires for
+                    # benign reasons trains its reader to skip it, and the once it
+                    # means what it says is the once it gets skipped.
+                    #
+                    # So re-check ownership rather than locking longer. Still held
+                    # -> the reap this error exists for. No longer held -> we raced
+                    # our own release.
+                    with self._pool_lock:
+                        still_ours = lease_id in self._pool_leases
+                    if not still_ours:
+                        log.debug(
+                            f"Pool lease {lease_id} was released while its renewal "
+                            f"was in flight ({shown} held); the 404 is our own race "
+                            f"with release_pool, not a reap."
+                        )
+                    else:
+                        log.error(
+                            f"Pool lease {lease_id} is GONE from the registry after "
+                            f"{shown} held and we STILL HOLD it — reaped while the "
+                            f"generation was running, so the pool is no longer "
+                            f"exclusively ours. Check the lease TTL against #827 "
+                            f"staging."
+                        )
                 elif e.response.status_code in (403, 422):
                     # Not transient. 403 means our identity is not the lease's
                     # holder; 422 means we are sending a body the model rejects.

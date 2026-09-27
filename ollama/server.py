@@ -193,6 +193,11 @@ async def lifespan(app: FastAPI):
                 )
 
     mgr.start_background_tasks()
+    # Which source the bearer came from (#845). "environment" means the launcher
+    # is still exporting it and the hygiene change is NOT in effect on this box —
+    # deploying the code and changing the launcher are two steps, and without this
+    # line they are indistinguishable from outside. Never the value.
+    log.info(f"SC_TOKEN source: {config.SC_TOKEN_SOURCE}")
     log.info(f"Model Service ready - managing {len(mgr.models)} models")
 
     yield

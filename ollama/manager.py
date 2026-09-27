@@ -68,6 +68,7 @@ VLM_DEFAULT_MEMORY_MB = 18700
 EXO_RESOURCE_ID = config.EXO_RESOURCE_ID
 EXO_TIERS = config.EXO_TIERS
 EXO_LEASE_TTL = config.EXO_LEASE_TTL
+EXO_LEASE_MAX_TOTAL_S = config.EXO_LEASE_MAX_TOTAL_S
 EXO_WEDGE_RECHECK_S = config.EXO_WEDGE_RECHECK_S
 
 
@@ -1077,6 +1078,11 @@ class ModelManager:
                 memory_mb=None,      # the pool is TAKEN, not metered in bytes
                 ttl_seconds=EXO_LEASE_TTL,
                 exclusive=True,
+                # Explicit, not the registry default: liveness and exposure are
+                # different numbers now (#827 b1). 600s says "assume I died after
+                # this"; 1800s says "this is the longest I could legitimately need
+                # the pool". Renewals extend inside the second until granted_at+1800.
+                max_total_s=EXO_LEASE_MAX_TOTAL_S,
             )
         except httpx.HTTPStatusError as e:
             # A 404 here is a misconfiguration, not a transient. It means this

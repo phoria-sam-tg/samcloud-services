@@ -488,11 +488,24 @@ def main():
           f"{config.EXO_LEASE_RENEW_INTERVAL_S} > {config.EXO_LEASE_RENEW_MAX_S}")
     check("and never degenerate",
           config.EXO_LEASE_RENEW_INTERVAL_S >= 5, str(config.EXO_LEASE_RENEW_INTERVAL_S))
-    # A third of 1800s is 594s: without the cap only the 5 longest leases of 514
-    # would ever renew, and stage (b)'s gate could wait days.
-    check("uncapped it would be far longer than a minute",
-          int(config.EXO_LEASE_TTL * config.EXO_LEASE_RENEW_PCT / 100) > 60,
-          f"ttl={config.EXO_LEASE_TTL} pct={config.EXO_LEASE_RENEW_PCT}")
+    # This asserted "uncapped it would be far longer than a minute", which was the
+    # CAP'S JUSTIFICATION at TTL 1800 (the fraction gave 450s there). At b2's TTL 120
+    # the fraction alone gives 30s and the cap does not bind, so the assertion became
+    # false the moment the TTL moved — a configuration pinned into a test, exactly
+    # like [13c]'s literals, and this time the suite caught it rather than a reviewer.
+    #
+    # So assert what the cap is FOR, which is TTL-independent.
+    fraction_s = int(config.EXO_LEASE_TTL * config.EXO_LEASE_RENEW_PCT / 100)
+    binds = "cap" if fraction_s > config.EXO_LEASE_RENEW_MAX_S else "fraction"
+    check(f"the interval is short enough to be crossed by ordinary leases "
+          f"(the {binds} binds here, giving {config.EXO_LEASE_RENEW_INTERVAL_S}s)",
+          config.EXO_LEASE_RENEW_INTERVAL_S <= 60,
+          f"{config.EXO_LEASE_RENEW_INTERVAL_S}s leaves the renewal path unexercised "
+          f"on all but the longest generations")
+    check("and it is the smaller of the cap and the fraction, not something else",
+          config.EXO_LEASE_RENEW_INTERVAL_S
+          == max(5, min(config.EXO_LEASE_RENEW_MAX_S, fraction_s)),
+          f"{config.EXO_LEASE_RENEW_INTERVAL_S} vs min({config.EXO_LEASE_RENEW_MAX_S}, {fraction_s})")
     check("the percentage is clamped into a sane band",
           10 <= config.EXO_LEASE_RENEW_PCT <= 90, str(config.EXO_LEASE_RENEW_PCT))
 
@@ -652,6 +665,11 @@ def main():
     # ran first" — not N comfortable ones. My earlier "30s of margin" was the
     # TWO-miss case, not the three-miss case.
     B2_TTL = 120
+    # Once b2 is deployed this stops being hypothetical, so assert the live config
+    # matches what b2 specifies. Kept as a literal so the cell goes on describing b2
+    # if the TTL moves again — and this check is what notices that it has.
+    check(f"the live EXO_LEASE_TTL is b2's {B2_TTL}s",
+          config.EXO_LEASE_TTL == B2_TTL, f"live TTL is {config.EXO_LEASE_TTL}s")
     b2_iv = max(5, min(config.EXO_LEASE_RENEW_MAX_S,
                        int(B2_TTL * config.EXO_LEASE_RENEW_PCT / 100)))
     b2_tol = B2_TTL // b2_iv - 1
@@ -767,16 +785,27 @@ def main():
                 await task
             except asyncio.CancelledError:
                 pass
-            await asyncio.sleep(0.16)
+            # SETTLE before the baseline. The renewal runs in a to_thread, so a call
+            # already dispatched when cancel() lands completes afterwards and bumps
+            # the count — which made this flaky, 2 -> 3 on about one run in three.
+            # The property is "no FURTHER renewal is initiated", not "the count is
+            # frozen at the instant of the kill"; asserting the latter is a test
+            # pinned to a race boundary, which is what admin warned against for the
+            # tolerance-3 case and what I then built here.
+            await asyncio.sleep(0.10)
+            settled = len([c for c in sc2.calls if c[0] == "renew"])
+            await asyncio.sleep(0.30)                      # ~6 ticks at 0.05s
             after = len([c for c in sc2.calls if c[0] == "renew"])
-            return before, after, ("lease_killed" in mm._pool_leases)
+            return before, settled, after, ("lease_killed" in mm._pool_leases)
         finally:
             config.EXO_LEASE_RENEW_INTERVAL_S = real
 
-    before, after, still_held = asyncio.run(killed_renewer())
+    before, settled, after, still_held = asyncio.run(killed_renewer())
     check("the loop was renewing before the kill", before >= 1, str(before))
-    check("and sent NOTHING after it — so the lease will lapse at its expiry",
-          after == before, f"{before} -> {after}")
+    check("and sent NOTHING in the ~6 ticks after it settled — the lease will lapse",
+          after == settled, f"settled {settled} -> {after}")
+    check("at most one renewal was in flight across the kill, not a continuing loop",
+          settled - before <= 1, f"{settled - before} landed after cancel")
     check("the lease is still in _pool_leases: nothing released it, which is the point",
           still_held, "a cancelled renewer must not release — that is shutdown's job")
 

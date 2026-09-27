@@ -1124,6 +1124,12 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                 models_dir=config.EXO_MODELS_DIR,
                 chars_per_token=config.EXO_CHARS_PER_TOKEN,
                 resource_id=config.EXO_RESOURCE_ID,
+                # Tools are part of the prompt, not metadata alongside it: this
+                # model's template renders every definition inline. Measured on
+                # live traffic, leaving them out read a request as 11,742 tokens
+                # that exo then prefilled as 18,118 — 900 tokens short of the
+                # level that panicked the host.
+                tools=req.tools,
             )
         except prompt_size.PromptTooLarge as e:
             raise _prompt_too_large_413(e)
@@ -1286,6 +1292,18 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                         "message": "caller went away before the pool answered",
                     })
                 data = gen.result()
+                # What we measured against what exo actually prefilled. The gate
+                # is only as good as this agreement: counting `messages` alone
+                # once read 11,742 for a prompt exo prefilled as 18,118, and
+                # nothing in the logs said so. A drift warning turns the next
+                # such gap into a line someone can find.
+                actual = ((data or {}).get("usage") or {}).get("prompt_tokens")
+                if actual and n_tokens and actual > n_tokens * 1.15:
+                    log.warning(
+                        f"Prompt measured {n_tokens} tokens by {how}, exo prefilled "
+                        f"{actual} ({actual / n_tokens:.2f}x). The gate is counting "
+                        f"less than the model is reading — #837"
+                    )
             finally:
                 mgr.release_pool(lease_id)
         except capacity.PoolBusy as e:

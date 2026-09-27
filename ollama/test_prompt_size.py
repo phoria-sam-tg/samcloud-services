@@ -274,6 +274,20 @@ def main():
     check(len(warned) == 1 and "1.54x" in warned[0],
           f"warns once, on the gap that matters ({len(warned)} warning(s))")
 
+    step(9, "forcing include_usage preserves what the caller sent")
+    # Off by default: this adds a chunk to someone else's stream.
+    check(config.EXO_FORCE_STREAM_USAGE is False,
+          f"the flag is off unless a box turns it on ({config.EXO_FORCE_STREAM_USAGE})")
+    check(server._stream_options_with_usage(None) == {"include_usage": True},
+          "sets include_usage when the caller sent no stream_options")
+    kept = server._stream_options_with_usage({"chunk_size_hint": 8})
+    check(kept == {"chunk_size_hint": 8, "include_usage": True},
+          f"keeps the caller's other options rather than replacing them ({kept})")
+    original = {"include_usage": False}
+    server._stream_options_with_usage(original)
+    check(original == {"include_usage": False},
+          "does not mutate the caller's object")
+
     print(f"\n{'='*60}")
     if failures:
         print(f"  {len(failures)} FAILED:")

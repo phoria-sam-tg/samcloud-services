@@ -255,6 +255,22 @@ EXO_MODELS_DIR = _env("EXO_MODELS_DIR", "/Users/Shared/exo/models")
 # method produced its number so an over-count is legible rather than mysterious.
 EXO_CHARS_PER_TOKEN = float(_env("EXO_CHARS_PER_TOKEN", "1.5"))
 
+# Add `stream_options.include_usage` to streamed pool requests, so exo reports
+# what it prefilled and the drift check (#837) has something to compare against.
+#
+# Off by default and enabled per box, because it changes what a client receives:
+# exo answers with one extra final chunk carrying usage and an empty `choices`
+# array. That is standard OpenAI shape and OpenAI clients ignore it, but it is
+# the caller's stream and we are adding to it, so it is a decision a box makes
+# deliberately rather than a default it inherits.
+#
+# Measured on this box, 2026-09-27/28: of 124 gate decisions after the counter
+# was corrected, one real turn went unverified — hermes' 3,971-token stream at
+# 08:54, which carried no usage chunk, while its 10,550-token stream the
+# previous evening did. So the same client asks on some turns and not others,
+# and without this the drift check is silent exactly when it happens not to.
+EXO_FORCE_STREAM_USAGE = _env_bool("EXO_FORCE_STREAM_USAGE", False)
+
 # How long `GET /models` may reuse a pool status reading. Status display only —
 # the serving path always reads fresh, so this cannot route a request at a stale
 # resident model.

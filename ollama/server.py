@@ -618,6 +618,18 @@ def _prompt_too_large_413(e: "prompt_size.PromptTooLarge") -> HTTPException:
     return HTTPException(status_code=413, detail=e.as_dict())
 
 
+def _stream_options_with_usage(existing: Optional[dict]) -> dict:
+    """The caller's `stream_options`, with `include_usage` turned on.
+
+    Preserves whatever else the caller sent rather than replacing the object:
+    a client that asked for something and got it silently dropped is a worse
+    outcome than an unverified count.
+    """
+    options = dict(existing or {})
+    options["include_usage"] = True
+    return options
+
+
 def _usage_prompt_tokens(line: str) -> Optional[int]:
     """`usage.prompt_tokens` out of one forwarded SSE line, or None.
 
@@ -1229,6 +1241,14 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
             payload["max_tokens"] = req.max_tokens
         for key, value in defaults.items():
             payload.setdefault(key, value)
+
+        if req.stream and config.EXO_FORCE_STREAM_USAGE:
+            # Ask exo to report what it prefilled, so the drift check on the
+            # streaming path has a number to compare against (#837). Off unless
+            # the box turns it on: it adds a final usage chunk to the caller's
+            # stream that the caller did not request.
+            payload["stream_options"] = _stream_options_with_usage(
+                payload.get("stream_options"))
 
         purpose = f"chat:{mm.name}"
 

@@ -1611,20 +1611,26 @@ class ModelManager:
                         f"ceiling; granted TTL is {EXO_LEASE_TTL}s). Expected "
                         f"until #827 stage (b) lowers the granted TTL."
                     )
+                elif reason == "ttl_below_granted":
+                    # #34 splits already_later in two, and THIS half has exactly
+                    # one cause, so it can be named rather than listed. Same
+                    # severity: every renewal extends nothing, the lease lapses on
+                    # its original expiry, and the loop reports success throughout.
+                    log.error(
+                        f"Pool lease renewal is NOT EXTENDING: {lease_id} after "
+                        f"{shown} held returned ttl_below_granted — we are asking "
+                        f"for {EXO_LEASE_TTL}s but the lease was granted for "
+                        f"longer, so the expiry is already further out. Every "
+                        f"renewal will do nothing and the lease lapses on its "
+                        f"original expiry ({resp.get('expires_at')}). #827."
+                    )
                 elif reason == "already_later":
-                    # A MISCONFIGURATION, not an anomaly: whatever the cause, EVERY
-                    # renewal extends nothing and the lease lapses on its original
-                    # expiry while this loop reports success. Liveness off while
-                    # looking on — the #843 shape — so it is an error.
-                    #
-                    # It states the OBSERVATION and lists the candidate causes
-                    # rather than asserting one. For this gateway the cause can
-                    # only be a renewal TTL below the granted one, but that is a
-                    # fact about our configuration, not about the response: the
-                    # same reason also reaches a caller whose GRANT exceeded the
-                    # ceiling (the adapter at TURN_TIMEOUT=5400s). Naming one cause
-                    # would be right here and wrong there, and this message is the
-                    # only thing a reader has.
+                    # The pre-#34 registry (0.12.51) does not split this, so here
+                    # it still carries both causes and neither can be asserted.
+                    # Kept rather than replaced: this gateway may meet either
+                    # version depending on which release the plane is running, and
+                    # mapping an old value onto the new message would claim a
+                    # precision the response does not have.
                     log.error(
                         f"Pool lease renewal is NOT EXTENDING: {lease_id} after "
                         f"{shown} held returned already_later — the expiry is "

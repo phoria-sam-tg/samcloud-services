@@ -202,6 +202,29 @@ def main():
     check("and does not assert the cause that only applies to us",
           errs and "so the renewal TTL is smaller" not in errs[0], str(errs))
 
+    print("  [2f2] ttl_below_granted (#34) names its one cause")
+    # #34 splits already_later. This half has exactly one cause, so unlike the
+    # pre-split value it can assert it rather than list candidates.
+    sc = Recorder(reply={"extended_by_s": 0, "capped": False,
+                         "reason": "ttl_below_granted", "max_total_s": 1800,
+                         "expires_at": "2026-09-27T09:00:00Z"})
+    m = manager_holding("lease_B7", 320, sc)
+    seen = logs_from(m._renew_pool_leases)
+    errs = [msg for lvl, msg in seen if lvl == "error"]
+    check("it is an error", len(errs) == 1, str(seen))
+    check("it names the single cause", errs and "granted for" in errs[0], str(errs))
+    check("and reports the expiry the lease will actually lapse on",
+          errs and "2026-09-27T09:00:00Z" in errs[0], str(errs))
+    # The pre-#34 value must keep the two-cause wording: the gateway may meet
+    # either release, and mapping one onto the other claims precision the
+    # response does not carry.
+    sc = Recorder(reply={"extended_by_s": 0, "capped": False,
+                         "reason": "already_later", "max_total_s": 1800})
+    m = manager_holding("lease_B8", 320, sc)
+    errs = [m2 for l, m2 in logs_from(m._renew_pool_leases) if l == "error"]
+    check("the pre-split value still lists both candidates",
+          errs and "Either the renewal TTL is below the granted one" in errs[0], str(errs))
+
     print("  [2g] a response with no `reason` is inferred AND said out loud")
     # A quiet fallback to the old two-boolean inference is the failure this whole
     # ticket keeps turning up, so the inference announces itself.

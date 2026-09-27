@@ -40,15 +40,21 @@ def check(label, cond, detail=""):
 class Recorder:
     """A samcloud client that records which lease calls were made, in order."""
 
-    def __init__(self, renew=None):
+    def __init__(self, renew=None, reply=None):
         self.calls = []
         self._renew = renew
+        # The stage (a) reality: accepted, capped, extending nothing.
+        self.reply = reply if reply is not None else {
+            "lease_id": "x", "status": "active", "extended_by_s": 0,
+            "capped": True, "max_total_s": 1800}
 
-    def renew_lease(self, lease_id):
-        self.calls.append(("renew", lease_id))
+    def renew_lease(self, lease_id, ttl_seconds):
+        # ttl_seconds is REQUIRED by the endpoint; recording it means a caller
+        # that stops sending it fails here rather than with a 422 in production.
+        self.calls.append(("renew", lease_id, ttl_seconds))
         if self._renew:
             raise self._renew
-        return {"status": "renewed"}
+        return dict(self.reply)
 
     def release_lease(self, lease_id):
         self.calls.append(("release", lease_id))
@@ -96,7 +102,7 @@ def main():
     m = manager_holding("lease_A", 300, sc)
     logs_from(m._renew_pool_leases)
     check("renew_lease was called for the held lease",
-          ("renew", "lease_A") in sc.calls, str(sc.calls))
+          any(c[0] == "renew" and c[1] == "lease_A" for c in sc.calls), str(sc.calls))
     # The whole point. _renew_leases() above does exactly this and must not be
     # the model for an exclusive lease.
     check("NOTHING was released", all(c[0] != "release" for c in sc.calls), str(sc.calls))
@@ -111,11 +117,32 @@ def main():
     sc = Recorder()
     m = manager_holding("lease_B", 187, sc)
     seen = logs_from(m._renew_pool_leases)
-    line = next((msg for lvl, msg in seen if "renewed in place" in msg), "")
-    check("it says renewed in place", bool(line), str(seen))
-    check("it states a held-time over 120s", "187s held" in line, line)
-    check("logged at info, not warning", any(
-        lvl == "info" and "renewed in place" in msg for lvl, msg in seen), str(seen))
+    line = next((msg for lvl, msg in seen if "187s held" in msg), "")
+    check("it states a held-time over 120s", bool(line), str(seen))
+    check("logged at info, not warning",
+          any(lvl == "info" and "187s held" in msg for lvl, msg in seen), str(seen))
+    check("it sends the REQUIRED ttl_seconds with the renewal",
+          any(c[0] == "renew" and c[2] == config.EXO_LEASE_TTL for c in sc.calls),
+          str(sc.calls))
+
+    print("  [2b] a capped renewal must NOT read as an extension")
+    # Stage (a) grants 1800s and the ceiling is granted_at+1800, so every renewal
+    # is accepted and extends nothing. A line saying 'renewed' for that is a
+    # renewal that silently did nothing looking exactly like one that silently
+    # failed — the shape of every defect this ticket turned up.
+    check("it says there was no extension", "NO extension" in line, line)
+    check("and names the ceiling that capped it", "1800s ceiling" in line, line)
+    check("and says why it is expected, not a fault",
+          "stage (b)" in line, line)
+
+    print("  [2c] a real extension says so, with the amount")
+    sc = Recorder(reply={"extended_by_s": 60, "capped": False,
+                         "expires_at": "2026-09-27T08:00:00Z", "max_total_s": 1800})
+    m = manager_holding("lease_B2", 200, sc)
+    seen = logs_from(m._renew_pool_leases)
+    line2 = next((msg for lvl, msg in seen if "200s held" in msg), "")
+    check("it reports the extension", "+60s" in line2, line2)
+    check("and does not claim there was none", "NO extension" not in line2, line2)
 
     print("  [3] a failed renewal KEEPS the lease — dropping it is worse")
     sc = Recorder(renew=http_error(503))
@@ -154,7 +181,7 @@ def main():
     with m._pool_lock:
         m._pool_leases.add("lease_F")          # no acquire time recorded
     seen = logs_from(m._renew_pool_leases)
-    check("it renews anyway", ("renew", "lease_F") in sc.calls, str(sc.calls))
+    check("it renews anyway", any(c[0] == "renew" and c[1] == "lease_F" for c in sc.calls), str(sc.calls))
     check("and reports the age as unknown rather than 0s",
           any("unknown held" in msg for _, msg in seen), str(seen))
 

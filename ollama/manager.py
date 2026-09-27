@@ -1567,12 +1567,29 @@ class ModelManager:
             age = time.monotonic() - since if since else None
             shown = f"{age:.0f}s" if age is not None else "unknown"
             try:
-                self.sc.renew_lease(lease_id)
-                log.info(
-                    f"Pool lease {lease_id} renewed in place after {shown} held "
-                    f"(TTL={EXO_LEASE_TTL}s, renewing every "
-                    f"{config.EXO_LEASE_RENEW_INTERVAL_S}s)"
-                )
+                resp = self.sc.renew_lease(lease_id, EXO_LEASE_TTL) or {}
+                extended = resp.get("extended_by_s")
+                if extended:
+                    log.info(
+                        f"Pool lease {lease_id} renewed in place after {shown} "
+                        f"held: +{extended}s, expires {resp.get('expires_at')} "
+                        f"(renewing every {config.EXO_LEASE_RENEW_INTERVAL_S}s)"
+                    )
+                else:
+                    # Accepted and extended NOTHING. The ceiling is computed from
+                    # granted_at, so asking for another EXO_LEASE_TTL on a lease
+                    # granted for exactly that always caps to its existing expiry.
+                    # Expected throughout stage (a) — but it must not print as an
+                    # extension, because a renewal that silently does nothing
+                    # reads exactly like one that silently failed, and that is the
+                    # shape of every defect this ticket has turned up.
+                    log.info(
+                        f"Pool lease {lease_id} renewal accepted after {shown} "
+                        f"held, NO extension (capped at the "
+                        f"{resp.get('max_total_s')}s ceiling; granted TTL is "
+                        f"{EXO_LEASE_TTL}s). Expected until #827 stage (b) "
+                        f"lowers the granted TTL below the ceiling."
+                    )
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:
                     # The registry no longer knows this lease while we are still

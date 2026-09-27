@@ -101,7 +101,7 @@ class SamcloudClient:
         # A 409 read as a 200 is the exact failure this function exists to stop.
         return {**body, "status_code": r.status_code}
 
-    def renew_lease(self, lease_id: str) -> dict:
+    def renew_lease(self, lease_id: str, ttl_seconds: int) -> dict:
         """Extend a lease IN PLACE. Never release-and-reacquire (#827).
 
         The distinction is the whole point. Releasing and re-requesting opens a
@@ -110,8 +110,19 @@ class SamcloudClient:
         of fault #827 exists to remove, so reintroducing it as the renewal
         mechanism would be self-defeating. See `_renew_leases` in manager.py for
         the shape NOT to copy.
+
+        `ttl_seconds` is required by the endpoint and has no default, on purpose:
+        defaulting it would mean either silently shortening a long lease whose
+        holder omitted the field, or inferring the original span, which is lost
+        after the first renewal. The holder says what it wants, every time.
+
+        The reply carries `extended_by_s` and `capped`. Both matter to the
+        caller: the ceiling is computed from `granted_at`, so a renewal can be
+        accepted and extend nothing, and "accepted" alone does not mean the
+        lease moved.
         """
-        r = self._http.post(f"/leases/{lease_id}/renew")
+        r = self._http.post(f"/leases/{lease_id}/renew",
+                            json={"ttl_seconds": ttl_seconds})
         r.raise_for_status()
         return r.json()
 

@@ -322,10 +322,23 @@ def exo_first_token_deadline(prompt_tokens: int | None) -> float:
 #   EXO_LEASE_TTL          how long before someone may assume we died   LIVENESS
 #   EXO_LEASE_MAX_TOTAL_S  the longest we could legitimately need it     EXPOSURE
 #
-# Liveness is now 600s because we renew. A dead holder frees the pool in <=600s
-# instead of <=1800s, which is the whole point of #827: every incident was a
-# holder that went away while its exclusive lease lived on.
-EXO_LEASE_TTL = _env_int("EXO_LEASE_TTL", 600)
+# Liveness is 120s at b2. A dead holder frees the pool in <=120s, against <=1800s
+# before #827 — every incident on that ticket was a holder that went away while its
+# exclusive lease lived on.
+#
+# WHAT b2 BUYS AND COSTS, since the number alone hides both:
+#   a dead holder's lease lapses in    600s -> 120s
+#   the tick becomes                    60s -> 30s   min(60, TTL*25%): the cap stops
+#                                                    binding below TTL 240
+#   a full-budget 1500s generation
+#   depends on                          ~25 -> ~50 consecutive renewals
+#
+# That last line is the trade: five times faster recovery from a dead holder, in
+# exchange for a long generation depending on twice as many successful renewals to
+# keep a lease it already holds. Both clauses still hold, and the recovery path is
+# asserted rather than hoped for (test_pool_renewal [13]-[14]), which is what made
+# this safe to do rather than merely desirable.
+EXO_LEASE_TTL = _env_int("EXO_LEASE_TTL", 120)
 
 # The ceiling, counted by the registry from granted_at, passed EXPLICITLY on the
 # grant rather than left to the registry default. The ceiling is the first thing

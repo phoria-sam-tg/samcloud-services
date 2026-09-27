@@ -88,10 +88,29 @@ def logs_from(fn):
     return seen
 
 
-def http_error(code):
+def http_error(code, body=None):
+    """An HTTPStatusError shaped like the real endpoint's refusal.
+
+    `body` matters. samclaude-admin, reviewing PR #35: #33's 404 for a lease that
+    is no longer active carries `expires_at` in its body, and a renewer that
+    sniffed the body for that key read a reaped lease as alive. This client
+    branches on the STATUS CODE, so it should be immune — but "should be" is the
+    phrase that has been wrong all day, so the real body goes in the fake and the
+    immunity is asserted rather than reasoned about.
+    """
     req = httpx.Request("POST", "http://x/leases/l/renew")
-    return httpx.HTTPStatusError("boom", request=req,
-                                 response=httpx.Response(code, request=req))
+    return httpx.HTTPStatusError(
+        "boom", request=req,
+        response=httpx.Response(code, request=req, json=body) if body is not None
+        else httpx.Response(code, request=req))
+
+
+# Verbatim from #33's handler, the branch for status != "active".
+REAPED_404_BODY = {
+    "detail": "Lease lease_x is expired, not active",
+    "status": "expired",
+    "expires_at": "2026-09-27T08:30:00+00:00",
+}
 
 
 def main():
@@ -237,6 +256,31 @@ def main():
     check("and still classifies it correctly from the booleans",
           any("NO extension" in msg for _, msg in seen), str(seen))
 
+    print("  [2h] at_ceiling logs once, and a CHANGE always logs")
+    # admin, reviewing #35: past the ceiling the line repeats forever. At stage (a)
+    # every renewal is capped, so a 1500s generation would print ~25 identical
+    # lines. Suppress the repeat — but only the repeat.
+    sc = Recorder()                                   # default reply: at_ceiling
+    m = manager_holding("lease_B9", 200, sc)
+    first = logs_from(m._renew_pool_leases)
+    second = logs_from(m._renew_pool_leases)
+    third = logs_from(m._renew_pool_leases)
+    check("the first capped renewal logs",
+          any("NO extension" in msg for _, msg in first), str(first))
+    check("the second does not repeat it", second == [], str(second))
+    check("nor the third", third == [], str(third))
+    # The important half: silence must mean "unchanged", never "new but hidden".
+    sc.reply = {"extended_by_s": 40, "capped": False, "reason": "extended",
+                "max_total_s": 1800, "expires_at": "2026-09-27T09:00:00Z"}
+    changed = logs_from(m._renew_pool_leases)
+    check("a change of reason logs immediately",
+          any("+40s" in msg for _, msg in changed), str(changed))
+    sc.reply = {"extended_by_s": 0, "capped": False, "reason": "ttl_below_granted",
+                "max_total_s": 1800}
+    broke = logs_from(m._renew_pool_leases)
+    check("and a change to an error state is never suppressed",
+          any(lvl == "error" for lvl, _ in broke), str(broke))
+
     print("  [3] a failed renewal KEEPS the lease — dropping it is worse")
     sc = Recorder(renew=http_error(503))
     m = manager_holding("lease_C", 90, sc)
@@ -271,6 +315,24 @@ def main():
               errs and "NOT WORKING" in errs[0] and word in errs[0], str(errs))
         check(f"{code} still keeps the lease",
               f"lease_{code}" in m._pool_leases, str(m._pool_leases))
+
+    print("  [4c] the real 404 body, which carries expires_at, is still a reap")
+    # PR #35 had this defect: its refusal check tested for expires_at in the body
+    # and #33's 404 carries it, so a reaped lease read as alive and the action ran
+    # on against a grantable pool. This client keys on the status code instead, so
+    # the same body must still reach the ERROR branch.
+    sc = Recorder(renew=http_error(404, REAPED_404_BODY))
+    m = manager_holding("lease_reaped", 410, sc)
+    seen = logs_from(m._renew_pool_leases)
+    errs = [msg for lvl, msg in seen if lvl == "error"]
+    check("a 404 carrying expires_at is an error, not a success",
+          len(errs) == 1, str(seen))
+    check("and it still says exclusivity is gone",
+          errs and "no longer exclusively" in errs[0], str(errs))
+    check("nothing was logged at info — a reap must not read as a renewal",
+          not any(lvl == "info" for lvl, _ in seen), str(seen))
+    check("and the lease stays tracked so shutdown still releases it",
+          "lease_reaped" in m._pool_leases, str(m._pool_leases))
 
     print("  [5] a released lease is not renewed, and leaves no bookkeeping behind")
     sc = Recorder()

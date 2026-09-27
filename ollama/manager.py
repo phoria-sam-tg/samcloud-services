@@ -224,6 +224,11 @@ class ModelManager:
     # default TTL drops only once a lease over 120s is seen renewing —
     # so it is load-bearing, not decoration.
     _pool_lease_acquired: dict = field(default_factory=dict, repr=False)
+    # Last renewal reason per lease, so the at_ceiling line is logged once
+    # rather than every interval (samclaude-admin, reviewing PR #35). A
+    # CHANGE of reason always logs, so silence only ever means 'the same
+    # thing as last time' and never 'something new I decided to hide'.
+    _pool_lease_last_reason: dict = field(default_factory=dict, repr=False)
     # Guards pool bookkeeping that is mutated OFF the event loop — the lease set
     # above, and the tier's request counter in resolve_exo_tier. Both reach this
     # object from `asyncio.to_thread`, so the single-threaded loop no longer
@@ -1219,6 +1224,7 @@ class ModelManager:
         with self._pool_lock:
             self._pool_leases.discard(lease_id)
             self._pool_lease_acquired.pop(lease_id, None)
+            self._pool_lease_last_reason.pop(lease_id, None)
         try:
             self.sc.release_lease(lease_id)
             log.info(f"Pool lease {lease_id} released")
@@ -1600,6 +1606,15 @@ class ModelManager:
                         f"held: +{extended}s, expires {resp.get('expires_at')} "
                         f"({every}){tail}"
                     )
+                elif reason == "at_ceiling" and (
+                        self._pool_lease_last_reason.get(lease_id) == "at_ceiling"):
+                    # Same as last interval. At stage (a) EVERY renewal is capped,
+                    # so a 1500s generation would otherwise print 25 identical
+                    # lines. Suppressed only while the reason is UNCHANGED — the
+                    # first one logs, and any change logs — because a log that
+                    # goes quiet for a new reason is the failure this whole ticket
+                    # is about.
+                    pass
                 elif reason == "at_ceiling":
                     # Accepted, extended nothing, the ceiling bound it. Expected
                     # for the whole of stage (a) — but it must not print as an
@@ -1651,6 +1666,7 @@ class ModelManager:
                         f"Pool lease {lease_id} renewal after {shown} held "
                         f"returned an unrecognised reason {reason!r}: {resp}"
                     )
+                self._pool_lease_last_reason[lease_id] = reason
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:
                     # The registry no longer knows this lease while we are still

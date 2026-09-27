@@ -309,6 +309,38 @@ def main():
     check("and a change to an error state is never suppressed",
           any(lvl == "error" for lvl, _ in broke), str(broke))
 
+    print("  [12] a lease younger than the threshold is skipped, not renewed")
+    # 21:15:19Z: the heartbeat fired 486ms after a grant, `now+600` was microseconds
+    # ahead of `granted+600`, the registry's int() of that was 0, and it reported
+    # `ttl_below_granted` — a caller misconfiguration that had not happened. The
+    # request could not achieve anything, so it is not sent.
+    sc = Recorder()
+    m = manager_holding("lease_young", 0.4, sc)      # 400ms old
+    seen = logs_from(m._renew_pool_leases)
+    check("no renewal request was sent", sc.calls == [], str(sc.calls))
+    check("nothing logged at info, warning or error",
+          not any(lvl in ("info", "warning", "error") for lvl, _ in seen), str(seen))
+    check("the lease is still held", "lease_young" in m._pool_leases, str(m._pool_leases))
+
+    print("  [12b] and a lease past the threshold is renewed as normal")
+    sc = Recorder()
+    m = manager_holding("lease_old_enough", 3.0, sc)
+    seen = logs_from(m._renew_pool_leases)
+    check("the renewal was sent",
+          any(c[0] == "renew" for c in sc.calls), str(sc.calls))
+    check("and it logged", any(lvl == "info" for lvl, _ in seen), str(seen))
+
+    print("  [12c] the threshold is small enough not to disturb clause 2")
+    # Skipping a whole interval would push the worst-case gap from 60s to ~120s
+    # and leave a third of clause 2's margin. 2s leaves it untouched.
+    iv = config.EXO_LEASE_RENEW_INTERVAL_S
+    check("the skip is far below one interval",
+          ModelManager._RENEW_MIN_AGE_S < iv / 10,
+          f"{ModelManager._RENEW_MIN_AGE_S}s vs interval {iv}s")
+    check("so three attempts still fit inside 80% of the TTL",
+          iv * 3 + ModelManager._RENEW_MIN_AGE_S <= config.EXO_LEASE_TTL * 0.8,
+          f"{iv*3}+{ModelManager._RENEW_MIN_AGE_S} vs {config.EXO_LEASE_TTL*0.8:.0f}")
+
     print("  [3] a failed renewal KEEPS the lease — dropping it is worse")
     sc = Recorder(renew=http_error(503))
     m = manager_holding("lease_C", 90, sc)

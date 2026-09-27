@@ -1580,6 +1580,10 @@ class ModelManager:
             except Exception as e:
                 log.warning(f"Failed to renew lease for {name}: {e}")
 
+    # Leases younger than this are skipped by a renewal tick. See the comment at
+    # the skip for why it is 2s rather than one interval.
+    _RENEW_MIN_AGE_S: float = 2.0
+
     async def pool_renewal_loop(self):
         """Keep held pool leases alive while their generation runs (#827 P3).
 
@@ -1618,6 +1622,29 @@ class ModelManager:
         for lease_id, since in held:
             age = time.monotonic() - since if since else None
             shown = f"{age:.0f}s" if age is not None else "unknown"
+
+            # A lease this young cannot need renewing, and renewing it anyway is
+            # how a benign truncation became an ERROR (#827, 21:15:19Z). The
+            # heartbeat's offset from acquisition is 0 to one interval, and at the
+            # 0 end `now + ttl` is only microseconds ahead of `granted + ttl` — the
+            # registry's `int()` of that difference was 0, which it then reported
+            # as `ttl_below_granted`, a caller misconfiguration that had not
+            # happened. samclaude-admin is fixing the classification in 0.12.56;
+            # this skips the request that provokes it, which is worth doing anyway
+            # because it cannot achieve anything.
+            #
+            # DELIBERATELY SMALL, and not "younger than one interval". Skipping a
+            # whole interval would push the worst-case renewal gap from 60s to
+            # ~120s, and clause 2's invariant (three attempts inside 80% of the
+            # TTL) is stated over 60/120/180 against 480. It would still hold at
+            # 120/180/240, with a third of the margin. Two seconds removes the
+            # sub-second case and perturbs nothing.
+            if age is not None and age < self._RENEW_MIN_AGE_S:
+                log.debug(
+                    f"Pool lease {lease_id} is {age:.2f}s old; skipping this "
+                    f"renewal tick — nothing to extend yet."
+                )
+                continue
             try:
                 resp = self.sc.renew_lease(lease_id, EXO_LEASE_TTL) or {}
 

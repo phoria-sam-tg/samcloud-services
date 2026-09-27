@@ -618,6 +618,49 @@ def _prompt_too_large_413(e: "prompt_size.PromptTooLarge") -> HTTPException:
     return HTTPException(status_code=413, detail=e.as_dict())
 
 
+def _usage_prompt_tokens(line: str) -> Optional[int]:
+    """`usage.prompt_tokens` out of one forwarded SSE line, or None.
+
+    The substring test first because this runs on every chunk of every streamed
+    generation and almost none of them carry usage — a JSON parse per token is
+    a cost the stream should not pay to satisfy a diagnostic.
+
+    Never raises: this sits in the forwarding path, and a malformed chunk must
+    not be able to end a generation that is otherwise fine.
+    """
+    if not line or "usage" not in line or not line.startswith("data:"):
+        return None
+    body = line[5:].strip()
+    if not body or body == "[DONE]":
+        return None
+    try:
+        usage = (json.loads(body) or {}).get("usage") or {}
+        tokens = usage.get("prompt_tokens")
+        return int(tokens) if tokens else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _check_drift(measured: Optional[int], how: str, actual: Optional[int], model: str):
+    """Warn when exo prefilled materially more than the gate counted (#837).
+
+    Shared by both paths on purpose. The gate is only as good as this agreement:
+    counting `messages` alone once read 11,742 for a prompt exo prefilled as
+    18,118, and nothing in the logs said so. That went unseen for an afternoon,
+    and then the check that would have caught it existed on the non-streaming
+    path only — while the client that mattered was streaming. One function, both
+    callers, so the two cannot drift apart again.
+    """
+    if not actual or not measured:
+        return
+    if actual > measured * 1.15:
+        log.warning(
+            f"Prompt measured {measured} tokens by {how}, exo prefilled {actual} "
+            f"({actual / measured:.2f}x) for {model}. The gate is counting less "
+            f"than the model is reading — #837"
+        )
+
+
 def _exo_completion_budget(model_id: str, requested: Optional[int]) -> int:
     """How many tokens the answer may add to the same KV cache.
 
@@ -1206,6 +1249,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                 raise _busy_503(e)
 
             async def stream():
+                usage_tokens = None
                 try:
                     async for line in mgr.exo.chat_stream(
                         mm.name, req.messages,
@@ -1216,6 +1260,9 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                         **{k: v for k, v in payload.items()
                            if k not in ("model", "messages", "stream")}
                     ):
+                        seen = _usage_prompt_tokens(line)
+                        if seen:
+                            usage_tokens = seen
                         # "\n\n", not "\n": the blank line is what *dispatches* an
                         # SSE event. ExoClient.chat_stream strips blank lines, so
                         # re-adding a single newline left every event unterminated —
@@ -1264,6 +1311,19 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                     # Covers a clean finish, an error, and a client that walked
                     # away mid-generation (CancelledError unwinds through here).
                     mgr.release_pool(lease_id)
+                    if usage_tokens:
+                        _check_drift(n_tokens, how, usage_tokens, mm.name)
+                    else:
+                        # Said out loud, because a silent drift check and an
+                        # absent one look identical in a log and only one of
+                        # them is evidence. exo emits usage on a stream only
+                        # when the caller sends stream_options.include_usage;
+                        # this gateway forwards that field but does not add it.
+                        log.info(
+                            f"Stream for {mm.name} carried no usage chunk, so the "
+                            f"{n_tokens}-token count ({how}) went unverified — the "
+                            f"caller did not ask for stream_options.include_usage"
+                        )
 
             return StreamingResponse(stream(), media_type="text/event-stream")
 
@@ -1322,13 +1382,9 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                 # once read 11,742 for a prompt exo prefilled as 18,118, and
                 # nothing in the logs said so. A drift warning turns the next
                 # such gap into a line someone can find.
-                actual = ((data or {}).get("usage") or {}).get("prompt_tokens")
-                if actual and n_tokens and actual > n_tokens * 1.15:
-                    log.warning(
-                        f"Prompt measured {n_tokens} tokens by {how}, exo prefilled "
-                        f"{actual} ({actual / n_tokens:.2f}x). The gate is counting "
-                        f"less than the model is reading — #837"
-                    )
+                _check_drift(n_tokens, how,
+                             ((data or {}).get("usage") or {}).get("prompt_tokens"),
+                             mm.name)
             finally:
                 mgr.release_pool(lease_id)
         except capacity.PoolBusy as e:

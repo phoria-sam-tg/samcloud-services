@@ -1612,18 +1612,27 @@ class ModelManager:
                         f"until #827 stage (b) lowers the granted TTL."
                     )
                 elif reason == "already_later":
-                    # A MISCONFIGURATION, not an anomaly: the expiry is already
-                    # beyond now + our ttl, which at a constant TTL cannot happen.
-                    # It means the renewal TTL is smaller than the granted one, so
-                    # EVERY renewal extends nothing and the lease will lapse at its
-                    # original expiry while this loop reports success. Liveness off
-                    # while looking on — the #843 shape, so it is an error.
+                    # A MISCONFIGURATION, not an anomaly: whatever the cause, EVERY
+                    # renewal extends nothing and the lease lapses on its original
+                    # expiry while this loop reports success. Liveness off while
+                    # looking on — the #843 shape — so it is an error.
+                    #
+                    # It states the OBSERVATION and lists the candidate causes
+                    # rather than asserting one. For this gateway the cause can
+                    # only be a renewal TTL below the granted one, but that is a
+                    # fact about our configuration, not about the response: the
+                    # same reason also reaches a caller whose GRANT exceeded the
+                    # ceiling (the adapter at TURN_TIMEOUT=5400s). Naming one cause
+                    # would be right here and wrong there, and this message is the
+                    # only thing a reader has.
                     log.error(
                         f"Pool lease renewal is NOT EXTENDING: {lease_id} after "
                         f"{shown} held returned already_later — the expiry is "
-                        f"beyond now+{EXO_LEASE_TTL}s, so the renewal TTL is "
-                        f"smaller than the granted one. Every renewal will do "
-                        f"nothing and the lease lapses on its original expiry. #827."
+                        f"already beyond now+{EXO_LEASE_TTL}s. Either the renewal "
+                        f"TTL is below the granted one, or the grant exceeded the "
+                        f"registry ceiling ({resp.get('max_total_s')}s). Every "
+                        f"renewal will do nothing and the lease lapses on its "
+                        f"original expiry ({resp.get('expires_at')}). #827."
                     )
                 elif reason == "indefinite":
                     log.warning(

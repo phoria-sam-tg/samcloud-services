@@ -192,8 +192,15 @@ def main():
     check("it is an error, not a warning", len(errs) == 1, str(seen))
     check("and it says renewals are doing nothing",
           errs and "NOT EXTENDING" in errs[0], str(errs))
-    check("and names the cause, not just the symptom",
-          errs and "smaller than the granted one" in errs[0], str(errs))
+    check("it lists the candidate causes rather than asserting one",
+          errs and "Either the renewal TTL is below the granted one" in errs[0]
+          and "grant exceeded the registry ceiling" in errs[0], str(errs))
+    # @claude-wafer-services, 08:00: the adapter grants TURN_TIMEOUT=5400s, three
+    # times the ceiling, and gets already_later forever. Blaming the renewal TTL
+    # would be "a correct message for the wrong reason" there. The gateway can
+    # only hit the first cause, but the message is what a reader has.
+    check("and does not assert the cause that only applies to us",
+          errs and "so the renewal TTL is smaller" not in errs[0], str(errs))
 
     print("  [2g] a response with no `reason` is inferred AND said out loud")
     # A quiet fallback to the old two-boolean inference is the failure this whole

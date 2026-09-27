@@ -5,9 +5,12 @@ Defaults target the production samcloud registry and the
 claude-services-slice device.
 """
 
+import logging
 import os
 import shutil
 from pathlib import Path
+
+log = logging.getLogger("model-config")
 
 
 def _env(name: str, default: str) -> str:
@@ -32,7 +35,58 @@ def _env_bool(name: str, default: bool) -> bool:
 
 # --- samcloud registry ---
 SC_BASE = _env("SC_BASE", "https://cloud.samtg.xyz/api/v1")
-SC_TOKEN = os.environ.get("SC_TOKEN", "")
+
+# The credential file the bearer is read from when SC_TOKEN is NOT in the
+# environment (#845). Keeping it out of the environment is the whole point: the
+# launcher used `set -a` around its env file, so the value was exported and every
+# child process the gateway starts inherited it, and `ps eww <pid>` showed it to
+# any reader of that uid.
+#
+# Nothing on disk held a literal: slice's env file set
+# `SC_TOKEN=$(cat ~/.samcloud/token)`, a reference evaluated at source time, so
+# this reads the same file the launcher already pointed at rather than a new one.
+SC_TOKEN_FILE = _env("SC_TOKEN_FILE", "~/.samcloud/token")
+
+
+def _read_token_file(path: str) -> str:
+    """The bearer from a 0600 credential file, or "" if there is nothing to read.
+
+    Accepts both shapes that exist in practice: a raw token, and a curl header
+    file (`Authorization: Bearer <tok>`), because both live side by side in these
+    accounts and picking one would make the other fail silently.
+
+    A permissive mode WARNS and still returns the token. Refusing would turn a
+    permission bit into a total authentication outage, and the file being readable
+    by others is a different problem from this gateway being able to start. The
+    warning names the mode so it is actionable.
+    """
+    try:
+        full = os.path.expanduser(path)
+        st = os.stat(full)
+        mode = st.st_mode & 0o777
+        if mode & 0o077:
+            log.warning(
+                f"credential file {full} is mode {oct(mode)}, not 0600 — readable "
+                f"beyond its owner. Using it anyway; refusing would make a "
+                f"permission bit an authentication outage (#845)."
+            )
+        raw = open(full).read()
+    except OSError:
+        return ""
+    for line in raw.splitlines():
+        if line.lower().startswith("authorization:"):
+            v = line.split(":", 1)[1].strip()
+            return v.split(None, 1)[1].strip() if v.lower().startswith("bearer") else v
+    return raw.strip()
+
+
+_sc_token_env = os.environ.get("SC_TOKEN", "")
+SC_TOKEN = _sc_token_env or _read_token_file(SC_TOKEN_FILE)
+# Which source won, because "the fix is deployed" and "the launcher still exports
+# it" are indistinguishable without saying so, and an env-sourced token means the
+# hygiene change is not actually in effect. Never the value.
+SC_TOKEN_SOURCE = ("environment" if _sc_token_env
+                   else f"file {SC_TOKEN_FILE}" if SC_TOKEN else "NOT FOUND")
 SC_DEVICE = _env("SC_DEVICE", "claude-services-slice")
 SC_SERVICE_NAME = _env("SC_SERVICE_NAME", "model-service")
 SC_SERVICE_ID = f"{SC_DEVICE}/{SC_SERVICE_NAME}"

@@ -534,16 +534,30 @@ class ExoClient:
                 # slow pool, it is a stopped one (#830).
                 stream = resp.content.__aiter__()
                 seen = 0
-                last = time.monotonic()
+                started = time.monotonic()
+                last = started
+                # The whole-request deadline, tracked HERE rather than left to
+                # aiohttp's `total=`. Both layers raise asyncio.TimeoutError, so a
+                # single `except` cannot tell them apart — and on 2026-09-27 that
+                # mislabelled a 1500s request timeout as "153 chunks then 6s of
+                # silence", a stall the 60s budget could not have produced. Owning
+                # the deadline makes the distinction a fact rather than a guess.
                 # Scaled to the prompt, because prefill is silent and its length is
                 # the only thing that predicts how long that silence should last.
                 # Unknown prompt size falls back to the whole-request budget, i.e.
                 # exactly the behaviour before this existed.
                 first_token_budget = config.exo_first_token_deadline(prompt_tokens)
                 while True:
-                    budget = (
+                    line_budget = (
                         config.EXO_STALL_TIMEOUT if seen else first_token_budget
                     )
+                    remaining = (
+                        started + config.EXO_GENERATE_TIMEOUT - time.monotonic()
+                    )
+                    # Whichever runs out first. `bounded_by_request` records which,
+                    # so the handler below reports the cause it actually hit.
+                    bounded_by_request = remaining <= line_budget
+                    budget = max(0.0, min(line_budget, remaining))
                     try:
                         raw = await asyncio.wait_for(
                             stream.__anext__(), timeout=budget
@@ -551,6 +565,15 @@ class ExoClient:
                     except StopAsyncIteration:
                         break
                     except asyncio.TimeoutError:
+                        if bounded_by_request:
+                            # The request's own budget, not a stall. Reported as
+                            # what it is: pre-#5 behaviour, a 502, and no claim
+                            # about silence we did not measure.
+                            raise ExoRequestFailed(
+                                f"the exo pool did not finish within "
+                                f"{config.EXO_GENERATE_TIMEOUT}s "
+                                f"({seen} chunks received)"
+                            )
                         if not seen:
                             if prompt_tokens:
                                 raise ExoStalled(

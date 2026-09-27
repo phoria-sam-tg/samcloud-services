@@ -212,6 +212,31 @@ def main():
           and drain([(0.01, b"data: a\n"), (1.0, b"data: b\n")])[1].phase == "inter_token",
           "phase must distinguish the two deadlines")
 
+    # --- the whole-request timeout must not wear the stall's name -----------
+    # 2026-09-27, in production: "Pool STALLED mid-stream ... 153 chunks then 6s
+    # of silence", logged against a 60s stall budget that 6s cannot have tripped.
+    # It fired at exactly 1500s -- aiohttp's session `total`, not the per-line
+    # wait. One `except asyncio.TimeoutError` cannot tell the two apart, so the
+    # 504 claimed a stall nobody measured, and no log line could be trusted to
+    # mean the inter-token rule had ever fired.
+
+    # Chunks arriving steadily, generous per-line budget, short overall budget:
+    # the request runs out of time while the stream is healthy.
+    lines, err = drain([(0.1, b"data: a\n")] * 10, stall=5, overall=0.35)
+    check("request budget expiring mid-stream -> ExoRequestFailed, not a stall",
+          isinstance(err, ExoRequestFailed) and not isinstance(err, ExoStalled),
+          f"got {err!r} -- a 1500s timeout must not be reported as a stall")
+    check("...and it says how many chunks arrived, without claiming silence",
+          isinstance(err, ExoRequestFailed) and "chunks received" in str(err)
+          and "silence" not in str(err), str(err)[:160])
+
+    # And the per-line rule must still fire when IT is the binding budget.
+    lines, err = drain([(0.01, b"data: a\n"), (1.0, b"data: b\n")],
+                       stall=0.25, overall=30)
+    check("the inter-token rule still fires when it is the tighter budget",
+          isinstance(err, ExoStalled) and err.phase == "inter_token",
+          f"got {err!r}")
+
     print(f"\n  {'ALL PASSED' if not FAIL else 'FAILED'}: "
           f"exo stall abort {PASS} passed, {FAIL} failed\n")
     return 1 if FAIL else 0

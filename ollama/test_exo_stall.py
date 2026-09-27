@@ -85,17 +85,24 @@ def fake_aiohttp(script):
     return mod
 
 
-def drain(script, stall=0.25, overall=5):
+def drain(script, stall=0.25, overall=5, prompt_tokens=None, rate=None, margin=None):
     """Run chat_stream against `script`; return (lines, exception or None)."""
     sys.modules["aiohttp"] = fake_aiohttp(script)
     old_stall, old_total = config.EXO_STALL_TIMEOUT, config.EXO_GENERATE_TIMEOUT
+    old_rate, old_margin = config.EXO_FIRST_TOKEN_RATE_TPS, config.EXO_FIRST_TOKEN_MARGIN_S
     config.EXO_STALL_TIMEOUT, config.EXO_GENERATE_TIMEOUT = stall, overall
+    if rate is not None:
+        config.EXO_FIRST_TOKEN_RATE_TPS = rate
+    if margin is not None:
+        config.EXO_FIRST_TOKEN_MARGIN_S = margin
     lines, err = [], None
 
     async def go():
         nonlocal err
         try:
-            async for line in ExoClient().chat_stream("m", [{"role": "user", "content": "x"}]):
+            async for line in ExoClient().chat_stream(
+                "m", [{"role": "user", "content": "x"}], prompt_tokens=prompt_tokens
+            ):
                 lines.append(line)
         except Exception as e:  # noqa: BLE001 - the test is about which one
             err = e
@@ -104,6 +111,8 @@ def drain(script, stall=0.25, overall=5):
         asyncio.run(go())
     finally:
         config.EXO_STALL_TIMEOUT, config.EXO_GENERATE_TIMEOUT = old_stall, old_total
+        config.EXO_FIRST_TOKEN_RATE_TPS = old_rate
+        config.EXO_FIRST_TOKEN_MARGIN_S = old_margin
         sys.modules.pop("aiohttp", None)
     return lines, err
 
@@ -142,6 +151,66 @@ def main():
     lines, err = drain([(1.0, b"data: a\n")], stall=5, overall=0.25)
     check("no answer at all -> the request timeout, not a stall",
           isinstance(err, ExoRequestFailed) and not isinstance(err, ExoStalled), f"got {err!r}")
+
+    # --- the first-token deadline -------------------------------------------
+    # EXO_STALL_TIMEOUT cannot bound the silence BEFORE the first token, and that
+    # is where the 2026-09-27 wedge sat: prefill finished, decode never started,
+    # no token ever, so the inter-token rule never armed and the pool was shut for
+    # 28 minutes. The deadline has to scale with the prompt or it cuts real
+    # prefills. #830.
+
+    check("the formula is tokens/rate + margin, admin's numbers",
+          round(config.exo_first_token_deadline(1463), 1) == 69.8
+          and round(config.exo_first_token_deadline(12288), 1) == 141.9,
+          f"1463 -> {config.exo_first_token_deadline(1463)}, "
+          f"12288 -> {config.exo_first_token_deadline(12288)}")
+
+    check("an unknown prompt size falls back to the whole-request budget",
+          config.exo_first_token_deadline(None) == float(config.EXO_GENERATE_TIMEOUT)
+          and config.exo_first_token_deadline(0) == float(config.EXO_GENERATE_TIMEOUT),
+          "a guessed deadline is worse than the behaviour it replaces")
+
+    check("the deadline can never exceed the whole-request budget",
+          config.exo_first_token_deadline(10 ** 7) == float(config.EXO_GENERATE_TIMEOUT),
+          "a deadline longer than the request budget could not fire")
+
+    # 100 tokens at rate 1000/s + 0.2s margin = 0.3s; the pool sends nothing.
+    lines, err = drain([(2.0, b"data: a\n")], stall=5, overall=5,
+                       prompt_tokens=100, rate=1000, margin=0.2)
+    check("prefill that never produces a first token -> ExoStalled",
+          isinstance(err, ExoStalled), f"got {err!r}")
+    check("...named as the first_token deadline, not the inter-token one",
+          isinstance(err, ExoStalled) and err.phase == "first_token",
+          f"phase={getattr(err, 'phase', None)}")
+    check("...and it reports zero tokens seen",
+          isinstance(err, ExoStalled) and err.tokens == 0,
+          f"tokens={getattr(err, 'tokens', None)}")
+    check("...and the message names the formula, so a log says why",
+          isinstance(err, ExoStalled) and "first_token deadline" in str(err)
+          and "100-token prompt" in str(err), str(err)[:200])
+
+    # The same prompt, answering inside the deadline: must not be cut.
+    lines, err = drain([(0.05, b"data: a\n"), (0.05, b"data: [DONE]\n")],
+                       stall=5, overall=5, prompt_tokens=100, rate=1000, margin=0.2)
+    check("a prefill that answers inside its deadline is untouched",
+          err is None and len([x for x in lines if x]) == 2, f"{err!r} {lines}")
+
+    # A long prefill with a generous deadline: the deadline must scale, not bite.
+    lines, err = drain([(0.4, b"data: a\n"), (0.01, b"data: [DONE]\n")],
+                       stall=5, overall=5, prompt_tokens=6000, rate=1000, margin=0.2)
+    check("a larger prompt earns a longer deadline (6000/1000+0.2 = 6.2s)",
+          err is None, f"cut a prefill that was inside its scaled deadline: {err!r}")
+
+    # Without a token count the old behaviour must be preserved exactly.
+    lines, err = drain([(1.0, b"data: a\n")], stall=5, overall=0.25)
+    check("no token count -> still the request timeout, not a stall",
+          isinstance(err, ExoRequestFailed) and not isinstance(err, ExoStalled),
+          f"got {err!r}")
+
+    check("the inter-token stall still names its own phase",
+          isinstance(drain([(0.01, b"data: a\n"), (1.0, b"data: b\n")])[1], ExoStalled)
+          and drain([(0.01, b"data: a\n"), (1.0, b"data: b\n")])[1].phase == "inter_token",
+          "phase must distinguish the two deadlines")
 
     print(f"\n  {'ALL PASSED' if not FAIL else 'FAILED'}: "
           f"exo stall abort {PASS} passed, {FAIL} failed\n")

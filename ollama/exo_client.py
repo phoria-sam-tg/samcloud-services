@@ -71,10 +71,17 @@ class ExoStalled(Exception):
     placement guard see the wedge and rebuild the instance (#830).
     """
 
-    def __init__(self, message: str, *, tokens: int = 0, silent_for: float = 0.0):
+    def __init__(self, message: str, *, tokens: int = 0, silent_for: float = 0.0,
+                 phase: str = "inter_token", deadline: float = 0.0):
         super().__init__(message)
         self.tokens = tokens
         self.silent_for = silent_for
+        # Which deadline fired. Two stalls with the same 504 need telling apart in
+        # a log a week later: "first_token" is a prefill that never produced,
+        # "inter_token" is a decode that stopped. They have different causes and
+        # the same remedy, so the status code is shared and the phase is recorded.
+        self.phase = phase
+        self.deadline = deadline
 
 
 class ExoUnavailable(Exception):
@@ -411,7 +418,8 @@ class ExoClient:
         r.raise_for_status()
         return r.json()
 
-    async def chat_collect(self, model: str, messages: list[dict], **kwargs) -> dict:
+    async def chat_collect(self, model: str, messages: list[dict],
+                           prompt_tokens: int | None = None, **kwargs) -> dict:
         """A non-streaming answer, assembled from the streaming endpoint.
 
         Gives a caller the plain OpenAI response shape they asked for. Not
@@ -436,7 +444,9 @@ class ExoClient:
         usage: dict = {}
         model_reported = None
 
-        async for line in self.chat_stream(model, messages, **kwargs):
+        async for line in self.chat_stream(
+            model, messages, prompt_tokens=prompt_tokens, **kwargs
+        ):
             if line.startswith(":"):          # SSE comment, e.g. ": keep-alive"
                 continue
             if not line.startswith("data:"):
@@ -484,7 +494,8 @@ class ExoClient:
             "usage": usage,
         }
 
-    async def chat_stream(self, model: str, messages: list[dict], **kwargs):
+    async def chat_stream(self, model: str, messages: list[dict],
+                          prompt_tokens: int | None = None, **kwargs):
         """Streaming chat completion, yielding raw SSE lines for passthrough.
 
         "Raw" includes the blank lines, which it did not before: this docstring
@@ -524,10 +535,14 @@ class ExoClient:
                 stream = resp.content.__aiter__()
                 seen = 0
                 last = time.monotonic()
+                # Scaled to the prompt, because prefill is silent and its length is
+                # the only thing that predicts how long that silence should last.
+                # Unknown prompt size falls back to the whole-request budget, i.e.
+                # exactly the behaviour before this existed.
+                first_token_budget = config.exo_first_token_deadline(prompt_tokens)
                 while True:
                     budget = (
-                        config.EXO_STALL_TIMEOUT if seen
-                        else config.EXO_GENERATE_TIMEOUT
+                        config.EXO_STALL_TIMEOUT if seen else first_token_budget
                     )
                     try:
                         raw = await asyncio.wait_for(
@@ -537,6 +552,23 @@ class ExoClient:
                         break
                     except asyncio.TimeoutError:
                         if not seen:
+                            if prompt_tokens:
+                                raise ExoStalled(
+                                    f"the exo pool produced no first token within "
+                                    f"{first_token_budget:.0f}s for a "
+                                    f"{prompt_tokens}-token prompt (first_token "
+                                    f"deadline: tokens/"
+                                    f"{config.EXO_FIRST_TOKEN_RATE_TPS} + "
+                                    f"{config.EXO_FIRST_TOKEN_MARGIN_S}s). Prefill "
+                                    f"never produced, so this is a stalled instance "
+                                    f"rather than a slow one — abandoning it so the "
+                                    f"pool can be rebuilt.",
+                                    tokens=0, silent_for=first_token_budget,
+                                    phase="first_token", deadline=first_token_budget,
+                                )
+                            # No token count: no deadline was computed, so this is
+                            # still the old whole-request timeout and must not be
+                            # reported as a stall we did not measure.
                             raise ExoRequestFailed(
                                 f"the exo pool produced no answer within "
                                 f"{config.EXO_GENERATE_TIMEOUT}s"
@@ -550,6 +582,8 @@ class ExoClient:
                             f"rebuilt rather than holding its lease for "
                             f"{config.EXO_GENERATE_TIMEOUT}s.",
                             tokens=seen, silent_for=silent,
+                            phase="inter_token",
+                            deadline=float(config.EXO_STALL_TIMEOUT),
                         )
                     # Blank lines are yielded too. In SSE a blank line is not
                     # whitespace, it is the event terminator — dropping it and

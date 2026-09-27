@@ -156,6 +156,48 @@ EXO_GENERATE_TIMEOUT = _env_int("EXO_GENERATE_TIMEOUT", 1500)
 # see is already a real token — "first line" and "first token" are the same.
 EXO_STALL_TIMEOUT = _env_int("EXO_STALL_TIMEOUT", 60)
 
+# How long the pool may take to produce its FIRST token, as a function of the
+# prompt it was given.
+#
+# EXO_STALL_TIMEOUT bounds the gap BETWEEN tokens and cannot bound the gap before
+# the first one, because prefill is legitimately silent — and that is where the
+# 2026-09-27 wedge sat. A generation received at 14:17:56 finished prefilling
+# 1,463 tokens at 14:17:59.878 and then never reached `Starting decode`: no tokens
+# ever, so the inter-token rule never armed, and the only bound left was
+# EXO_GENERATE_TIMEOUT. The pool was shut for 28 minutes (25 of them the gateway
+# waiting, 3 the guard recovering) for a stall detectable in about 70 seconds.
+#
+# The deadline has to scale with the prompt or it cuts real prefills: measured on
+# this pool, cold prefill runs at 180-405 tok/s (4.89s for 1,474 tokens; 15.29s
+# for 6,197; 37.53s for 11,670). 150 tok/s is below every sample, so the rate is
+# a floor rather than an average, and the margin covers the KV-cache transition
+# that follows prefill — measured at 0.00s and 17.22s, the second being the step
+# this wedge died on.
+#
+#   1,463 tokens  ->  1463/150 + 60  =  ~70s
+#   12,288 tokens -> 12288/150 + 60  = ~142s
+#
+# Never longer than the whole-request budget: a deadline that exceeds it could not
+# fire. #830.
+EXO_FIRST_TOKEN_RATE_TPS = _env_int("EXO_FIRST_TOKEN_RATE_TPS", 150)
+EXO_FIRST_TOKEN_MARGIN_S = _env_int("EXO_FIRST_TOKEN_MARGIN_S", 60)
+
+
+def exo_first_token_deadline(prompt_tokens: int | None) -> float:
+    """Seconds to allow before the first token, or the whole-request budget.
+
+    Returns EXO_GENERATE_TIMEOUT unchanged when the prompt size is unknown, so a
+    caller that cannot count tokens keeps exactly today's behaviour rather than
+    getting a deadline computed from a guess.
+    """
+    if not prompt_tokens or prompt_tokens <= 0:
+        return float(EXO_GENERATE_TIMEOUT)
+    return min(
+        prompt_tokens / EXO_FIRST_TOKEN_RATE_TPS + EXO_FIRST_TOKEN_MARGIN_S,
+        float(EXO_GENERATE_TIMEOUT),
+    )
+
+
 # Ceiling on how long an exclusive lease can outlive the request that took it.
 # This is a leak bound, not an expected generation length — the happy path
 # releases in a `finally`. It matters because a lease stranded on an exclusive

@@ -239,6 +239,34 @@ _EXO_TTL_MARGIN = 300
 if EXO_LEASE_TTL < EXO_GENERATE_TIMEOUT + _EXO_TTL_MARGIN:
     EXO_LEASE_TTL = EXO_GENERATE_TIMEOUT + _EXO_TTL_MARGIN
 
+# --- Renewal (#827 P3, stage a) ---------------------------------------------
+# The invariant above — a lease must outlive the longest generation — is what a
+# holder needs when it CANNOT renew. Renewal is what makes it obsolete: with a
+# heartbeat, a dead holder frees the pool in one TTL instead of 1800s, and the
+# TTL no longer has to cover the work.
+#
+# This stage adds the renewing and changes NO timing: EXO_LEASE_TTL stays where
+# it is, so nothing about exclusivity depends on the new path working. Stage (b)
+# lowers it, and only once a renewal has been seen in this log — at which point
+# the invariant above must be replaced by one about the RENEWAL INTERVAL, not
+# the generation, or a short TTL breaks exclusivity outright.
+#
+# An integer percent, not a float: `float("")` raises, and an env var set to
+# empty is the commonest way an operator "unsets" one.
+EXO_LEASE_RENEW_PCT = _env_int("EXO_LEASE_RENEW_PCT", 33)
+EXO_LEASE_RENEW_PCT = min(90, max(10, EXO_LEASE_RENEW_PCT))
+
+# Capped, for two reasons. A third of 1800s is 594s, so today only the five
+# longest leases of 514 would ever renew and the path would be all but
+# unexercised — an untested mechanism that exclusivity is about to depend on.
+# And admin's gate for stage (b) is a renewal observed on a lease over 120s;
+# at 594s that could wait days. A 60s cap makes any lease past a minute renew
+# at least once, which is 35 of 514 by today's traffic, while costing one
+# request per minute only while a generation is actually running.
+EXO_LEASE_RENEW_MAX_S = _env_int("EXO_LEASE_RENEW_MAX_S", 60)
+EXO_LEASE_RENEW_INTERVAL_S = max(
+    5, min(EXO_LEASE_RENEW_MAX_S, int(EXO_LEASE_TTL * EXO_LEASE_RENEW_PCT / 100)))
+
 # Per-model request defaults — the same shape model-service already uses for
 # its Ollama `think:false` workaround. On an exclusive resource an unbounded
 # generation is not slow, it is a denial of service: one caller owns the pool

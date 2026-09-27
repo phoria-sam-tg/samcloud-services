@@ -219,6 +219,11 @@ class ModelManager:
     # registry is the thing that enforces one-at-a-time, and this bookkeeping
     # should not be the component that quietly assumes it.
     _pool_leases: set = field(default_factory=set, repr=False)
+    # When each pool lease was taken, so a renewal can say how long the
+    # lease has been held. That age is the gate for #827 stage (b) — the
+    # default TTL drops only once a lease over 120s is seen renewing —
+    # so it is load-bearing, not decoration.
+    _pool_lease_acquired: dict = field(default_factory=dict, repr=False)
     # Guards pool bookkeeping that is mutated OFF the event loop — the lease set
     # above, and the tier's request counter in resolve_exo_tier. Both reach this
     # object from `asyncio.to_thread`, so the single-threaded loop no longer
@@ -229,6 +234,7 @@ class ModelManager:
     _cooldown_task: Optional[asyncio.Task] = field(default=None, repr=False)
     _health_task: Optional[asyncio.Task] = field(default=None, repr=False)
     _stats_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    _pool_renewal_task: Optional[asyncio.Task] = field(default=None, repr=False)
     _offering_task: Optional[asyncio.Task] = field(default=None, repr=False)
     _offering_tier: Optional[str] = field(default=None, repr=False)
 
@@ -1094,6 +1100,7 @@ class ModelManager:
             # the wire and a decline could only be delivered as stream content.
             with self._pool_lock:
                 self._pool_leases.add(outcome.lease_id)
+                self._pool_lease_acquired[outcome.lease_id] = time.monotonic()
             log.info(
                 f"Pool lease {outcome.lease_id} acquired for {purpose} "
                 f"(exclusive, TTL={EXO_LEASE_TTL}s)"
@@ -1211,6 +1218,7 @@ class ModelManager:
             return
         with self._pool_lock:
             self._pool_leases.discard(lease_id)
+            self._pool_lease_acquired.pop(lease_id, None)
         try:
             self.sc.release_lease(lease_id)
             log.info(f"Pool lease {lease_id} released")
@@ -1513,7 +1521,16 @@ class ModelManager:
                 log.warning(f"Lease renewal error: {e}")
 
     def _renew_leases(self):
-        """Release and re-request leases to prevent expiry."""
+        """Release and re-request MODEL leases to prevent expiry.
+
+        NOT THE PATTERN FOR AN EXCLUSIVE LEASE, and deliberately left alone.
+        Releasing and then re-requesting opens a window in which the resource is
+        unheld; for the memory leases here that is survivable, because they are
+        shares of a pool rather than the pool itself. On the exclusive pool lease
+        the same two lines would let another caller in mid-generation — the exact
+        class of fault #827 exists to remove. `_renew_pool_leases` below renews in
+        place against POST /leases/<id>/renew and must stay that way.
+        """
         for name, mm in list(self.models.items()):
             if not mm.lease_id:
                 continue
@@ -1525,12 +1542,69 @@ class ModelManager:
             except Exception as e:
                 log.warning(f"Failed to renew lease for {name}: {e}")
 
+    async def pool_renewal_loop(self):
+        """Keep held pool leases alive while their generation runs (#827 P3)."""
+        while True:
+            await asyncio.sleep(config.EXO_LEASE_RENEW_INTERVAL_S)
+            try:
+                self._renew_pool_leases()
+            except Exception as e:
+                log.warning(f"Pool lease renewal error: {e}")
+
+    def _renew_pool_leases(self):
+        """Extend every held pool lease IN PLACE. Never releases anything.
+
+        A failure here does NOT release the lease. The generation is still
+        running and the pool is still ours until the registry says otherwise;
+        dropping the claim because we failed to restate it would hand a busy
+        single-slot pool to the next caller, which is worse than a lease that
+        outlives us by one TTL.
+        """
+        with self._pool_lock:
+            held = [(lid, self._pool_lease_acquired.get(lid))
+                    for lid in self._pool_leases]
+        for lease_id, since in held:
+            age = time.monotonic() - since if since else None
+            shown = f"{age:.0f}s" if age is not None else "unknown"
+            try:
+                self.sc.renew_lease(lease_id)
+                log.info(
+                    f"Pool lease {lease_id} renewed in place after {shown} held "
+                    f"(TTL={EXO_LEASE_TTL}s, renewing every "
+                    f"{config.EXO_LEASE_RENEW_INTERVAL_S}s)"
+                )
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    # The registry no longer knows this lease while we are still
+                    # generating against it: exclusivity is already gone and the
+                    # pool can be granted to someone else at any moment. Loudest
+                    # thing this class says, because nothing downstream can tell.
+                    log.error(
+                        f"Pool lease {lease_id} is GONE from the registry after "
+                        f"{shown} held — it was reaped while the generation was "
+                        f"still running, so the pool is no longer exclusively "
+                        f"ours. Check the lease TTL against #827 staging."
+                    )
+                else:
+                    log.warning(
+                        f"Could not renew pool lease {lease_id} after {shown} "
+                        f"held ({e.response.status_code}); keeping it — the "
+                        f"generation is still running"
+                    )
+            except Exception as e:
+                log.warning(
+                    f"Could not renew pool lease {lease_id} after {shown} held "
+                    f"({type(e).__name__}: {e}); keeping it"
+                )
+
     def start_background_tasks(self):
         if self._cooldown_task is None or self._cooldown_task.done():
             self._cooldown_task = asyncio.create_task(self.cooldown_loop())
         if self._health_task is None or self._health_task.done():
             self._health_task = asyncio.create_task(self.health_loop())
         self._renewal_task = asyncio.create_task(self.lease_renewal_loop())
+        if self._pool_renewal_task is None or self._pool_renewal_task.done():
+            self._pool_renewal_task = asyncio.create_task(self.pool_renewal_loop())
         if self._stats_task is None or self._stats_task.done():
             self._stats_task = asyncio.create_task(self.stats_loop())
         if config.OFFERING_ENABLED and (self._offering_task is None or self._offering_task.done()):
@@ -1561,7 +1635,8 @@ class ModelManager:
                     results.append({"model": name, "status": "lease_released", "process": "kept"})
                 except Exception:
                     pass
-        for task in [self._cooldown_task, self._health_task, getattr(self, '_renewal_task', None), self._stats_task, self._offering_task]:
+        for task in [self._cooldown_task, self._health_task, getattr(self, '_renewal_task', None),
+                     getattr(self, '_pool_renewal_task', None), self._stats_task, self._offering_task]:
             if task and not task.done():
                 task.cancel()
         return results

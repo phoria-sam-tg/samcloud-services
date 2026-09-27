@@ -199,6 +199,61 @@ def _template(model_id: str, models_dir: str):
     return tmpl
 
 
+def _renderable(messages: list) -> list:
+    """Messages in the shape the chat template expects.
+
+    Two shapes that OpenAI clients send legitimately and this template cannot
+    render as-is:
+
+    - `tool_calls[].function.arguments` as a **JSON string**, which is what the
+      OpenAI API specifies and what hermes sends. The template does
+      `tc.arguments.items()` (line 66), so a string raises `'str object' has no
+      attribute 'items'` and the whole render is lost. Measured 2026-09-27:
+      identical payload, 29 tokens rendered with the arguments parsed, 126 by
+      the serialised fallback — the fallback is not a small over-count on
+      structured messages, so letting the render fail is expensive.
+    - `content: None` on an assistant message that carries only tool_calls.
+
+    Parsed rather than patched around: an argument string that will not parse is
+    left alone, the render fails, and the fallback counts it. That is the safe
+    direction and it keeps this function honest about what it can fix.
+    """
+    out = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            out.append(m)
+            continue
+        m = dict(m)
+        if m.get("content") is None:
+            m["content"] = ""
+        calls = m.get("tool_calls")
+        if isinstance(calls, list):
+            fixed = []
+            for call in calls:
+                if isinstance(call, dict):
+                    call = dict(call)
+                    for holder in (call.get("function"), call):
+                        if not isinstance(holder, dict):
+                            continue
+                        args = holder.get("arguments")
+                        if isinstance(args, str):
+                            try:
+                                parsed = json.loads(args)
+                            except (ValueError, TypeError):
+                                continue
+                            if isinstance(parsed, dict):
+                                if holder is call:
+                                    call["arguments"] = parsed
+                                else:
+                                    holder = dict(holder)
+                                    holder["arguments"] = parsed
+                                    call["function"] = holder
+                fixed.append(call)
+            m["tool_calls"] = fixed
+        out.append(m)
+    return out
+
+
 def _serialised(messages: list, tools: Optional[list]) -> str:
     """Everything outbound, as JSON — the fallback when the template is missing.
 
@@ -265,7 +320,7 @@ def count(messages: list, model_id: str, models_dir: str, chars_per_token: float
         tmpl = _template(model_id, models_dir)
         if tmpl is not None:
             try:
-                rendered = tmpl.render(messages=messages or [], tools=tools or None,
+                rendered = tmpl.render(messages=_renderable(messages), tools=tools or None,
                                        add_generation_prompt=True)
                 return len(tok.encode(rendered, add_special_tokens=False).ids), "chat template"
             except Exception as e:

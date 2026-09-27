@@ -362,6 +362,42 @@ def main():
     check("and the lease stays tracked so shutdown still releases it",
           "lease_reaped" in m._pool_leases, str(m._pool_leases))
 
+    print("  [4d] a 404 on a lease we NO LONGER HOLD is our own race, not a reap")
+    # claude-wafer-services, #827: the tick reads the held map under _pool_lock and
+    # POSTs outside it — deliberately, since holding a lock across a 10s HTTP call
+    # is the wrong trade. A generation finishing in that window releases its lease
+    # and the renewal 404s on a lease we no longer own. Median lease 9.4s against a
+    # 60s tick, so this is the NORMAL path, and reporting it as a reap would be a
+    # false alarm that trains its reader to skip the line.
+    class RaceThenGone:
+        def __init__(self, mgr): self.mgr = mgr
+        def renew_lease(self, lease_id, ttl_seconds):
+            # exactly the race: release lands while the POST is in flight
+            with self.mgr._pool_lock:
+                self.mgr._pool_leases.discard(lease_id)
+            raise http_error(404, REAPED_404_BODY)
+    m = ModelManager(sc=None)
+    m.sc = RaceThenGone(m)
+    with m._pool_lock:
+        m._pool_leases.add("lease_raced")
+        m._pool_lease_acquired["lease_raced"] = time.monotonic() - 70
+    seen = logs_from(m._renew_pool_leases)
+    check("no error — this is benign",
+          not any(lvl == "error" for lvl, _ in seen), str(seen))
+    check("and no warning either", not any(lvl == "warning" for lvl, _ in seen), str(seen))
+    check("nothing claims the pool was reaped",
+          not any("reaped" in msg.lower() or "GONE" in msg for _, msg in seen), str(seen))
+
+    print("  [4e] a 404 on a lease we STILL HOLD is the reap the error exists for")
+    sc = Recorder(renew=http_error(404, REAPED_404_BODY))
+    m = manager_holding("lease_reaped_held", 410, sc)
+    seen = logs_from(m._renew_pool_leases)
+    errs = [msg for lvl, msg in seen if lvl == "error"]
+    check("it is an error", len(errs) == 1, str(seen))
+    check("and it says we still hold it, so the distinction is visible",
+          errs and "STILL HOLD" in errs[0], str(errs))
+    check("and still names exclusivity", errs and "exclusively" in errs[0], str(errs))
+
     print("  [5] a released lease is not renewed, and leaves no bookkeeping behind")
     sc = Recorder()
     m = manager_holding("lease_E", 10, sc)

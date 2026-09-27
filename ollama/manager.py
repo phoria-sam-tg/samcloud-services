@@ -1570,10 +1570,20 @@ class ModelManager:
                 resp = self.sc.renew_lease(lease_id, EXO_LEASE_TTL) or {}
                 extended = resp.get("extended_by_s")
                 if extended:
+                    # capped AND extended arrive together on the LAST renewal
+                    # before the ceiling: target lands exactly on the ceiling,
+                    # which is still later than the current expiry. So this is a
+                    # real extension and also the final one — worth saying, because
+                    # every renewal after it prints "NO extension" and an operator
+                    # should see that transition coming rather than meet it.
+                    tail = (" — this is the LAST extension, the "
+                            f"{resp.get('max_total_s')}s ceiling is now reached"
+                            if resp.get("capped") else "")
                     log.info(
                         f"Pool lease {lease_id} renewed in place after {shown} "
                         f"held: +{extended}s, expires {resp.get('expires_at')} "
                         f"(renewing every {config.EXO_LEASE_RENEW_INTERVAL_S}s)"
+                        f"{tail}"
                     )
                 elif resp.get("capped"):
                     # Accepted and extended NOTHING because the ceiling bound it.

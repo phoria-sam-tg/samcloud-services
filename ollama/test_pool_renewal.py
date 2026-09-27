@@ -144,6 +144,23 @@ def main():
     check("it reports the extension", "+60s" in line2, line2)
     check("and does not claim there was none", "NO extension" not in line2, line2)
 
+    print("  [2e] capped AND extended together: the last extension before the ceiling")
+    # samclaude-admin, reviewing #33: on the final renewal target lands on the
+    # ceiling, which is still later than the current expiry — so extended_by_s > 0
+    # and capped is true at the same time. Branching on capped first would print
+    # "NO extension" for a renewal that extended.
+    sc = Recorder(reply={"extended_by_s": 25, "capped": True, "max_total_s": 1800,
+                         "expires_at": "2026-09-27T08:30:00Z"})
+    m = manager_holding("lease_B4", 1775, sc)
+    seen = logs_from(m._renew_pool_leases)
+    line4 = next((msg for lvl, msg in seen if "1775s held" in msg), "")
+    check("the extension is reported, not swallowed by capped",
+          "+25s" in line4, line4)
+    check("it does NOT say there was no extension",
+          "NO extension" not in line4, line4)
+    check("and it warns that this is the last one",
+          "LAST extension" in line4 and "1800s ceiling" in line4, line4)
+
     print("  [2d] no extension and NOT capped is a different thing, and says so")
     # The registry returns extended_by_s 0 with capped False for a lease that has
     # no expiry at all. Treating "no extension" as "ceiling" would mislabel it —

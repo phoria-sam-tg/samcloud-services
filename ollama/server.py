@@ -1230,12 +1230,15 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                     # stalled instance hits the same stuck runner, and what the
                     # caller should do is wait for the guard to rebuild it.
                     log.error(
-                        f"Pool STALLED mid-stream for {mm.name}: {e.tokens} chunks "
-                        f"then {e.silent_for:.0f}s of silence — releasing the lease "
-                        f"so the placement guard can recover the instance"
+                        f"Pool STALLED mid-stream for {mm.name} on the {e.phase} "
+                        f"deadline ({e.deadline:.0f}s): {e.tokens} chunks then "
+                        f"{e.silent_for:.0f}s of silence — releasing the lease so "
+                        f"the placement guard can recover the instance"
                     )
                     yield "data: " + json.dumps({
                         "error": {"message": str(e), "type": "pool_stalled",
+                                  "deadline": e.phase,
+                                  "deadline_s": round(e.deadline, 1),
                                   "tokens_before_stall": e.tokens,
                                   "silent_for_s": round(e.silent_for, 1)},
                     }) + "\n\n"
@@ -1332,12 +1335,19 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
             # and retrying this one lands on the same stuck instance until the
             # placement guard rebuilds it (#830).
             log.error(
-                f"Pool STALLED for {mm.name}: {e.tokens} chunks then "
-                f"{e.silent_for:.0f}s of silence — lease released, the guard "
-                f"should now see an unleased busy pool and rebuild it"
+                f"Pool STALLED for {mm.name} on the {e.phase} deadline "
+                f"({e.deadline:.0f}s): {e.tokens} chunks then {e.silent_for:.0f}s "
+                f"of silence — lease released, the guard should now see an unleased "
+                f"busy pool and rebuild it"
             )
             raise HTTPException(status_code=504, detail={
                 "error": "pool_stalled",
+                # Which deadline fired, named in the response as well as the log:
+                # "first_token" is a prefill that never produced, "inter_token" a
+                # decode that stopped. A caller retrying learns nothing from the
+                # status code alone, and these have different expected durations.
+                "deadline": e.phase,
+                "deadline_s": round(e.deadline, 1),
                 "message": str(e),
                 "tokens_before_stall": e.tokens,
                 "silent_for_s": round(e.silent_for, 1),

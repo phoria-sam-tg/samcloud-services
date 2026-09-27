@@ -53,6 +53,7 @@ class SamcloudClient:
         memory_mb: Optional[int] = None,
         ttl_seconds: int = 3600,
         exclusive: bool = False,
+        max_total_s: Optional[int] = None,
     ) -> dict:
         """Request a lease. Returns `{"status_code": int, ...body}`.
 
@@ -80,6 +81,12 @@ class SamcloudClient:
         to whoever collides with it.
         """
         payload: dict = {"ttl_seconds": ttl_seconds}
+        if max_total_s is not None:
+            # The ceiling, counted by the registry from granted_at (#827 P3a/#34).
+            # Sent explicitly rather than left to the registry default, because
+            # when a lease lapses the ceiling is the first thing a reader checks
+            # and it should be visible in the call that made the lease.
+            payload["max_total_s"] = max_total_s
         if service_id is not None:
             payload["service_id"] = service_id
         if memory_mb is not None:

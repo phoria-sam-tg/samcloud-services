@@ -316,14 +316,39 @@ def exo_first_token_deadline(prompt_tokens: int | None) -> float:
 # generation that runs to its timeout finishes just as its lease lapses — the
 # pool silently becomes grantable to someone else while we are still using it,
 # which is the exact collision the exclusive lease exists to prevent.
-EXO_LEASE_TTL = _env_int("EXO_LEASE_TTL", 1800)
+# TWO NUMBERS WITH DIFFERENT JOBS (#827 b1). Stage (a) had one, and it had to
+# cover both, which is why it was 1800s:
+#
+#   EXO_LEASE_TTL          how long before someone may assume we died   LIVENESS
+#   EXO_LEASE_MAX_TOTAL_S  the longest we could legitimately need it     EXPOSURE
+#
+# Liveness is now 600s because we renew. A dead holder frees the pool in <=600s
+# instead of <=1800s, which is the whole point of #827: every incident was a
+# holder that went away while its exclusive lease lived on.
+EXO_LEASE_TTL = _env_int("EXO_LEASE_TTL", 600)
 
-# Enforce the ordering rather than trusting whoever edits the env next. Widening
-# the lease is the safe direction: a lease that is too long delays the pool for
-# other consumers, while one that is too short breaks exclusivity outright.
+# The ceiling, counted by the registry from granted_at, passed EXPLICITLY on the
+# grant rather than left to the registry default. The ceiling is the first thing
+# a reader checks when a lease lapses, so it belongs in the call.
+EXO_LEASE_MAX_TOTAL_S = _env_int("EXO_LEASE_MAX_TOTAL_S", 1800)
+
+# THE INVARIANT SWAP, which is the substance of b1 rather than the number.
+#
+# Stage (a) forced EXO_LEASE_TTL >= EXO_GENERATE_TIMEOUT + 300: a lease had to
+# outlive the longest generation, because a holder that cannot renew has nothing
+# else to protect it. Renewal makes that obsolete and moves the requirement:
+#
+#   1. the CEILING must still outlive the longest generation, because renewals
+#      cannot walk a lease past granted_at + max_total_s. This is the clause that
+#      inherits stage (a)'s job, and getting it wrong lapses a lease mid-work.
+#   2. the TTL must leave room for two MISSED renewals — three attempts, the last
+#      with time to spare for a slow registry answer. Not the generation's length
+#      any more; the renewal interval's.
+#
+# Widening is the safe direction for both, as before.
 _EXO_TTL_MARGIN = 300
-if EXO_LEASE_TTL < EXO_GENERATE_TIMEOUT + _EXO_TTL_MARGIN:
-    EXO_LEASE_TTL = EXO_GENERATE_TIMEOUT + _EXO_TTL_MARGIN
+if EXO_LEASE_MAX_TOTAL_S < EXO_GENERATE_TIMEOUT + _EXO_TTL_MARGIN:
+    EXO_LEASE_MAX_TOTAL_S = EXO_GENERATE_TIMEOUT + _EXO_TTL_MARGIN
 
 # --- Renewal (#827 P3, stage a) ---------------------------------------------
 # The invariant above — a lease must outlive the longest generation — is what a
@@ -366,6 +391,17 @@ EXO_LEASE_RENEW_PCT = min(90, max(10, EXO_LEASE_RENEW_PCT))
 EXO_LEASE_RENEW_MAX_S = _env_int("EXO_LEASE_RENEW_MAX_S", 60)
 EXO_LEASE_RENEW_INTERVAL_S = max(
     5, min(EXO_LEASE_RENEW_MAX_S, int(EXO_LEASE_TTL * EXO_LEASE_RENEW_PCT / 100)))
+
+# Clause 2 of the swap, enforced here because it needs the interval. Three
+# attempts (two missed renewals survived) must land inside 80% of the lease, so
+# the third still has a fifth of the TTL left for a slow registry answer — this
+# gateway's calls carry a 10s timeout. At the b1 defaults: interval 60s, attempts
+# at 60/120/180s, 180 <= 480. Widen the TTL rather than narrow the interval,
+# because a shorter interval costs requests and a longer TTL costs only how fast
+# a dead holder is noticed.
+_EXO_MIN_TTL = int(EXO_LEASE_RENEW_INTERVAL_S * 3 / 0.8)
+if EXO_LEASE_TTL < _EXO_MIN_TTL:
+    EXO_LEASE_TTL = _EXO_MIN_TTL
 
 # Per-model request defaults — the same shape model-service already uses for
 # its Ollama `think:false` workaround. On an exclusive resource an unbounded

@@ -397,10 +397,43 @@ def main():
     check("the percentage is clamped into a sane band",
           10 <= config.EXO_LEASE_RENEW_PCT <= 90, str(config.EXO_LEASE_RENEW_PCT))
 
-    print("  [8] stage (a) changes no timing — exclusivity cannot depend on the new path")
-    check("the TTL still outlives the longest generation",
-          config.EXO_LEASE_TTL >= config.EXO_GENERATE_TIMEOUT + 300,
+    print("  [8] b1's invariant swap: the CEILING inherits the old TTL clause")
+    # Stage (a) required TTL >= GENERATE_TIMEOUT + 300, because a holder that
+    # cannot renew has nothing else protecting it. b1 moves that requirement onto
+    # the ceiling, which renewals cannot walk past — getting THIS wrong lapses a
+    # lease mid-generation, which is what the old clause existed to prevent.
+    check("the ceiling outlives the longest generation",
+          config.EXO_LEASE_MAX_TOTAL_S >= config.EXO_GENERATE_TIMEOUT + 300,
+          f"ceiling={config.EXO_LEASE_MAX_TOTAL_S} gen={config.EXO_GENERATE_TIMEOUT}")
+    check("the TTL is now SHORTER than the longest generation, which is the point",
+          config.EXO_LEASE_TTL < config.EXO_GENERATE_TIMEOUT,
           f"ttl={config.EXO_LEASE_TTL} gen={config.EXO_GENERATE_TIMEOUT}")
+    check("and three renewal attempts fit inside 80% of the TTL",
+          config.EXO_LEASE_RENEW_INTERVAL_S * 3 <= config.EXO_LEASE_TTL * 0.8,
+          f"3x{config.EXO_LEASE_RENEW_INTERVAL_S} vs {config.EXO_LEASE_TTL*0.8:.0f}")
+
+    print("  [8b] the grant sends both numbers, explicitly")
+    sc = Recorder()
+    m = ModelManager(sc=sc)
+    # acquire_pool builds the payload; assert what it would send rather than
+    # restating it, so a change to either constant follows automatically.
+    sent = {}
+    def fake_request_lease(**kw):
+        sent.update(kw)
+        return {"lease_id": "lease_z", "status": "active", "status_code": 200}
+    sc.request_lease = fake_request_lease
+    m.exo = type("E", (), {"pool_status": staticmethod(lambda: {"ok": True})})()
+    try:
+        m.acquire_pool("test")
+    except Exception:
+        pass
+    check("ttl_seconds is the liveness number",
+          sent.get("ttl_seconds") == config.EXO_LEASE_TTL, str(sent.get("ttl_seconds")))
+    check("max_total_s is the exposure number, sent explicitly",
+          sent.get("max_total_s") == config.EXO_LEASE_MAX_TOTAL_S, str(sent.get("max_total_s")))
+    check("and they are NOT the same number any more",
+          config.EXO_LEASE_TTL != config.EXO_LEASE_MAX_TOTAL_S,
+          f"{config.EXO_LEASE_TTL} vs {config.EXO_LEASE_MAX_TOTAL_S}")
 
     print("  [9] two missed renewals leave real slack, not 3 seconds of it")
     # Stage (b)'s invariant is TTL >= 3 * interval. Because the interval is a
@@ -408,7 +441,7 @@ def main():
     # unless the fraction is small enough: at 33% the third attempt lands at 98%
     # of the lease, and one slow registry answer (10s timeout) loses it. This is
     # the assertion that would fail if someone raised the percentage back.
-    for ttl in (120, 300, 1800):
+    for ttl in (120, 300, 600, 1800):
         iv = max(5, min(config.EXO_LEASE_RENEW_MAX_S,
                         int(ttl * config.EXO_LEASE_RENEW_PCT / 100)))
         third = iv * 3

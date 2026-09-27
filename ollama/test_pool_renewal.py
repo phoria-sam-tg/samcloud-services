@@ -595,6 +595,165 @@ def main():
     check(f"the worst tick gap stayed under 0.5s (was {worst:.2f}s)",
               worst < 0.5, f"worst gap {worst:.2f}s — the loop was blocked")
 
+    print("  [13] a transient renewal failure is survived: the next tick reclaims the lease")
+    # b2's gate, per samclaude-admin and claude-wafer-services: zero errors across b1
+    # means the RECOVERY path has never run. Tolerance is not the question — at
+    # TTL 120 the interval is 30s and three misses are survivable — a path with
+    # margin is still a path with no evidence. So assert it rather than wait for it.
+    class FailsThenWorks:
+        def __init__(self, fail_times): self.n, self.fail_times, self.calls = 0, fail_times, []
+        def renew_lease(self, lease_id, ttl_seconds):
+            self.n += 1
+            self.calls.append(self.n)
+            if self.n <= self.fail_times:
+                raise http_error(503)
+            return {"extended_by_s": 60, "capped": False, "reason": "extended",
+                    "max_total_s": 1800, "expires_at": "2026-09-28T00:00:00Z"}
+
+    sc = FailsThenWorks(fail_times=1)
+    m = manager_holding("lease_recov", 200, sc)
+    first = logs_from(m._renew_pool_leases)          # tick 1: fails
+    check("the lease is KEPT after a failed renewal",
+          "lease_recov" in m._pool_leases, str(m._pool_leases))
+    check("and it warns rather than erroring — a transient is not a reap",
+          any(lvl == "warning" for lvl, _ in first)
+          and not any(lvl == "error" for lvl, _ in first), str(first))
+    second = logs_from(m._renew_pool_leases)         # tick 2: succeeds
+    check("the next tick reclaims it, extending",
+          any("+60s" in msg for _, msg in second), str(second))
+    check("both ticks actually reached the registry", sc.calls == [1, 2], str(sc.calls))
+
+    print("  [13b] two consecutive failures: still kept, still loud, never silently dropped")
+    # The client must never drop the lease itself. Losing it is the registry's TTL
+    # lapsing, which is the tolerance arithmetic below — not a decision this code
+    # makes. Dropping it would hand a busy single-slot pool to the next caller.
+    sc = FailsThenWorks(fail_times=2)
+    m = manager_holding("lease_recov2", 200, sc)
+    warns = 0
+    for _ in range(2):
+        warns += sum(1 for lvl, _ in logs_from(m._renew_pool_leases) if lvl == "warning")
+    check("still held after two consecutive failures",
+          "lease_recov2" in m._pool_leases, str(m._pool_leases))
+    check("and warned on each, not once and then silent", warns == 2, str(warns))
+    third = logs_from(m._renew_pool_leases)
+    check("and the third tick still recovers it",
+          any("+60s" in msg for _, msg in third), str(third))
+
+    print("  [13c] AT B2's REAL SETTINGS: tolerance is N-1 reliable plus one photo finish")
+    # The tick is NOT a free parameter at b2: min(60, 120*25%) = 30, so the 60s cap
+    # only binds above TTL 240. claude-wafer-services first read a 60s tick at
+    # TTL 600 as the interval, but 25% of 600 is 150, so the 60 was the CAP — one
+    # point on a curve read as a horizontal line.
+    #
+    # And their refinement, which applies to every row rather than just b2: whenever
+    # the TTL is a multiple of the tick, the LAST tolerated miss puts the rescuing
+    # attempt exactly on the expiry instant. So the honest reading is
+    # "N-1 reliable misses, plus one decided by clock agreement and whether a reap
+    # ran first" — not N comfortable ones. My earlier "30s of margin" was the
+    # TWO-miss case, not the three-miss case.
+    B2_TTL = 120
+    b2_iv = max(5, min(config.EXO_LEASE_RENEW_MAX_S,
+                       int(B2_TTL * config.EXO_LEASE_RENEW_PCT / 100)))
+    b2_tol = B2_TTL // b2_iv - 1
+    check(f"at b2 (TTL {B2_TTL}) the shipped formula gives a {b2_iv}s tick, not 60s",
+          b2_iv == 30, f"got {b2_iv}s")
+    check(f"nominal tolerance {b2_tol}", b2_tol == 3, f"got {b2_tol}")
+    check("of which RELIABLE misses is one fewer",
+          b2_tol - 1 == 2, f"{b2_tol - 1}")
+    check("because the last tolerated rescue lands ON the expiry, not before it",
+          b2_iv * (b2_tol + 1) == B2_TTL,
+          f"{b2_iv}*{b2_tol+1}={b2_iv*(b2_tol+1)} vs TTL {B2_TTL}")
+    check("while two misses leave a whole tick of margin",
+          B2_TTL - b2_iv * (b2_tol) >= b2_iv, f"{B2_TTL - b2_iv*b2_tol}s")
+    check("clause 2 still holds at b2", b2_iv * 3 <= B2_TTL * 0.8,
+          f"3*{b2_iv} vs {B2_TTL*0.8:.0f}")
+
+    print("  [13d] AT B2: survives TWO consecutive failures — the reliable case")
+    # samclaude-admin: assert survival at 2 and loss at 4. NOT at 3 — that is the
+    # photo finish, decided by clock agreement, and a test pinned to it is a flaky
+    # test waiting to happen.
+    sc = FailsThenWorks(fail_times=2)
+    m = manager_holding("lease_b2_survives", 200, sc)
+    warns, errs_during = 0, []
+    for _ in range(2):
+        seen = logs_from(m._renew_pool_leases)
+        warns += sum(1 for lvl, _ in seen if lvl == "warning")
+        errs_during += [msg for lvl, msg in seen if lvl == "error"]
+    check("held through both failures", "lease_b2_survives" in m._pool_leases, str(m._pool_leases))
+    check("warned on each, not once then silent", warns == 2, str(warns))
+    # This check was `check(..., True, "")` for one revision — a control that could
+    # not fail, which is the exact tell claude-wafer-services named for a table
+    # whose rows all agreed. It now reads the captured errors.
+    check("no error during either failure — two misses is survivable, not a loss",
+          errs_during == [], str(errs_during))
+    third = logs_from(m._renew_pool_leases)
+    check("and the third tick reclaims it",
+          any("+60s" in msg for _, msg in third), str(third))
+    check("with no error logged anywhere in the sequence",
+          not any(lvl == "error" for lvl, _ in third), str(third))
+
+    print("  [13e] AT B2: FOUR failures, past the expiry — the loss is loud and named")
+    # Once the registry has reaped, the next renewal 404s while we still hold the
+    # lease, which is #17's STILL HOLD branch. The loudness comes from there, so
+    # this asserts the sequence rather than assuming a detector this client
+    # does not have.
+    class FailsPastTheTTL:
+        def __init__(self, n_503): self.n, self.n_503 = 0, n_503
+        def renew_lease(self, lease_id, ttl_seconds):
+            self.n += 1
+            raise http_error(503) if self.n <= self.n_503 else http_error(404, REAPED_404_BODY)
+    sc = FailsPastTheTTL(n_503=4)               # 4 misses: past 120s at a 30s tick
+    m = manager_holding("lease_b2_lost", 200, sc)
+    warn_ticks, errs = 0, []
+    for _ in range(5):
+        seen = logs_from(m._renew_pool_leases)
+        warn_ticks += sum(1 for lvl, _ in seen if lvl == "warning")
+        errs += [msg for lvl, msg in seen if lvl == "error"]
+    check("warned on each of the four failures", warn_ticks == 4, str(warn_ticks))
+    check("then ONE error, not another warning", len(errs) == 1, str(errs))
+    check("naming the lease", errs and "lease_b2_lost" in errs[0], str(errs))
+    check("and saying STILL HOLD, so it reads as a reap not our own release",
+          errs and "STILL HOLD" in errs[0], str(errs))
+    check("still tracked, so shutdown attempts a release",
+          "lease_b2_lost" in m._pool_leases, str(m._pool_leases))
+    # Deliberately NOT asserted at 3 failures. And NOT asserted here at all: that
+    # the registry expired the row before granting the pool to anyone else. That is
+    # the registry's guarded UPDATE and reap ordering, pinned on the samcloud side
+    # (test_a_renewal_cannot_resurrect_a_lease_expired_under_it). A client test
+    # cannot see it, and claiming otherwise is the gap this crew keeps finding.
+
+    print("  [14] a killed renewer stops renewing — the lease must then lapse, not live on")
+    # samclaude-admin's b2 spec: kill the renewer with cancellation, never SIGTERM,
+    # because a clean shutdown RELEASES the lease and the test would pass while
+    # proving nothing about expiry.
+    async def killed_renewer():
+        real = config.EXO_LEASE_RENEW_INTERVAL_S
+        config.EXO_LEASE_RENEW_INTERVAL_S = 0.05
+        try:
+            sc2 = Recorder(reply={"extended_by_s": 60, "capped": False,
+                                  "reason": "extended", "max_total_s": 1800})
+            mm = manager_holding("lease_killed", 200, sc2)
+            task = asyncio.create_task(mm.pool_renewal_loop())
+            await asyncio.sleep(0.16)
+            before = len([c for c in sc2.calls if c[0] == "renew"])
+            task.cancel()                      # the SIGKILL analogue: no shutdown path
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            await asyncio.sleep(0.16)
+            after = len([c for c in sc2.calls if c[0] == "renew"])
+            return before, after, ("lease_killed" in mm._pool_leases)
+        finally:
+            config.EXO_LEASE_RENEW_INTERVAL_S = real
+
+    before, after, still_held = asyncio.run(killed_renewer())
+    check("the loop was renewing before the kill", before >= 1, str(before))
+    check("and sent NOTHING after it — so the lease will lapse at its expiry",
+          after == before, f"{before} -> {after}")
+    check("the lease is still in _pool_leases: nothing released it, which is the point",
+          still_held, "a cancelled renewer must not release — that is shutdown's job")
+
     print()
     if failed:
         print(f"  FAILED: {failed} failed, {passed} passed")

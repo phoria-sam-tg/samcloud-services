@@ -243,6 +243,37 @@ def main():
     except prompt_size.PromptTooLarge as e:
         check("estimate" in e.method, f"refused by estimate ({e.method})")
 
+    step(8, "the drift check reads a streamed usage chunk, not just a JSON body")
+    # hermes streams — established from the gateway log, where the only
+    # mid-stream events on a day I sent no chat requests sit inside hermes-only
+    # windows. So a drift check that lives on the non-streaming path only is a
+    # check on the client that does not matter.
+    lines = [
+        'data: {"choices":[{"delta":{"content":"hi"}}]}',
+        'data: {"choices":[],"usage":{"prompt_tokens":18118,"completion_tokens":7}}',
+        'data: [DONE]',
+        ': keep-alive',
+        '',
+    ]
+    found = [server._usage_prompt_tokens(l) for l in lines]
+    check(found == [None, 18118, None, None, None],
+          f"usage is picked out of the stream and nothing else is ({found})")
+    check(server._usage_prompt_tokens('data: {"usage": not json}') is None,
+          "a malformed chunk returns None rather than raising into the stream")
+
+    warned = []
+    real_warning = server.log.warning
+    server.log.warning = lambda msg, *a, **k: warned.append(str(msg))
+    try:
+        server._check_drift(11742, "chat template", 18118, MODEL)   # 1.54x, the real case
+        server._check_drift(11742, "chat template", 12000, MODEL)   # 1.02x, agreement
+        server._check_drift(None, "chat template", 18118, MODEL)    # nothing measured
+        server._check_drift(11742, "chat template", None, MODEL)    # no usage chunk
+    finally:
+        server.log.warning = real_warning
+    check(len(warned) == 1 and "1.54x" in warned[0],
+          f"warns once, on the gap that matters ({len(warned)} warning(s))")
+
     print(f"\n{'='*60}")
     if failures:
         print(f"  {len(failures)} FAILED:")

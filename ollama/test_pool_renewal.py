@@ -655,16 +655,42 @@ def main():
     b2_iv = max(5, min(config.EXO_LEASE_RENEW_MAX_S,
                        int(B2_TTL * config.EXO_LEASE_RENEW_PCT / 100)))
     b2_tol = B2_TTL // b2_iv - 1
-    check(f"at b2 (TTL {B2_TTL}) the shipped formula gives a {b2_iv}s tick, not 60s",
-          b2_iv == 30, f"got {b2_iv}s")
-    check(f"nominal tolerance {b2_tol}", b2_tol == 3, f"got {b2_tol}")
-    check("of which RELIABLE misses is one fewer",
-          b2_tol - 1 == 2, f"{b2_tol - 1}")
-    check("because the last tolerated rescue lands ON the expiry, not before it",
-          b2_iv * (b2_tol + 1) == B2_TTL,
-          f"{b2_iv}*{b2_tol+1}={b2_iv*(b2_tol+1)} vs TTL {B2_TTL}")
-    check("while two misses leave a whole tick of margin",
-          B2_TTL - b2_iv * (b2_tol) >= b2_iv, f"{B2_TTL - b2_iv*b2_tol}s")
+    # claude-wafer-services asked whether this derives or restates, and the first
+    # version RESTATED: it computed b2_iv and b2_tol from the live constants and then
+    # asserted `== 30`, `== 3`, `== 2`. Those fail if the fraction changes, so nothing
+    # passed silently — but they fail on the WRONG CLAIM, which invites the next
+    # person to update the literal instead of re-deriving the relationship. And the
+    # photo-finish clause was ASSERTED rather than made conditional: at a fraction
+    # that does not divide the TTL evenly the last miss gains real margin and the
+    # clause stops being true, so asserting it would then be asserting something
+    # false.
+    #
+    # So: assert the RELATIONSHIPS, and branch on divisibility rather than assuming
+    # it. No number below is written down except b2's TTL, which is the thing under
+    # test.
+    check("the cap does not bind at b2 — that is why the tick is not 60s",
+          b2_iv < config.EXO_LEASE_RENEW_MAX_S,
+          f"tick {b2_iv}s == cap {config.EXO_LEASE_RENEW_MAX_S}s, so the tick is capped here")
+    check(f"the tick ({b2_iv}s) is the fraction of the TTL, not the cap",
+          b2_iv == int(B2_TTL * config.EXO_LEASE_RENEW_PCT / 100), f"{b2_iv}")
+    divides = B2_TTL % b2_iv == 0
+    reliable = b2_tol - 1 if divides else b2_tol
+    if divides:
+        check("TTL is a multiple of the tick, so the LAST tolerated rescue lands on "
+              "the expiry instant — a photo finish, not a margin",
+              b2_iv * (b2_tol + 1) == B2_TTL,
+              f"{b2_iv}*{b2_tol+1} vs {B2_TTL}")
+        check(f"so RELIABLE misses is one fewer than nominal ({reliable} of {b2_tol})",
+              reliable == b2_tol - 1, f"{reliable}")
+    else:
+        check("TTL is NOT a multiple of the tick, so the last miss keeps real margin "
+              "and every tolerated miss is reliable",
+              reliable == b2_tol, f"{reliable} of {b2_tol}")
+    check("enough reliable misses to survive a transient outage of two ticks",
+          reliable >= 2, f"only {reliable} reliable — a single blip could lose the lease")
+    check("the last RELIABLE rescue leaves at least a whole tick of margin",
+          B2_TTL - b2_iv * (reliable + 1) >= b2_iv,
+          f"{B2_TTL - b2_iv*(reliable+1)}s vs one tick {b2_iv}s")
     check("clause 2 still holds at b2", b2_iv * 3 <= B2_TTL * 0.8,
           f"3*{b2_iv} vs {B2_TTL*0.8:.0f}")
 

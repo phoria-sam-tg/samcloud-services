@@ -38,8 +38,9 @@ from typing import Optional
 
 from . import capacity
 from . import config
+from . import prompt_size
 from .manager import (
-    ModelManager, Backend, VLM_PORT,
+    ModelManager, Backend, VLM_PORT, VLM_MODELS, vlm_installed,
     match_vlm_model, match_gguf_model, match_exo_tier,
 )
 from .exo_client import ExoUnavailable, ExoRequestFailed, ExoStalled
@@ -438,6 +439,32 @@ async def list_models_openai():
         if mm.backend != Backend.EXO:      # tiers already added under their tier name
             add(name, mm.backend.value)
 
+    # The VLM catalogue. Unlike the two catalogue reads below it needs no
+    # try/except: VLM_MODELS is a static dict in manager.py, not a backend that
+    # can be down. And unlike them it is the *only* record of what these models
+    # are -- an mlx-vlm model is not "pulled" and has no GGUF on disk, so if it
+    # is not listed from here it is not listed at all. That was the gap: the
+    # gateway has served vision since the mlx-vlm backend landed, and because
+    # the process is on-demand and unloads after COOLDOWN_SECONDS, `mgr.models`
+    # above held it only for the few minutes after a request. So discovery
+    # showed a text-only gateway to anyone who asked while it was idle, which
+    # is the same discovery-failure-on-a-working-backend this endpoint was
+    # added to fix (ticket #815).
+    #
+    # Listed by resolved id, not by alias, so the entry is the same string
+    # whether or not the model is resident -- load_vlm_model registers under
+    # the resolved id, so a loaded VLM has already added itself above and
+    # `seen` collapses the two. The alias ("qwen2.5-vl") still resolves on
+    # request; match_vlm_model takes either.
+    #
+    # Only the ones whose weights are on disk, which is what "can be asked for"
+    # means for the other two local backends as well -- see vlm_installed for
+    # why an uninstalled VLM is worse than merely slow. `/models` lists the
+    # whole catalogue with the flag, so nothing is hidden from an operator.
+    for info in VLM_MODELS.values():
+        if vlm_installed(info["default"]):
+            add(info["default"], Backend.VLM.value)
+
     try:
         for m in mgr.ollama.list_models():
             add(m.get("name", ""), "ollama")
@@ -469,6 +496,19 @@ async def list_models():
         },
         "available_ollama": [m["name"] for m in mgr.ollama.list_models()],
         "available_gguf": mgr.llama.available_models(),
+        # Both names, because they are not interchangeable to a caller: the
+        # alias survives a change of `default` in the catalogue, the resolved
+        # id is what a request actually gets and what `managed` above keys on.
+        "available_vlm": [
+            {"alias": alias, "model": info["default"],
+             "memory_mb": info["memory_mb"],
+             # Weights on disk. False means a request for it would download
+             # first, uncapped and unmeasured -- so it is absent from
+             # /v1/models, but named here so the gap is visible rather than
+             # looking like the model was never configured.
+             "installed": vlm_installed(info["default"])}
+            for alias, info in VLM_MODELS.items()
+        ],
         "exo_pool": await _exo_pool_view(),
     }
 
@@ -559,14 +599,49 @@ def _busy_503(e: "capacity.PoolBusy") -> HTTPException:
     return HTTPException(status_code=503, detail=e.as_dict(), headers=headers or None)
 
 
+def _prompt_too_large_413(e: "prompt_size.PromptTooLarge") -> HTTPException:
+    """The prompt is too big for this host to prefill. 413, with the limit named.
+
+    413 rather than 400 because the request is well-formed and the problem is
+    its size, and rather than 503 because retrying unchanged will never work —
+    the three declines a pool caller can meet (`too big`, `busy`, `not there`)
+    should be distinguishable without parsing prose, and only one of them is
+    worth waiting out.
+
+    No `Retry-After`. Nothing about this host will change in a minute that makes
+    a 100k-token prompt safe.
+    """
+    log.warning(
+        f"Refused a prompt for the pool: {e.tokens} tokens by {e.method}, "
+        f"limit {e.limit} (#837)"
+    )
+    return HTTPException(status_code=413, detail=e.as_dict())
+
+
+def _exo_completion_budget(model_id: str, requested: Optional[int]) -> int:
+    """How many tokens the answer may add to the same KV cache.
+
+    Mirrors the cap arithmetic on the serving path below — a caller may ask for
+    less than the cap, never for more — so the number quoted in a refusal is the
+    number that would actually have been sent.
+    """
+    cap = mgr.exo_request_defaults(model_id).get("max_tokens")
+    if cap is None:
+        return requested or 0
+    return min(requested, cap) if requested else cap
+
+
 def _pool_unavailable_503(e: Exception) -> HTTPException:
     """The pool is not there — distinct from it being busy.
 
     Deliberately not a 404: the tier is configured and real, so "no such model"
     would send a caller looking for a typo. And deliberately not a retry hint —
-    the pool cannot restart itself after a reboot (a headless launch is denied
-    local-network access on macOS), so a swap or a relaunch needs a human at a
-    Terminal and a tight retry loop would just spin.
+    the gateway does not place the pool's model, so a swap needs an operator and
+    a tight retry loop would just spin.
+
+    The relaunch half of that used to be true as well, and is not: a node no
+    longer needs a human at a Terminal (see `config.EXO_BASE`). Under launchd it
+    restarts itself; what it cannot do is place a model.
     """
     log.warning(f"Pool unavailable: {e}")
     return HTTPException(status_code=503, detail={
@@ -575,8 +650,9 @@ def _pool_unavailable_503(e: Exception) -> HTTPException:
         "resource_id": config.EXO_RESOURCE_ID,
         "endpoint": config.EXO_BASE,
         "note": (
-            "the exo pool is placed out of band and cannot start itself after a "
-            "reboot; it needs to be launched from a Terminal on the host"
+            "the exo pool's model is placed out of band — the gateway does not "
+            "place it. The nodes themselves are supervised and need no human at "
+            "a Terminal; ask whoever operates the pool to place a model on it"
         ),
     })
 
@@ -900,6 +976,45 @@ async def _watch_disconnect(request: Optional[Request], poll_s: float = 2.0):
         await asyncio.sleep(poll_s)
 
 
+def _openai_shape_vlm(data: dict) -> dict:
+    """Give mlx-vlm's reply the shape this gateway's other backends return.
+
+    Measured 2026-09-24 on this box, same prompt to each backend: the Ollama
+    path builds `usage.prompt_tokens`/`completion_tokens` and sets
+    `choices[].index` (see the chunk assembly above); mlx-vlm answers with
+    `usage.input_tokens`/`output_tokens` and no `index`. So a caller reading
+    `usage.prompt_tokens` -- which is what the OpenAI SDKs read -- got a number
+    from every text model here and `None` from the only vision one, for the
+    same request shape. Backends should not be tellable apart by the envelope.
+
+    mlx-vlm's own keys are kept beside the OpenAI ones rather than renamed
+    away: `input_tokens`, and the `prompt_tps`/`generation_tps`/`peak_memory`
+    it reports and the others do not, are real measurements and cost nothing to
+    carry. Unknown keys are ignored by OpenAI clients.
+
+    Not touched: `id`, `object` and `created`, which mlx-vlm omits -- and so
+    does the Ollama path, so adding them here would make the vision backend the
+    odd one out in the other direction. That gap is real but fleet-wide, and
+    belongs in one change across every backend rather than in this one.
+    """
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        if "prompt_tokens" not in usage and "input_tokens" in usage:
+            usage["prompt_tokens"] = usage["input_tokens"]
+        if "completion_tokens" not in usage and "output_tokens" in usage:
+            usage["completion_tokens"] = usage["output_tokens"]
+        if "total_tokens" not in usage:
+            have = usage.get("prompt_tokens"), usage.get("completion_tokens")
+            if all(isinstance(v, int) for v in have):
+                usage["total_tokens"] = sum(have)
+
+    for i, choice in enumerate(data.get("choices") or []):
+        if isinstance(choice, dict):
+            choice.setdefault("index", i)
+
+    return data
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest, http_request: Request = None):
     mm = await _resolve_model(req.model)
@@ -993,6 +1108,34 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
             }
 
     elif mm.backend == Backend.EXO:
+        # Measure the prompt BEFORE anything else happens to it (ticket #837).
+        # Before the lease, before the wedge guard, before a byte reaches exo:
+        # a prompt large enough to panic the host must cost the host nothing at
+        # all, and a refusal that had to take an exclusive lease to say no would
+        # be its own small outage. This is the check that was missing when a
+        # 108,753-token prompt came through here and took slice down for three
+        # hours.
+        try:
+            n_tokens, how = prompt_size.check(
+                req.messages,
+                mm.name,
+                limit=config.EXO_MAX_PROMPT_TOKENS,
+                completion_budget=_exo_completion_budget(mm.name, req.max_tokens),
+                models_dir=config.EXO_MODELS_DIR,
+                chars_per_token=config.EXO_CHARS_PER_TOKEN,
+                resource_id=config.EXO_RESOURCE_ID,
+                # Tools are part of the prompt, not metadata alongside it: this
+                # model's template renders every definition inline. Measured on
+                # live traffic, leaving them out read a request as 11,742 tokens
+                # that exo then prefilled as 18,118 — 900 tokens short of the
+                # level that panicked the host.
+                tools=req.tools,
+            )
+        except prompt_size.PromptTooLarge as e:
+            raise _prompt_too_large_413(e)
+        log.info(f"Pool prompt: {n_tokens} tokens by {how} "
+                 f"(limit {config.EXO_MAX_PROMPT_TOKENS})")
+
         # exo speaks OpenAI already, so this is a proxy and not a translation:
         # no native-format detour, no tool-call reshaping, no system-prompt
         # injection. What this branch adds over a bare reverse proxy is the
@@ -1066,6 +1209,10 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                 try:
                     async for line in mgr.exo.chat_stream(
                         mm.name, req.messages,
+                        # The gate has already counted this prompt (#837), so the
+                        # first-token deadline can scale to it instead of falling
+                        # back to the whole-request budget. #830.
+                        prompt_tokens=n_tokens,
                         **{k: v for k, v in payload.items()
                            if k not in ("model", "messages", "stream")}
                     ):
@@ -1087,12 +1234,15 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                     # stalled instance hits the same stuck runner, and what the
                     # caller should do is wait for the guard to rebuild it.
                     log.error(
-                        f"Pool STALLED mid-stream for {mm.name}: {e.tokens} chunks "
-                        f"then {e.silent_for:.0f}s of silence — releasing the lease "
-                        f"so the placement guard can recover the instance"
+                        f"Pool STALLED mid-stream for {mm.name} on the {e.phase} "
+                        f"deadline ({e.deadline:.0f}s): {e.tokens} chunks then "
+                        f"{e.silent_for:.0f}s of silence — releasing the lease so "
+                        f"the placement guard can recover the instance"
                     )
                     yield "data: " + json.dumps({
                         "error": {"message": str(e), "type": "pool_stalled",
+                                  "deadline": e.phase,
+                                  "deadline_s": round(e.deadline, 1),
                                   "tokens_before_stall": e.tokens,
                                   "silent_for_s": round(e.silent_for, 1)},
                     }) + "\n\n"
@@ -1136,6 +1286,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                 gen = asyncio.ensure_future(mgr.exo.chat_collect(
                     mm.name,
                     req.messages,
+                    prompt_tokens=n_tokens,
                     **{k: v for k, v in payload.items()
                        if k not in ("model", "messages", "stream")},
                 ))
@@ -1166,6 +1317,18 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                         "message": "caller went away before the pool answered",
                     })
                 data = gen.result()
+                # What we measured against what exo actually prefilled. The gate
+                # is only as good as this agreement: counting `messages` alone
+                # once read 11,742 for a prompt exo prefilled as 18,118, and
+                # nothing in the logs said so. A drift warning turns the next
+                # such gap into a line someone can find.
+                actual = ((data or {}).get("usage") or {}).get("prompt_tokens")
+                if actual and n_tokens and actual > n_tokens * 1.15:
+                    log.warning(
+                        f"Prompt measured {n_tokens} tokens by {how}, exo prefilled "
+                        f"{actual} ({actual / n_tokens:.2f}x). The gate is counting "
+                        f"less than the model is reading — #837"
+                    )
             finally:
                 mgr.release_pool(lease_id)
         except capacity.PoolBusy as e:
@@ -1177,12 +1340,19 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
             # and retrying this one lands on the same stuck instance until the
             # placement guard rebuilds it (#830).
             log.error(
-                f"Pool STALLED for {mm.name}: {e.tokens} chunks then "
-                f"{e.silent_for:.0f}s of silence — lease released, the guard "
-                f"should now see an unleased busy pool and rebuild it"
+                f"Pool STALLED for {mm.name} on the {e.phase} deadline "
+                f"({e.deadline:.0f}s): {e.tokens} chunks then {e.silent_for:.0f}s "
+                f"of silence — lease released, the guard should now see an unleased "
+                f"busy pool and rebuild it"
             )
             raise HTTPException(status_code=504, detail={
                 "error": "pool_stalled",
+                # Which deadline fired, named in the response as well as the log:
+                # "first_token" is a prefill that never produced, "inter_token" a
+                # decode that stopped. A caller retrying learns nothing from the
+                # status code alone, and these have different expected durations.
+                "deadline": e.phase,
+                "deadline_s": round(e.deadline, 1),
                 "message": str(e),
                 "tokens_before_stall": e.tokens,
                 "silent_for_s": round(e.silent_for, 1),
@@ -1332,7 +1502,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                     if tool_calls:
                         data["choices"][0]["message"]["tool_calls"] = tool_calls
                         data["choices"][0]["finish_reason"] = "tool_calls"
-                return data
+                return _openai_shape_vlm(data)
 
 
 @app.post("/v1/completions")

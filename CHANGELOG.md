@@ -2,6 +2,161 @@
 
 Project history and current state. This is a living document.
 
+## 2026-09-25 — The gateway now measures a prompt before it dispatches it (#837)
+
+- **What happened.** slice kernel-panicked at 11:50:43 and was down about three
+  hours. A 108,753-token prompt arrived through this gateway, exo began
+  prefilling it, and at 47,104 tokens macOS's GPU driver panicked the host
+  instead of failing the allocation: `completeMemory() prepare count underflow`
+  @IOGPUMemory.cpp:492, wired ~53 GB of 64, free 62 MB, `memoryPressure false`.
+  The driver bug is Apple's. Reaching it from userspace with a large enough
+  prompt was ours, and until this change any client that could POST to :8800
+  could do it.
+- **Measured, because the shape is not the obvious one.** Cold prefill through
+  the gateway, `max_tokens=1`, `vm_stat` sampled every second, on the current
+  2-node placement (slice carries layers 13-47, wafer 0-13). Slice idle with the
+  model resident: 21.2 GB wired, 23.0 GB available.
+
+  | prompt tokens | peak wired | over baseline | available at peak |
+  |---|---|---|---|
+  | 4,096 | 24.7 GB | +3.5 GB | 21.1 GB |
+  | 8,192 | 29.3 GB | +8.1 GB | ~17 GB |
+  | 16,384 | 46.1 GB | +24.9 GB | 8.5 GB |
+
+  **Four times the tokens cost seven times the memory.** A limit picked by
+  intuition — or by dividing the panic by a per-token rate — lands in the wrong
+  place. Fitting `peak = 21.2 + 6.32e-4*N + 5.41e-8*N^2` (GB, N tokens)
+  reproduces the 8,192 point to within 0.8 GB and puts the panic level (53 GB)
+  at about **19,000 tokens**. One prompt, no other load.
+- **The inference, kept apart from the measurement.** The linear term looks like
+  the KV cache itself (this model caches the MLA latent, 576 values per token
+  per layer); the quadratic term looks like the attention score matrix
+  materialised per prefill chunk over the whole sequence so far and retained by
+  MLX's buffer cache. What would disconfirm it: a run where peak memory tracks
+  tokens linearly, or one where `mx.clear_cache()` between chunks flattens it.
+- **`EXO_MAX_PROMPT_TOKENS = 12288`**, predicted peak 36.8 GB — 16 GB below the
+  level that panicked the host, with room for the 8,192-token answer that
+  decodes into the same cache. Over it: **413 `prompt_too_large`**, naming the
+  limit, the measurement, and which method produced it. Not 400 (the request is
+  well-formed), not 503 (retrying unchanged will never work), no `Retry-After`
+  (nothing about this host changes in a minute).
+- **The refusal costs the pool nothing.** It happens before the lease, before
+  the wedge guard, before a byte reaches exo — a decline that had to take an
+  exclusive lease to say no would be its own small outage. `test_prompt_size`
+  spies on both and asserts neither is touched.
+- **Every refusal says the limit is about the host.** GLM-4.7-Flash advertises
+  202,752 tokens and exo will try to serve them; the constraint is two Macs. A
+  caller told only "too long" reasonably goes looking for a longer-context
+  model, and there is one — this same model.
+- **Counting.** The resident model's own `tokenizer.json`, read off the exo
+  models directory, so the gateway counts with the tokenizer that will prefill.
+  Missing tokenizer falls back to chars/1.5 — the densest ratio measured across
+  prose (4.50), Python (3.86), JSON (3.38), logs (2.76), CJK (2.00) and
+  base64-like text (1.50) — which over-counts prose about 3x. That is the safe
+  direction, and the refusal names the method so the over-count is legible. A
+  body past `limit x longest-vocab-token` is refused without tokenizing at all.
+- **The other box is tighter in a different way.** wafer carries 13 of 47 layers
+  with 36 GB total, and was measured at 14.0 GB available with 17.0 of 18.4 GB
+  of swap already in use. A limit sized only off slice is not automatically safe
+  for wafer.
+- **Measured passively while real traffic ran, and this is the part that
+  matters:** hermes-exo's ordinary turns on a 32,241-token conversation, served
+  95-99% from exo's KV prefix cache, took slice to **47.55 GB wired with 7.65 GB
+  available** — 5.5 GB short of the panic, with no experiment running. A warm
+  prompt is cheap and the same prompt cold is not, and nothing at request time
+  can tell you which one is about to happen.
+
+## 2026-09-24 — Vision was already served; it was never listed (#815)
+
+- **The mlx-vlm backend has worked the whole time.** #815 asked for an
+  image-capable model on the gateway, reporting `/v1/models` as text-only.
+  Measured: `mlx-community/Qwen2.5-VL-7B-Instruct-4bit` cold-loads and
+  classifies a 900px photo in ~8.5s through `/v1/chat/completions` with
+  `image_url` parts, by alias (`qwen2.5-vl`) and by resolved id. Nothing about
+  the serving path needed changing.
+- **`/v1/models` never enumerated `VLM_MODELS`.** It read the exo tiers, the
+  resident models, the Ollama catalogue and the GGUFs — every source but the
+  static dict that is the *only* record of the VLM backend. A VLM is not
+  "pulled" and has no file on disk, and the process is on-demand, so the
+  resident-models pass held it for a few minutes after a request and no longer.
+  Ask while idle and the gateway looked text-only. Same failure this endpoint
+  was added to fix, one backend over.
+- **Advertise only what is installed.** `vlm_installed()` checks the HF cache,
+  reading the same env huggingface_hub reads. `capacity.py` measures RAM and
+  nothing measures disk: gemma-4-31b's 18700MB *fit in RAM* here against 15GB
+  free disk and ~18.7GB of unfetched weights, and no load path would have
+  refused it — mlx-vlm downloads on demand and the box would have run out of
+  disk first. `/models` carries the full catalogue with an `installed` flag so
+  the gap is visible rather than silently absent.
+- **The vision envelope now matches the others.** mlx-vlm answers
+  `usage.input_tokens`/`output_tokens` and omits `choices[].index`; the Ollama
+  path builds `prompt_tokens`/`completion_tokens` and sets `index`. A caller
+  reading `usage.prompt_tokens` — what the OpenAI SDKs read — got a number from
+  every text model and `None` from the only vision one. Both key sets are
+  carried now. Still missing fleet-wide, and deliberately not fixed here:
+  `id`, `object`, `created`, which *no* backend on this gateway emits.
+- **Weights cost disk.** Qwen2.5-VL-7B-4bit is 5.3GB and took the box from 21GB
+  to 15GB free (99% full). Fetching gemma-4-31b here is not currently possible.
+- **What the first real caller measured** (claude-assistant, building the family
+  inventory classification pass on #815; their numbers, not ours, reported
+  2026-09-24). Recorded here because all three are properties of the model as
+  this gateway serves it, and the next caller writing a structured-list prompt
+  meets them on photo one.
+  - **`temperature: 0` looped.** A cluttered-shelf photo emitted
+    `plastic storage containers` 40 times with identical `detail`, spending the
+    whole 2400-token budget on one object. The same photo at `temperature: 0.2`
+    returned a clean list. Their reading of *why* — that at t=0 the degenerate
+    repeat is the argmax with nothing to break the tie — is inference, and is
+    theirs; what is measured is the two runs. Not reproduced on our side, and
+    our own test photo is too sparse to try it against. Worth knowing before
+    recommending t=0 for determinism on a list-shaped ask.
+  - **Latency here is output-bound, not load-bound.** 9.8s warm for a 16-item
+    reply against the 3.0s we measured for a 4-item one, same warm process.
+    Ours was right and unrepresentative: a cluttered photo runs ~20 objects at
+    ~40 tokens each. Plan a pass at ~10s/photo, not 3 — ~100 photos is nearer
+    15 minutes than 5, which is the number we gave on the ticket and should not
+    have.
+  - **Truncation is the normal case on a cluttered photo**, not an error case.
+    Their parser salvages every complete object out of a cut-off `items` array
+    rather than failing the photo. The token budget, not the model, is the
+    binding constraint.
+  - Scoping the system prompt to portable objects fixed the "tree and grass"
+    drift we saw, with occasional leakage ("window" on an office shot), and the
+    model marks genuine unknowns low-confidence when asked to.
+- **The envelope gap stays open, at the caller's request.** No backend here emits
+  `id`/`object`/`created`. The one consumer that could have been bitten parses the
+  JSON directly and declined a fleet-wide change on its account — better driven by
+  whatever meets it first than by a hypothetical. Left as is, deliberately.
+
+## 2026-09-22 — The exo pool moved out of `sam`, and the Terminal.app limitation was wrong
+
+- **The pool runs headless under the services accounts** (ticket #806). One node
+  per box, each as that box's own OS service user — `claude-services` on slice,
+  `wafer-services` on wafer — from a shared store at `/Users/Shared/exo`
+  (`models`, `hf`, `uv-cache`, `src`), setgid `staff`.
+- **The "must be launched from Terminal.app" limitation recorded on 2026-06-14
+  does not hold for a services account.** Measured 2026-09-22 on slice as
+  `claude-services`, spawned by sshd, no GUI session and no Terminal: UDP
+  multicast receive on exo's discovery group `ff12::e0a1:de89` port 52413 joined
+  on all 14 interfaces and took 23 announcement packets from the same peers
+  `sam` sees, in the same 12 seconds. A node started that way discovered its
+  peer and the ring formed, both ends reporting 2 nodes and 2 connections. The
+  earlier claim was about the GUI launchd *agent* domain; it was never tested
+  for a service user. Still untested: the LaunchDaemon domain specifically.
+- **`EXO_BASE` is `http://localhost:52415`**, not a pinned LAN address. It had
+  been `192.168.1.3` — one of wafer's *secondary* interface addresses, which
+  answered, and which hard-coded the pool to one node. Each box now runs a node,
+  so localhost is the honest address and it survives either box holding master.
+- **Read `/state` from both nodes before concluding one is out of the ring.** A
+  node that has just joined an established master serves an incomplete and stale
+  replica — measured on slice as a worker: `topology.nodes` listed only the
+  *other* node, with a `lastSeen` a day old, while the master listed both
+  correctly. It lists itself the moment it holds master. Believe the end that
+  lists itself.
+- **What still needs a human is placement, not launch.** The gateway does not
+  place the pool's model and a 503 from the tier now says so, rather than
+  telling the reader to go and find a keyboard.
+
 ## 2026-09-20 — Capacity migration committed, and the two boxes reconciled
 
 - **The capacity gate is in git.** It had been running in production on both

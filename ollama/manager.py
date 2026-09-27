@@ -681,9 +681,10 @@ class ModelManager:
     def _is_vlm_server(pid: int) -> bool:
         """True only if `pid` is genuinely a `python -m mlx_vlm.server` we own.
 
-        Checks the uid and requires `-m mlx_vlm.server` as adjacent whitespace-
-        delimited argv tokens — the exact shape load_vlm_model spawns. A process
-        whose command line merely contains the string does not qualify.
+        Checks three things, all of which the real process satisfies and a
+        coincidental `pgrep -f` match does not: our uid, `argv[0]` equal to
+        VLM_PYTHON, and `-m mlx_vlm.server` as adjacent whitespace-delimited
+        argv tokens. That is exactly the shape load_vlm_model spawns.
         """
         try:
             out = subprocess.run(
@@ -702,6 +703,19 @@ class ModelManager:
         except ValueError:
             return False
         toks = cmd.split()
+        if not toks:
+            return False
+        # Adjacent `-m mlx_vlm.server` tokens are NOT sufficient on their own,
+        # because they are also genuine arguments to other commands:
+        # `grep -- -m mlx_vlm.server .` carries both, adjacent, under our own
+        # uid, and the caller SIGTERMs whatever this returns True for. Only
+        # argv[0] says what a process was EXECUTED AS, and load_vlm_model execs
+        # VLM_PYTHON by exactly this string (see its Popen list below).
+        # Asserted by test_vlm_kill_guard.py: without this check, cases [2],
+        # [5] and [8] fail — a grep, a foreign interpreter, and a grep sharing
+        # the table with the real server all get SIGTERMed.
+        if toks[0] != VLM_PYTHON:
+            return False
         return any(
             t == "-m" and toks[i + 1] == "mlx_vlm.server"
             for i, t in enumerate(toks[:-1])

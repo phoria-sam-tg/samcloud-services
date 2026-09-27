@@ -1575,20 +1575,33 @@ class ModelManager:
                         f"held: +{extended}s, expires {resp.get('expires_at')} "
                         f"(renewing every {config.EXO_LEASE_RENEW_INTERVAL_S}s)"
                     )
-                else:
-                    # Accepted and extended NOTHING. The ceiling is computed from
-                    # granted_at, so asking for another EXO_LEASE_TTL on a lease
-                    # granted for exactly that always caps to its existing expiry.
-                    # Expected throughout stage (a) — but it must not print as an
-                    # extension, because a renewal that silently does nothing
-                    # reads exactly like one that silently failed, and that is the
-                    # shape of every defect this ticket has turned up.
+                elif resp.get("capped"):
+                    # Accepted and extended NOTHING because the ceiling bound it.
+                    # The ceiling runs from granted_at, so asking for another
+                    # EXO_LEASE_TTL on a lease granted for exactly that always
+                    # caps to its existing expiry. Expected throughout stage (a) —
+                    # but it must not print as an extension, because a renewal
+                    # that silently does nothing reads exactly like one that
+                    # silently failed.
                     log.info(
                         f"Pool lease {lease_id} renewal accepted after {shown} "
                         f"held, NO extension (capped at the "
                         f"{resp.get('max_total_s')}s ceiling; granted TTL is "
                         f"{EXO_LEASE_TTL}s). Expected until #827 stage (b) "
                         f"lowers the granted TTL below the ceiling."
+                    )
+                else:
+                    # Extended nothing and was NOT capped — the two are not the
+                    # same thing and assuming they were is how the branch above
+                    # would have mislabelled an indefinite lease as ceiling-bound.
+                    # The registry returns this shape when a lease has no expiry
+                    # at all ("nothing to renew"). This gateway always grants with
+                    # a TTL so it should be unreachable, and "should be" is the
+                    # phrase that has been wrong all day, so it says what it saw.
+                    log.warning(
+                        f"Pool lease {lease_id} renewal after {shown} held "
+                        f"extended nothing and was not capped: {resp.get('note') or resp}. "
+                        f"Unexpected — this gateway always grants with a TTL."
                     )
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:
@@ -1601,6 +1614,20 @@ class ModelManager:
                         f"{shown} held — it was reaped while the generation was "
                         f"still running, so the pool is no longer exclusively "
                         f"ours. Check the lease TTL against #827 staging."
+                    )
+                elif e.response.status_code in (403, 422):
+                    # Not transient. 403 means our identity is not the lease's
+                    # holder; 422 means we are sending a body the model rejects.
+                    # Either way renewal will fail identically every 60s forever,
+                    # so liveness is not in force at all while looking like it is
+                    # — the precise failure #843 was. As loud as a reap.
+                    log.error(
+                        f"Pool lease renewal is NOT WORKING: {lease_id} after "
+                        f"{shown} held answered {e.response.status_code} "
+                        f"({'not the holder' if e.response.status_code == 403 else 'bad request body'}). "
+                        f"This will repeat every "
+                        f"{config.EXO_LEASE_RENEW_INTERVAL_S}s and no lease is "
+                        f"being kept alive. #827."
                     )
                 else:
                     log.warning(

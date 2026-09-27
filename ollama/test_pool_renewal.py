@@ -144,6 +144,22 @@ def main():
     check("it reports the extension", "+60s" in line2, line2)
     check("and does not claim there was none", "NO extension" not in line2, line2)
 
+    print("  [2d] no extension and NOT capped is a different thing, and says so")
+    # The registry returns extended_by_s 0 with capped False for a lease that has
+    # no expiry at all. Treating "no extension" as "ceiling" would mislabel it —
+    # the same assumption-in-a-branch that the else-clause above used to make.
+    sc = Recorder(reply={"extended_by_s": 0, "capped": False, "max_total_s": 1800,
+                         "note": "indefinite lease — nothing to renew"})
+    m = manager_holding("lease_B3", 140, sc)
+    seen = logs_from(m._renew_pool_leases)
+    line3 = next((msg for lvl, msg in seen if "140s held" in msg), "")
+    check("it does not claim the ceiling capped it",
+          "ceiling" not in line3, line3)
+    check("it warns rather than reporting business as usual",
+          any(lvl == "warning" and "140s held" in msg for lvl, msg in seen), str(seen))
+    check("and it repeats what the registry actually said",
+          "nothing to renew" in line3, line3)
+
     print("  [3] a failed renewal KEEPS the lease — dropping it is worse")
     sc = Recorder(renew=http_error(503))
     m = manager_holding("lease_C", 90, sc)
@@ -163,6 +179,21 @@ def main():
           errs and "no longer exclusively" in errs[0], str(errs))
     check("the lease is still tracked, so shutdown still tries to release it",
           "lease_D" in m._pool_leases, str(m._pool_leases))
+
+    print("  [4b] 403 and 422 are NOT transient: renewal is simply not working")
+    # These repeat identically every interval. Liveness would be off while the
+    # code looks like it is running — #843 exactly. So they are errors, not
+    # warnings, and they say that nothing is being kept alive.
+    for code, word in ((403, "not the holder"), (422, "bad request body")):
+        sc = Recorder(renew=http_error(code))
+        m = manager_holding(f"lease_{code}", 150, sc)
+        seen = logs_from(m._renew_pool_leases)
+        errs = [msg for lvl, msg in seen if lvl == "error"]
+        check(f"{code} is logged at error", len(errs) == 1, str(seen))
+        check(f"{code} says renewal is not working and names why",
+              errs and "NOT WORKING" in errs[0] and word in errs[0], str(errs))
+        check(f"{code} still keeps the lease",
+              f"lease_{code}" in m._pool_leases, str(m._pool_leases))
 
     print("  [5] a released lease is not renewed, and leaves no bookkeeping behind")
     sc = Recorder()

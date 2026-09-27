@@ -179,6 +179,19 @@ class SamcloudClient:
         r.raise_for_status()
         return r.json()
 
+    def verify_token(self) -> dict:
+        """Who this client's bearer actually is.
+
+        Used at startup to log the gateway's identity (#845). `SC_TOKEN source:
+        file <path>` proves a file was read, not that it held the right bearer —
+        and the wrong bearer here is a seat token with wider scopes than the
+        service is entitled to, which fails no check and shows up in no log.
+        This is the call that makes it visible.
+        """
+        r = self._http.get("/auth/verify")
+        r.raise_for_status()
+        return r.json()
+
     def get_service(self, service_id: str) -> dict:
         r = self._http.get(f"/services/{service_id}")
         r.raise_for_status()

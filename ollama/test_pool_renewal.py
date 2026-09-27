@@ -177,6 +177,19 @@ def main():
           config.EXO_LEASE_TTL >= config.EXO_GENERATE_TIMEOUT + 300,
           f"ttl={config.EXO_LEASE_TTL} gen={config.EXO_GENERATE_TIMEOUT}")
 
+    print("  [9] two missed renewals leave real slack, not 3 seconds of it")
+    # Stage (b)'s invariant is TTL >= 3 * interval. Because the interval is a
+    # fraction of the TTL, that invariant is nearly a tautology and does no work
+    # unless the fraction is small enough: at 33% the third attempt lands at 98%
+    # of the lease, and one slow registry answer (10s timeout) loses it. This is
+    # the assertion that would fail if someone raised the percentage back.
+    for ttl in (120, 300, 1800):
+        iv = max(5, min(config.EXO_LEASE_RENEW_MAX_S,
+                        int(ttl * config.EXO_LEASE_RENEW_PCT / 100)))
+        third = iv * 3
+        check(f"at TTL={ttl}s the third attempt is at {third}s, <=80% of the lease",
+              third <= ttl * 0.8, f"interval={iv} third={third} ttl={ttl}")
+
     print()
     if failed:
         print(f"  FAILED: {failed} failed, {passed} passed")

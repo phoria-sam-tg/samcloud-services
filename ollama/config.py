@@ -253,7 +253,21 @@ if EXO_LEASE_TTL < EXO_GENERATE_TIMEOUT + _EXO_TTL_MARGIN:
 #
 # An integer percent, not a float: `float("")` raises, and an env var set to
 # empty is the commonest way an operator "unsets" one.
-EXO_LEASE_RENEW_PCT = _env_int("EXO_LEASE_RENEW_PCT", 33)
+#
+# 25, not 33, and the reason is arithmetic rather than taste. Stage (b)'s
+# invariant is TTL >= 3 * interval, so that two missed renewals still leave a
+# third attempt inside the lease. But the interval is itself a fraction of the
+# TTL, so that invariant is nearly a TAUTOLOGY and does no work at 33%:
+#
+#   TTL=120  pct=33  ->  interval 39  attempts at 39/78/117   3s of slack
+#   TTL=120  pct=25  ->  interval 30  attempts at 30/60/90   30s of slack
+#
+# At 33% the third attempt lands at 98% of the lease. This gateway's registry
+# calls carry a 10s timeout, so one slow answer on that third attempt loses the
+# lease outright — and losing it means the pool becomes grantable while we are
+# still generating, which is the failure renewal exists to prevent. 25% puts the
+# third attempt at 75% and leaves a quarter of the TTL spare.
+EXO_LEASE_RENEW_PCT = _env_int("EXO_LEASE_RENEW_PCT", 25)
 EXO_LEASE_RENEW_PCT = min(90, max(10, EXO_LEASE_RENEW_PCT))
 
 # Capped, for two reasons. A third of 1800s is 594s, so today only the five

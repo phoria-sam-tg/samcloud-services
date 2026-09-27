@@ -194,7 +194,33 @@ def main():
     except prompt_size.PromptTooLarge as e:
         check(True, f"a two-word prompt with oversized tools is refused ({e.tokens} tokens)")
 
-    step(5, "an absurd body is refused without being tokenized")
+    step(5, "a tool-calling conversation still counts through the template")
+    # OpenAI specifies `arguments` as a JSON string and hermes sends one. The
+    # template does `tc.arguments.items()`, so the string lost the render and
+    # the count fell to the serialised fallback — which on this shape measured
+    # 126 tokens against the template's 29. A 4x over-count is how a legitimate
+    # prompt gets refused, so this asserts the method, not just a number.
+    convo = [
+        {"role": "user", "content": "what is the weather"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "get_weather", "arguments": '{"city": "Melbourne"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "17C and raining"},
+    ]
+    n_convo, how_convo = prompt_size.count(convo, MODEL, config.EXO_MODELS_DIR,
+                                           config.EXO_CHARS_PER_TOKEN)
+    check(how_convo == "chat template",
+          f"tool_calls with string arguments render ({how_convo}, {n_convo} tokens)")
+    # Unparseable arguments are left alone and the fallback takes it: a wrong
+    # count in the safe direction beats a fabricated one.
+    broken = [dict(convo[1], tool_calls=[{"id": "c1", "type": "function", "function": {
+        "name": "f", "arguments": "not json at all"}}])]
+    _, how_broken = prompt_size.count(broken, MODEL, config.EXO_MODELS_DIR,
+                                      config.EXO_CHARS_PER_TOKEN)
+    check(how_broken == "serialised",
+          f"arguments that will not parse fall back rather than guess ({how_broken})")
+
+    step(6, "an absurd body is refused without being tokenized")
     huge = [{"role": "user", "content": "x" * (config.EXO_MAX_PROMPT_TOKENS * 600)}]
     try:
         prompt_size.check(huge, MODEL, limit=config.EXO_MAX_PROMPT_TOKENS,
@@ -205,7 +231,7 @@ def main():
     except prompt_size.PromptTooLarge as e:
         check(True, f"a body past any possible limit is refused ({e.method})")
 
-    step(6, "with no tokenizer, the estimate still refuses")
+    step(7, "with no tokenizer, the estimate still refuses")
     prompt_size._CACHE.pop("no-such/model", None)
     try:
         prompt_size.check([{"role": "user", "content": words(config.EXO_MAX_PROMPT_TOKENS)}],

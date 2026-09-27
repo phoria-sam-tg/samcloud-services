@@ -1568,50 +1568,73 @@ class ModelManager:
             shown = f"{age:.0f}s" if age is not None else "unknown"
             try:
                 resp = self.sc.renew_lease(lease_id, EXO_LEASE_TTL) or {}
-                extended = resp.get("extended_by_s")
-                if extended:
-                    # capped AND extended arrive together on the LAST renewal
-                    # before the ceiling: target lands exactly on the ceiling,
-                    # which is still later than the current expiry. So this is a
-                    # real extension and also the final one — worth saying, because
-                    # every renewal after it prints "NO extension" and an operator
-                    # should see that transition coming rather than meet it.
-                    tail = (" — this is the LAST extension, the "
+                extended = resp.get("extended_by_s") or 0
+                # `reason` (#33) rather than deriving one from two booleans. The
+                # registry knows which of four things happened; inferring it here
+                # is how "no extension" got mislabelled as "the ceiling" once
+                # already. When it is absent we say so instead of guessing —
+                # a quiet fallback to the old inference is the failure this
+                # whole ticket keeps turning up.
+                reason = resp.get("reason")
+                every = f"renewing every {config.EXO_LEASE_RENEW_INTERVAL_S}s"
+                if reason is None:
+                    reason = ("extended" if extended else
+                              "at_ceiling" if resp.get("capped") else "unknown")
+                    log.warning(
+                        f"Pool lease renewal response carried no `reason` field; "
+                        f"inferred {reason!r} from extended_by_s/capped. The "
+                        f"registry may predate #827 P3."
+                    )
+
+                if reason == "extended":
+                    # capped and extended arrive together on the LAST renewal
+                    # before the ceiling: target lands on the ceiling, still later
+                    # than the current expiry. Worth saying, because every renewal
+                    # after it reports at_ceiling and an operator should see that
+                    # transition coming rather than meet it.
+                    tail = (f" — this is the LAST extension, the "
                             f"{resp.get('max_total_s')}s ceiling is now reached"
                             if resp.get("capped") else "")
                     log.info(
                         f"Pool lease {lease_id} renewed in place after {shown} "
                         f"held: +{extended}s, expires {resp.get('expires_at')} "
-                        f"(renewing every {config.EXO_LEASE_RENEW_INTERVAL_S}s)"
-                        f"{tail}"
+                        f"({every}){tail}"
                     )
-                elif resp.get("capped"):
-                    # Accepted and extended NOTHING because the ceiling bound it.
-                    # The ceiling runs from granted_at, so asking for another
-                    # EXO_LEASE_TTL on a lease granted for exactly that always
-                    # caps to its existing expiry. Expected throughout stage (a) —
-                    # but it must not print as an extension, because a renewal
-                    # that silently does nothing reads exactly like one that
-                    # silently failed.
+                elif reason == "at_ceiling":
+                    # Accepted, extended nothing, the ceiling bound it. Expected
+                    # for the whole of stage (a) — but it must not print as an
+                    # extension, because a renewal that silently does nothing
+                    # reads exactly like one that silently failed.
                     log.info(
                         f"Pool lease {lease_id} renewal accepted after {shown} "
-                        f"held, NO extension (capped at the "
-                        f"{resp.get('max_total_s')}s ceiling; granted TTL is "
-                        f"{EXO_LEASE_TTL}s). Expected until #827 stage (b) "
-                        f"lowers the granted TTL below the ceiling."
+                        f"held, NO extension (at the {resp.get('max_total_s')}s "
+                        f"ceiling; granted TTL is {EXO_LEASE_TTL}s). Expected "
+                        f"until #827 stage (b) lowers the granted TTL."
+                    )
+                elif reason == "already_later":
+                    # A MISCONFIGURATION, not an anomaly: the expiry is already
+                    # beyond now + our ttl, which at a constant TTL cannot happen.
+                    # It means the renewal TTL is smaller than the granted one, so
+                    # EVERY renewal extends nothing and the lease will lapse at its
+                    # original expiry while this loop reports success. Liveness off
+                    # while looking on — the #843 shape, so it is an error.
+                    log.error(
+                        f"Pool lease renewal is NOT EXTENDING: {lease_id} after "
+                        f"{shown} held returned already_later — the expiry is "
+                        f"beyond now+{EXO_LEASE_TTL}s, so the renewal TTL is "
+                        f"smaller than the granted one. Every renewal will do "
+                        f"nothing and the lease lapses on its original expiry. #827."
+                    )
+                elif reason == "indefinite":
+                    log.warning(
+                        f"Pool lease {lease_id} has no expiry to renew after "
+                        f"{shown} held ({resp.get('note') or 'indefinite'}). "
+                        f"Unexpected — this gateway always grants with a TTL."
                     )
                 else:
-                    # Extended nothing and was NOT capped — the two are not the
-                    # same thing and assuming they were is how the branch above
-                    # would have mislabelled an indefinite lease as ceiling-bound.
-                    # The registry returns this shape when a lease has no expiry
-                    # at all ("nothing to renew"). This gateway always grants with
-                    # a TTL so it should be unreachable, and "should be" is the
-                    # phrase that has been wrong all day, so it says what it saw.
                     log.warning(
                         f"Pool lease {lease_id} renewal after {shown} held "
-                        f"extended nothing and was not capped: {resp.get('note') or resp}. "
-                        f"Unexpected — this gateway always grants with a TTL."
+                        f"returned an unrecognised reason {reason!r}: {resp}"
                     )
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:

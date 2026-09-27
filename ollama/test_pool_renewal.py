@@ -46,7 +46,7 @@ class Recorder:
         # The stage (a) reality: accepted, capped, extending nothing.
         self.reply = reply if reply is not None else {
             "lease_id": "x", "status": "active", "extended_by_s": 0,
-            "capped": True, "max_total_s": 1800}
+            "capped": True, "max_total_s": 1800, "reason": "at_ceiling"}
 
     def renew_lease(self, lease_id, ttl_seconds):
         # ttl_seconds is REQUIRED by the endpoint; recording it means a caller
@@ -136,7 +136,7 @@ def main():
           "stage (b)" in line, line)
 
     print("  [2c] a real extension says so, with the amount")
-    sc = Recorder(reply={"extended_by_s": 60, "capped": False,
+    sc = Recorder(reply={"extended_by_s": 60, "capped": False, "reason": "extended",
                          "expires_at": "2026-09-27T08:00:00Z", "max_total_s": 1800})
     m = manager_holding("lease_B2", 200, sc)
     seen = logs_from(m._renew_pool_leases)
@@ -144,28 +144,12 @@ def main():
     check("it reports the extension", "+60s" in line2, line2)
     check("and does not claim there was none", "NO extension" not in line2, line2)
 
-    print("  [2e] capped AND extended together: the last extension before the ceiling")
-    # samclaude-admin, reviewing #33: on the final renewal target lands on the
-    # ceiling, which is still later than the current expiry — so extended_by_s > 0
-    # and capped is true at the same time. Branching on capped first would print
-    # "NO extension" for a renewal that extended.
-    sc = Recorder(reply={"extended_by_s": 25, "capped": True, "max_total_s": 1800,
-                         "expires_at": "2026-09-27T08:30:00Z"})
-    m = manager_holding("lease_B4", 1775, sc)
-    seen = logs_from(m._renew_pool_leases)
-    line4 = next((msg for lvl, msg in seen if "1775s held" in msg), "")
-    check("the extension is reported, not swallowed by capped",
-          "+25s" in line4, line4)
-    check("it does NOT say there was no extension",
-          "NO extension" not in line4, line4)
-    check("and it warns that this is the last one",
-          "LAST extension" in line4 and "1800s ceiling" in line4, line4)
-
     print("  [2d] no extension and NOT capped is a different thing, and says so")
     # The registry returns extended_by_s 0 with capped False for a lease that has
     # no expiry at all. Treating "no extension" as "ceiling" would mislabel it —
     # the same assumption-in-a-branch that the else-clause above used to make.
     sc = Recorder(reply={"extended_by_s": 0, "capped": False, "max_total_s": 1800,
+                         "reason": "indefinite",
                          "note": "indefinite lease — nothing to renew"})
     m = manager_holding("lease_B3", 140, sc)
     seen = logs_from(m._renew_pool_leases)
@@ -176,6 +160,52 @@ def main():
           any(lvl == "warning" and "140s held" in msg for lvl, msg in seen), str(seen))
     check("and it repeats what the registry actually said",
           "nothing to renew" in line3, line3)
+
+    print("  [2e] capped AND extended together: the last extension before the ceiling")
+    # samclaude-admin, reviewing #33: on the final renewal target lands on the
+    # ceiling, which is still later than the current expiry — so extended_by_s > 0
+    # and capped is true at the same time. Branching on capped first would print
+    # "NO extension" for a renewal that extended.
+    sc = Recorder(reply={"extended_by_s": 25, "capped": True, "max_total_s": 1800,
+                         "reason": "extended", "expires_at": "2026-09-27T08:30:00Z"})
+    m = manager_holding("lease_B4", 1775, sc)
+    seen = logs_from(m._renew_pool_leases)
+    line4 = next((msg for lvl, msg in seen if "1775s held" in msg), "")
+    check("the extension is reported, not swallowed by capped",
+          "+25s" in line4, line4)
+    check("it does NOT say there was no extension",
+          "NO extension" not in line4, line4)
+    check("and it warns that this is the last one",
+          "LAST extension" in line4 and "1800s ceiling" in line4, line4)
+
+    print("  [2f] already_later is a MISCONFIGURATION, not an anomaly")
+    # #33 gives this its own reason. It means the renewal TTL is smaller than the
+    # granted one, so every renewal extends nothing and the lease lapses on its
+    # original expiry while the loop reports success — liveness off while looking
+    # on. Unreachable at a constant TTL, which is exactly why it must be loud if
+    # it ever appears.
+    sc = Recorder(reply={"extended_by_s": 0, "capped": False,
+                         "reason": "already_later", "max_total_s": 1800})
+    m = manager_holding("lease_B5", 300, sc)
+    seen = logs_from(m._renew_pool_leases)
+    errs = [msg for lvl, msg in seen if lvl == "error"]
+    check("it is an error, not a warning", len(errs) == 1, str(seen))
+    check("and it says renewals are doing nothing",
+          errs and "NOT EXTENDING" in errs[0], str(errs))
+    check("and names the cause, not just the symptom",
+          errs and "smaller than the granted one" in errs[0], str(errs))
+
+    print("  [2g] a response with no `reason` is inferred AND said out loud")
+    # A quiet fallback to the old two-boolean inference is the failure this whole
+    # ticket keeps turning up, so the inference announces itself.
+    sc = Recorder(reply={"extended_by_s": 0, "capped": True, "max_total_s": 1800})
+    m = manager_holding("lease_B6", 250, sc)
+    seen = logs_from(m._renew_pool_leases)
+    check("it warns that `reason` was missing",
+          any(lvl == "warning" and "no `reason` field" in msg for lvl, msg in seen),
+          str(seen))
+    check("and still classifies it correctly from the booleans",
+          any("NO extension" in msg for _, msg in seen), str(seen))
 
     print("  [3] a failed renewal KEEPS the lease — dropping it is worse")
     sc = Recorder(renew=http_error(503))

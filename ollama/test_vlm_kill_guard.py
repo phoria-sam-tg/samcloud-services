@@ -6,10 +6,16 @@ whole command line, and the loop sends SIGTERM to what it returns. So the predic
 guarding that kill is the only thing standing between the gateway and signalling an
 unrelated process on the same box.
 
-Checking uid plus adjacent `-m mlx_vlm.server` argv tokens is not enough: those
-tokens are also genuine arguments to other commands. `grep -- -m mlx_vlm.server .`
-has both, adjacent, under our own uid. Case [2] below is that command line, and it
-is killed without the argv[0] check.
+Checking uid plus adjacent `-m mlx_vlm.server` argv tokens is not enough, because
+`ps` output carries no quoting: a single quoted argument comes back as separate
+whitespace tokens. So `grep -r -- "-m mlx_vlm.server" /tree`, one argv element,
+prints as adjacent `-m` and `mlx_vlm.server` tokens under our own uid. That is
+case [2b], and it is the realistic long-lived form.
+
+Case [2] keeps the unquoted two-argument spelling for completeness. It has the same
+argv shape but is not reproducible as a live process: `--` ends option parsing, so
+`-m` is the pattern and `mlx_vlm.server` a filename that does not exist, and grep
+exits at once. Both are killed without the argv[0] check.
 
 Fakes, and why they are shaped this way:
   - `ps -o uid=,command= -p <pid>` really emits a leading-space-padded uid, a
@@ -124,6 +130,14 @@ def main():
         4002: (OUR_UID, "grep -- -m mlx_vlm.server ."),
     })
     check("the grep survives", killed == [], f"killed={killed}")
+
+    print("  [2b] the REALISTIC long-lived shape: a quoted pattern, unquoted by ps")
+    print("      `grep -r -- \"-m mlx_vlm.server\" /tree` is ONE argv element;")
+    print("      ps prints it unquoted, so cmd.split() sees adjacent tokens")
+    killed = run_killer({
+        4021: (OUR_UID, "grep -r -- -m mlx_vlm.server /Users/someone/code"),
+    })
+    check("the recursive grep survives", killed == [], f"killed={killed}")
 
     print("  [3] an editor whose file path merely mentions it is NOT killed")
     killed = run_killer({

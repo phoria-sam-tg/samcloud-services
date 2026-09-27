@@ -706,14 +706,26 @@ class ModelManager:
         if not toks:
             return False
         # Adjacent `-m mlx_vlm.server` tokens are NOT sufficient on their own,
-        # because they are also genuine arguments to other commands:
-        # `grep -- -m mlx_vlm.server .` carries both, adjacent, under our own
-        # uid, and the caller SIGTERMs whatever this returns True for. Only
-        # argv[0] says what a process was EXECUTED AS, and load_vlm_model execs
-        # VLM_PYTHON by exactly this string (see its Popen list below).
+        # and the reason is that `ps` output carries no quoting. A single quoted
+        # argument reappears in `ps -o command=` as separate whitespace tokens,
+        # so a long-lived
+        #     grep -r -- "-m mlx_vlm.server" /some/tree
+        # prints as `grep -r -- -m mlx_vlm.server /some/tree`, and `cmd.split()`
+        # sees `-m` immediately followed by `mlx_vlm.server`. That is a real
+        # process, under our own uid, that the caller would SIGTERM. The
+        # vulnerable shape comes from quoting loss in `ps`, not from anyone
+        # passing two separate arguments.
+        #
+        # This comment previously gave `grep -- -m mlx_vlm.server .` as the
+        # example. That has the right argv shape but cannot actually be caught:
+        # `--` ends option parsing, so `-m` is the pattern and `mlx_vlm.server`
+        # is a filename that does not exist, and grep exits at once. Established
+        # by trying to reproduce it against a live process and failing.
+        #
+        # Only argv[0] says what a process was EXECUTED AS, and load_vlm_model
+        # execs VLM_PYTHON by exactly this string (see its Popen list below).
         # Asserted by test_vlm_kill_guard.py: without this check, cases [2],
-        # [5] and [8] fail — a grep, a foreign interpreter, and a grep sharing
-        # the table with the real server all get SIGTERMed.
+        # [2b], [5] and [8] fail.
         if toks[0] != VLM_PYTHON:
             return False
         return any(

@@ -197,7 +197,23 @@ async def lifespan(app: FastAPI):
     # is still exporting it and the hygiene change is NOT in effect on this box —
     # deploying the code and changing the launcher are two steps, and without this
     # line they are indistinguishable from outside. Never the value.
-    log.info(f"SC_TOKEN source: {config.SC_TOKEN_SOURCE}")
+    # Which source the bearer came from AND who it actually is (#845). The source
+    # alone proves a file was read, not that it held this gateway's own token —
+    # and reading a seat token instead would widen the gateway's scopes while
+    # every check still passed. Best effort on purpose: a registry that cannot be
+    # reached at boot must not stop the gateway serving locally, so this reports
+    # "unverified" and carries on rather than raising. Never the value.
+    identity = "unverified"
+    if config.SC_TOKEN:
+        try:
+            who = sc.verify_token()
+            identity = f"{who.get('username')} ({who.get('role')})"
+            scopes = who.get("scopes")
+            if scopes:
+                identity += f" scopes {scopes}"
+        except Exception as e:
+            identity = f"unverified ({type(e).__name__})"
+    log.info(f"SC_TOKEN source: {config.SC_TOKEN_SOURCE}, identity {identity}")
     log.info(f"Model Service ready - managing {len(mgr.models)} models")
 
     yield

@@ -42,10 +42,28 @@ SC_BASE = _env("SC_BASE", "https://cloud.samtg.xyz/api/v1")
 # child process the gateway starts inherited it, and `ps eww <pid>` showed it to
 # any reader of that uid.
 #
-# Nothing on disk held a literal: slice's env file set
-# `SC_TOKEN=$(cat ~/.samcloud/token)`, a reference evaluated at source time, so
-# this reads the same file the launcher already pointed at rather than a new one.
-SC_TOKEN_FILE = _env("SC_TOKEN_FILE", "~/.samcloud/token")
+# THERE IS DELIBERATELY NO DEFAULT. This was `~/.samcloud/token` and that was
+# wrong in a way worth spelling out, because the wrong version looked correct:
+#
+#   `~/.samcloud/token` is the SEAT's bearer, not a service's. On wafer it exists
+#   and holds `claude-wafer-services` — three group scopes — while that gateway's
+#   own identity is `wafer-model-service` with `device:wafer-services` alone. With
+#   a default, dropping the export would have started the gateway successfully,
+#   logged `SC_TOKEN source: file ~/.samcloud/token`, and run it on a WIDER
+#   identity than it is entitled to. Not an outage: a silent privilege widening
+#   behind a green-looking startup line, which is strictly worse than a failure.
+#
+# So when SC_TOKEN is absent and SC_TOKEN_FILE is unset, the source is NOT FOUND
+# and startup says so. Each box sets SC_TOKEN_FILE explicitly at the path holding
+# that gateway's own token.
+#
+# The rule this encodes is narrower than "a service must not read
+# ~/.samcloud/token" (claude-wafer-services' refinement, and correct): a seat
+# token must never be reached for IMPLICITLY, as a default or a fallback, where a
+# service identity was intended. A seat's own scripts posting as the seat on
+# purpose — wafer's nerf/4dgs heartbeats do exactly that — are a different thing
+# and are fine.
+SC_TOKEN_FILE = _env("SC_TOKEN_FILE", "")
 
 
 def _read_token_file(path: str) -> str:
@@ -81,12 +99,26 @@ def _read_token_file(path: str) -> str:
 
 
 _sc_token_env = os.environ.get("SC_TOKEN", "")
-SC_TOKEN = _sc_token_env or _read_token_file(SC_TOKEN_FILE)
+SC_TOKEN = _sc_token_env or (_read_token_file(SC_TOKEN_FILE) if SC_TOKEN_FILE else "")
 # Which source won, because "the fix is deployed" and "the launcher still exports
 # it" are indistinguishable without saying so, and an env-sourced token means the
 # hygiene change is not actually in effect. Never the value.
 SC_TOKEN_SOURCE = ("environment" if _sc_token_env
                    else f"file {SC_TOKEN_FILE}" if SC_TOKEN else "NOT FOUND")
+# NOT FOUND is loud, and it names WHICH of the two ways it happened. "unset" is a
+# box whose launcher was changed without setting the path; "unreadable or empty"
+# is a path that is set and wrong. Those want different fixes and a bare NOT FOUND
+# would send someone to the wrong one.
+if SC_TOKEN_SOURCE == "NOT FOUND":
+    log.error(
+        "no samcloud bearer: SC_TOKEN is not in the environment and "
+        + (f"SC_TOKEN_FILE={SC_TOKEN_FILE} is unreadable or empty"
+           if SC_TOKEN_FILE else
+           "SC_TOKEN_FILE is unset — set it to the path of THIS gateway's own "
+           "token file. There is no default on purpose: a seat's "
+           "~/.samcloud/token is not a fallback for a service identity (#845)")
+        + ". Every registry call will fail 401."
+    )
 SC_DEVICE = _env("SC_DEVICE", "claude-services-slice")
 SC_SERVICE_NAME = _env("SC_SERVICE_NAME", "model-service")
 SC_SERVICE_ID = f"{SC_DEVICE}/{SC_SERVICE_NAME}"

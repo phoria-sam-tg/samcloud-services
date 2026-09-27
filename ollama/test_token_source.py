@@ -113,6 +113,61 @@ def main():
         check("an unexpanded ~ would raise rather than return empty",
               c.SC_TOKEN == "", repr(c.SC_TOKEN))
 
+        # ---- no seat-token fallback (#845 follow-up) ----
+        # This is the regression that matters most, and it FAILS against the
+        # version with a `~/.samcloud/token` default. On a box where that file
+        # exists — both slice and wafer — the default made an unset
+        # SC_TOKEN_FILE resolve to the SEAT's bearer. Startup would have said
+        # `file ~/.samcloud/token` and looked right while the gateway ran on an
+        # identity with wider scopes than it is entitled to. A test that only
+        # checked "a token was found" would have passed on the broken version.
+        print("  [8] SC_TOKEN_FILE unset is NOT FOUND, even though ~/.samcloud/token exists")
+        seat = Path(os.path.expanduser("~/.samcloud/token"))
+        check("precondition: the seat token file really is present on this box, "
+              "so this test is not vacuous",
+              seat.exists(), f"{seat} missing — test proves nothing here")
+        c = load(token_env=None, token_file=None)
+        check("SC_TOKEN_FILE has no default", c.SC_TOKEN_FILE == "", repr(c.SC_TOKEN_FILE))
+        check("no token is resolved", c.SC_TOKEN == "", f"len={len(c.SC_TOKEN)}")
+        check("the source is NOT FOUND, not the seat's file",
+              c.SC_TOKEN_SOURCE == "NOT FOUND", c.SC_TOKEN_SOURCE)
+        if seat.exists():
+            check("and specifically NOT the seat token, compared by value",
+                  c.SC_TOKEN != seat.read_text().strip(),
+                  "resolved token equals the seat token")
+
+        print("  [9] control: an explicitly configured file IS used")
+        c = load(token_env=None, token_file=raw)
+        check("explicit path wins", c.SC_TOKEN == "sc_agent_rawtoken", c.SC_TOKEN[:12])
+        check("and the source names that path", c.SC_TOKEN_SOURCE == f"file {raw}",
+              c.SC_TOKEN_SOURCE)
+
+        print("  [10] the identity check asks the registry who the bearer is")
+        # Startup logs the identity because the source alone cannot show that the
+        # right bearer was read. Asserted against a stub rather than the network:
+        # what is under test is that the client asks /auth/verify and returns the
+        # answer, not that the registry is up.
+        from ollama.samcloud import SamcloudClient
+
+        class _StubResp:
+            def __init__(self, body): self._b = body
+            def raise_for_status(self): pass
+            def json(self): return self._b
+
+        class _StubHttp:
+            def __init__(self): self.got = []
+            def get(self, path, **kw):
+                self.got.append(path)
+                return _StubResp({"username": "wafer-model-service", "role": "agent",
+                                  "scopes": ["device:wafer-services"]})
+
+        cl = SamcloudClient(token="unused")
+        cl._http = _StubHttp()
+        who = cl.verify_token()
+        check("it calls GET /auth/verify", cl._http.got == ["/auth/verify"], str(cl._http.got))
+        check("and returns the identity the startup line prints",
+              who.get("username") == "wafer-model-service", str(who))
+
     print()
     if failed:
         print(f"  FAILED: {failed} failed, {passed} passed")

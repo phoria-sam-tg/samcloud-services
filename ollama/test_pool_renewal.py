@@ -660,10 +660,20 @@ def main():
     #
     # And their refinement, which applies to every row rather than just b2: whenever
     # the TTL is a multiple of the tick, the LAST tolerated miss puts the rescuing
-    # attempt exactly on the expiry instant. So the honest reading is
-    # "N-1 reliable misses, plus one decided by clock agreement and whether a reap
-    # ran first" — not N comfortable ones. My earlier "30s of margin" was the
+    # attempt exactly on the expiry instant — so it is N-1 reliable misses plus one
+    # photo finish, not N comfortable ones. My earlier "30s of margin" was the
     # TWO-miss case, not the three-miss case.
+    #
+    # b2's deployment SETTLED that photo finish, and it settles it as a loss. Measured
+    # cadence between consecutive renewals was 30.097s and 30.148s, never 30.000s, and
+    # that is structural rather than luck: pool_renewal_loop sleeps the interval and
+    # THEN awaits the renewal, so the spacing is always interval + work and can never
+    # be <= the interval. The fourth attempt after a success therefore lands strictly
+    # after 4*30 = the TTL, i.e. after the lease has already expired. The photo finish
+    # is unreachable, not uncertain, so `reliable` below is the production figure and
+    # 2 is the number to quote. The divisibility branch stays because it is about the
+    # RELATIONSHIP, not about b2: at a fraction that does not divide the TTL the last
+    # miss keeps real margin and the clause stops applying.
     B2_TTL = 120
     # Once b2 is deployed this stops being hypothetical, so assert the live config
     # matches what b2 specifies. Kept as a literal so the cell goes on describing b2
@@ -714,8 +724,11 @@ def main():
 
     print("  [13d] AT B2: survives TWO consecutive failures — the reliable case")
     # samclaude-admin: assert survival at 2 and loss at 4. NOT at 3 — that is the
-    # photo finish, decided by clock agreement, and a test pinned to it is a flaky
-    # test waiting to happen.
+    # photo finish. b2's measured cadence (see [13c]) says 3 is in fact a loss, but it
+    # stays unasserted deliberately: the instruction was to assert neither way there,
+    # and a test pinned to the exact expiry instant is a flaky test waiting to happen
+    # whichever side of it the truth sits on. Survival at 2 is the guarantee; loss at
+    # 4 is the bound; 3 is real but not worth a test that measures scheduling latency.
     sc = FailsThenWorks(fail_times=2)
     m = manager_holding("lease_b2_survives", 200, sc)
     warns, errs_during = 0, []

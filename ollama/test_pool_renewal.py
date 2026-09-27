@@ -420,6 +420,37 @@ def main():
     check("nothing claims the pool was reaped",
           not any("reaped" in msg.lower() or "GONE" in msg for _, msg in seen), str(seen))
 
+    print("  [4d2] PIN the ordering [4d] depends on, at runtime")
+    # claude-wafer-services asked whether anything pins it; samclaude-admin's form
+    # is better than reading the source, because it asserts the property at the
+    # moment it matters rather than pattern-matching a body that happens to have it
+    # today. A reorder to DELETE-then-discard fails this directly; a rewrite that
+    # keeps the ordering still passes.
+    #
+    # [4d] makes the ordering true inside its own fake, so it cannot notice a
+    # reorder. This can.
+    ordering = {}
+    class AssertsOrder:
+        def __init__(self, mgr): self.mgr = mgr
+        def release_lease(self, lease_id):
+            # release_pool must have discarded it BEFORE calling us, or our own
+            # release could 404 a lease still in _pool_leases and be misreported
+            # as a reap.
+            with self.mgr._pool_lock:
+                ordering["absent_at_delete"] = lease_id not in self.mgr._pool_leases
+            return {"status": "released"}
+    m = ModelManager(sc=None)
+    m.sc = AssertsOrder(m)
+    with m._pool_lock:
+        m._pool_leases.add("lease_order")
+        m._pool_lease_acquired["lease_order"] = time.monotonic()
+    logs_from(lambda: m.release_pool("lease_order"))
+    check("release_lease was actually called", "absent_at_delete" in ordering, str(ordering))
+    check("and the lease was ALREADY absent from _pool_leases when it was",
+          ordering.get("absent_at_delete") is True,
+          "still present at DELETE — a 404 from our own release would now be "
+          "misreported as a reap")
+
     print("  [4e] a 404 on a lease we STILL HOLD is the reap the error exists for")
     sc = Recorder(renew=http_error(404, REAPED_404_BODY))
     m = manager_holding("lease_reaped_held", 410, sc)

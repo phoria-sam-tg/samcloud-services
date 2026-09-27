@@ -12,6 +12,7 @@ nothing else.
 
 Run: python3 ollama/test_pool_renewal.py
 """
+import asyncio
 import sys
 import time
 from pathlib import Path
@@ -386,6 +387,54 @@ def main():
         third = iv * 3
         check(f"at TTL={ttl}s the third attempt is at {third}s, <=80% of the lease",
               third <= ttl * 0.8, f"interval={iv} third={third} ttl={ttl}")
+
+    print("  [10] a slow renewal must NOT stall the event loop")
+    # samclaude-admin, reviewing #10: _renew_pool_leases makes a synchronous
+    # httpx POST with the plane's 10s timeout, every interval, for as long as
+    # a generation is streaming — on the same loop as that stream. Run on the
+    # loop it stalls every token for the duration. And the streaming path is
+    # where the 60s inter-token rule lives, so a slow renewal could trip this
+    # gateway's own stall detector against a healthy generation.
+    #
+    # Drives the REAL pool_renewal_loop with a short interval and a fake that
+    # takes 2s, and measures a concurrent 0.1s ticker. Against a loop that
+    # calls _renew_pool_leases directly, the ticker stalls for ~2s.
+    class Slow:
+            def renew_lease(self, lease_id, ttl_seconds):
+                time.sleep(2.0)
+                return {"extended_by_s": 0, "capped": True, "reason": "at_ceiling",
+                        "max_total_s": 1800}
+
+    async def scenario():
+            real = config.EXO_LEASE_RENEW_INTERVAL_S
+            config.EXO_LEASE_RENEW_INTERVAL_S = 0.05
+            try:
+                m = ModelManager(sc=Slow())
+                with m._pool_lock:
+                    m._pool_leases.add("lease_slow")
+                    m._pool_lease_acquired["lease_slow"] = time.monotonic() - 200
+                task = asyncio.create_task(m.pool_renewal_loop())
+                await asyncio.sleep(0.12)          # let the renewal start
+                gaps, prev = [], time.monotonic()
+                for _ in range(6):
+                    await asyncio.sleep(0.1)
+                    now = time.monotonic()
+                    gaps.append(now - prev)
+                    prev = now
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                return max(gaps)
+            finally:
+                config.EXO_LEASE_RENEW_INTERVAL_S = real
+
+
+
+    worst = asyncio.run(scenario())
+    check(f"the worst tick gap stayed under 0.5s (was {worst:.2f}s)",
+              worst < 0.5, f"worst gap {worst:.2f}s — the loop was blocked")
 
     print()
     if failed:

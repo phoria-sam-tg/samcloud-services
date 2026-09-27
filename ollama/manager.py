@@ -1549,11 +1549,25 @@ class ModelManager:
                 log.warning(f"Failed to renew lease for {name}: {e}")
 
     async def pool_renewal_loop(self):
-        """Keep held pool leases alive while their generation runs (#827 P3)."""
+        """Keep held pool leases alive while their generation runs (#827 P3).
+
+        OFF THE EVENT LOOP, via to_thread. `_renew_pool_leases` makes a
+        synchronous httpx POST carrying the plane's 10s timeout, and it runs
+        every interval for as long as a generation is streaming — on the same
+        loop as that stream. A slow plane answer would stall every token of
+        every concurrent response for its duration, and today's release 502s
+        took seconds. Worse, the streaming path is where the 60s inter-token
+        rule lives, so a renewal blocking the loop could trip this gateway's
+        own stall detector against a generation that never faltered.
+
+        The rest of the pool path already reaches this object from
+        `asyncio.to_thread` (see `_pool_lock`); the renewal was the one call
+        still on the loop.
+        """
         while True:
             await asyncio.sleep(config.EXO_LEASE_RENEW_INTERVAL_S)
             try:
-                self._renew_pool_leases()
+                await asyncio.to_thread(self._renew_pool_leases)
             except Exception as e:
                 log.warning(f"Pool lease renewal error: {e}")
 
@@ -1666,7 +1680,9 @@ class ModelManager:
                         f"Pool lease {lease_id} renewal after {shown} held "
                         f"returned an unrecognised reason {reason!r}: {resp}"
                     )
-                self._pool_lease_last_reason[lease_id] = reason
+                # Under the lock: `release_pool` pops this from another thread.
+                with self._pool_lock:
+                    self._pool_lease_last_reason[lease_id] = reason
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 404:
                     # The registry no longer knows this lease while we are still

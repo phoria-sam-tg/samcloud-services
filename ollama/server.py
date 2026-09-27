@@ -1209,6 +1209,10 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                 try:
                     async for line in mgr.exo.chat_stream(
                         mm.name, req.messages,
+                        # The gate has already counted this prompt (#837), so the
+                        # first-token deadline can scale to it instead of falling
+                        # back to the whole-request budget. #830.
+                        prompt_tokens=n_tokens,
                         **{k: v for k, v in payload.items()
                            if k not in ("model", "messages", "stream")}
                     ):
@@ -1282,6 +1286,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                 gen = asyncio.ensure_future(mgr.exo.chat_collect(
                     mm.name,
                     req.messages,
+                    prompt_tokens=n_tokens,
                     **{k: v for k, v in payload.items()
                        if k not in ("model", "messages", "stream")},
                 ))

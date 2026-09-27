@@ -547,6 +547,25 @@ class ExoClient:
                 # Unknown prompt size falls back to the whole-request budget, i.e.
                 # exactly the behaviour before this existed.
                 first_token_budget = config.exo_first_token_deadline(prompt_tokens)
+                # Logged once per request, ARMED rather than only on failure. A
+                # deadline that is only visible when it fires cannot be
+                # distinguished from one that was never computed -- and on
+                # 2026-09-27 the wiring for this was absent for a day without
+                # anything saying so. #830.
+                if prompt_tokens:
+                    log.info(
+                        f"exo first-token deadline {first_token_budget:.0f}s armed "
+                        f"({prompt_tokens} prompt tokens / "
+                        f"{config.EXO_FIRST_TOKEN_RATE_TPS} tok/s + "
+                        f"{config.EXO_FIRST_TOKEN_MARGIN_S}s); inter-token "
+                        f"{config.EXO_STALL_TIMEOUT}s"
+                    )
+                else:
+                    log.info(
+                        f"exo first-token deadline NOT armed (prompt size unknown) "
+                        f"— falling back to the whole-request budget "
+                        f"{config.EXO_GENERATE_TIMEOUT}s"
+                    )
                 while True:
                     line_budget = (
                         config.EXO_STALL_TIMEOUT if seen else first_token_budget

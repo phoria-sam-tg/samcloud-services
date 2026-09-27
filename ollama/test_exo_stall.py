@@ -237,6 +237,40 @@ def main():
           isinstance(err, ExoStalled) and err.phase == "inter_token",
           f"got {err!r}")
 
+    # --- the wiring itself --------------------------------------------------
+    # The deadline was implemented before the prompt counter reached main, so
+    # `prompt_tokens` was None and the whole mechanism was inert for a day with
+    # nothing in a log or a test saying so. chat_collect is what server.py calls
+    # on the non-streaming path; if it drops the argument the feature is off.
+    def _collect(script, prompt_tokens, stall=5, overall=5, rate=1000, margin=0.2):
+        sys.modules["aiohttp"] = fake_aiohttp(script)
+        o = (config.EXO_STALL_TIMEOUT, config.EXO_GENERATE_TIMEOUT,
+             config.EXO_FIRST_TOKEN_RATE_TPS, config.EXO_FIRST_TOKEN_MARGIN_S)
+        (config.EXO_STALL_TIMEOUT, config.EXO_GENERATE_TIMEOUT,
+         config.EXO_FIRST_TOKEN_RATE_TPS, config.EXO_FIRST_TOKEN_MARGIN_S) = (
+            stall, overall, rate, margin)
+        err = None
+        try:
+            asyncio.run(ExoClient().chat_collect(
+                "m", [{"role": "user", "content": "x"}], prompt_tokens=prompt_tokens))
+        except Exception as e:  # noqa: BLE001
+            err = e
+        finally:
+            (config.EXO_STALL_TIMEOUT, config.EXO_GENERATE_TIMEOUT,
+             config.EXO_FIRST_TOKEN_RATE_TPS, config.EXO_FIRST_TOKEN_MARGIN_S) = o
+            sys.modules.pop("aiohttp", None)
+        return err
+
+    err = _collect([(2.0, b"data: a\n")], prompt_tokens=100)
+    check("chat_collect forwards prompt_tokens, so the deadline is armed",
+          isinstance(err, ExoStalled) and err.phase == "first_token",
+          f"got {err!r} — if this is not a first_token stall the wiring is dropped")
+
+    err = _collect([(2.0, b"data: a\n")], prompt_tokens=None, overall=0.3)
+    check("...and without it the old whole-request budget still governs",
+          isinstance(err, ExoRequestFailed) and not isinstance(err, ExoStalled),
+          f"got {err!r}")
+
     print(f"\n  {'ALL PASSED' if not FAIL else 'FAILED'}: "
           f"exo stall abort {PASS} passed, {FAIL} failed\n")
     return 1 if FAIL else 0

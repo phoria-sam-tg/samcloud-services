@@ -249,6 +249,16 @@ def match_gguf_model(model_name: str, available: list[dict]):
     return None
 
 
+class TranscriberBusy(Exception):
+    """A whisper model swap was asked for while a transcription is running.
+
+    Derives from `Exception`, not `RuntimeError`, for the reason
+    `capacity.InsufficientCapacity` does: the `except RuntimeError` around the
+    load path turns anything it catches into "the transcriber could not start",
+    which is a different answer from "it is busy with the other model, retry".
+    """
+
+
 @dataclass
 class LeaseOutcome:
     """The verdict on a lease request: was it granted, and if not, why not.
@@ -1032,6 +1042,17 @@ class ModelManager:
             return False
         return WHISPER_SCRIPT in toks[1:]
 
+    def whisper_child_alive(self, mm: ManagedModel) -> bool:
+        """Can the child behind this entry still answer?
+
+        Two questions, because either alone says yes to a broken child: a process
+        that exited is dead, and a process that is up but not serving — a wedged
+        or half-started uvicorn — cannot be told from a working one by `poll()`.
+        """
+        if mm.whisper_process is not None and mm.whisper_process.poll() is not None:
+            return False
+        return self.whisper.health() is not None
+
     def load_whisper_model(self, model_name: str) -> ManagedModel:
         """Start the whisper child for a transcription model on demand.
 
@@ -1049,15 +1070,37 @@ class ModelManager:
 
         if model_id in self.models:
             mm = self.models[model_id]
-            mm.last_used = time.time()
-            mm.request_count += 1
-            return mm
+            if self.whisper_child_alive(mm):
+                mm.last_used = time.time()
+                mm.request_count += 1
+                return mm
+            # Do NOT hand back the entry. Nothing else would ever replace it: the
+            # cooldown loop is the only thing that removes one, and the audio
+            # route stamps `last_used` on a failed request too, so a dead child
+            # behind a live entry is a 503 on every request from then until the
+            # gateway restarts. Drop it — which releases the lease — and load a
+            # fresh one below.
+            log.warning(
+                f"whisper child for {model_id} is not answering — reloading it"
+            )
+            self.unload(model_id, force=True)
 
-        # One child per port — swap out the other whisper model first.
+        # One child per port — swap out the other whisper model first. A swap
+        # kills the child, so anything it is in the middle of dies with it: the
+        # caller whose transcription it was gets a 502 for a request that was
+        # working. `server._resolve_whisper` refuses the swap under its gate
+        # before ever reaching here; this is the same rule restated where the
+        # kill actually happens, for any future caller that arrives another way.
         for existing, mm in list(self.models.items()):
-            if mm.backend == Backend.WHISPER:
-                log.info(f"Unloading {existing} to make room for {model_id}")
-                self.unload(existing, force=True)
+            if mm.backend != Backend.WHISPER:
+                continue
+            if mm.in_flight:
+                raise TranscriberBusy(
+                    f"{existing} is serving {mm.in_flight} transcription(s); "
+                    f"loading {model_id} would kill the child mid-request"
+                )
+            log.info(f"Unloading {existing} to make room for {model_id}")
+            self.unload(existing, force=True)
 
         # Fit before spawn, for the reason every other load gates: the child
         # would otherwise allocate 2.6GB on a box that does not have it, and on
@@ -1631,22 +1674,11 @@ class ModelManager:
                 mm.name = resident
             return True
         if mm.backend == Backend.WHISPER:
-            # Restart our whisper child if it died. Unlike the VLM path this
-            # also asks the child itself, because a child that is alive is not
-            # the same as one that can answer: it holds one model and serves one
-            # transcription at a time, so poll() cannot tell a wedged child from
-            # a working one.
-            if mm.managed and mm.whisper_process and mm.whisper_process.poll() is not None:
-                log.warning(f"whisper child for {mm.name} died — restarting")
-                name = mm.name
-                del self.models[name]
-                try:
-                    self.load_whisper_model(name)
-                    return True
-                except Exception as e:
-                    log.error(f"Failed to restart whisper child for {name}: {e}")
-                    return False
-            return self.whisper.health() is not None
+            # Reports, does not repair. The repair is in `load_whisper_model`,
+            # which is where the audio route arrives: `_resolve_model` skips
+            # Backend.WHISPER entries by design, so a restart written here would
+            # be unreachable code that reads as a working recovery path.
+            return self.whisper_child_alive(mm)
 
         if mm.backend == Backend.VLM:
             # Restart our mlx-vlm process if it died.

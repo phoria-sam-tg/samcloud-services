@@ -35,6 +35,7 @@ from .manager import (
     match_whisper_model,
 )
 from .samcloud import SamcloudClient
+from .manager import TranscriberBusy
 from .whisper_client import WhisperFailed, WhisperUnavailable
 
 failures = []
@@ -92,12 +93,25 @@ def _managed(name=WHISPER_DEFAULT, backend=Backend.WHISPER, in_flight=0):
     )
 
 
+def _no_registry(*a, **kw):
+    """Stands in for any SamcloudClient call. Raises, because it should not happen.
+
+    `_request_lease` catches everything and carries on unleased, so a load still
+    works — this is here to keep the file's "no network" claim true rather than
+    approximately true, and to make a new registry call in this path show up as a
+    log line instead of a silent HTTPS request to the production plane.
+    """
+    raise RuntimeError("no registry in this test")
+
+
 def _manager() -> ModelManager:
     """A manager with every backend catalogue stubbed to empty and no registry."""
     mgr = ModelManager(sc=SamcloudClient(token="test"))
     mgr.ollama.list_models = lambda: []
     mgr.ollama.list_running = lambda: []
     mgr.llama.available_models = lambda: []
+    mgr.sc.request_lease = _no_registry
+    mgr.sc.release_lease = _no_registry
     return mgr
 
 
@@ -269,6 +283,8 @@ def main():
 
     step(6, "the spool holds nothing after a success or a failure")
     check(_spool_contents() == [], f"clean after six transcriptions: {_spool_contents()}")
+    check(not server._whisper_gate.locked(),
+          "and the resolve gate was released by every one of them")
 
     mgr = _manager()
     client, calls = _client(mgr)
@@ -369,6 +385,113 @@ def main():
               "and what whisper-1 means here")
     finally:
         server.hf_model_installed = original_installed
+
+    step(10, "[swap-while-busy] a swap cannot kill a transcription that is running")
+    mgr = _manager()
+    client, calls = _client(mgr)
+    # turbo resident and mid-request; the caller now asks for the other model.
+    # One child on one port, so honouring that ask means killing turbo's child
+    # under a transcription that has already started.
+    busy = _managed(WHISPER_DEFAULT, in_flight=1)
+    mgr.models[WHISPER_DEFAULT] = busy
+    mgr.load_whisper_model = ModelManager.load_whisper_model.__get__(mgr)
+    import subprocess as sp2
+    original_popen2 = sp2.Popen
+
+    def no_spawn2(*a, **k):
+        raise AssertionError("swapped the child while a transcription was running")
+
+    sp2.Popen = no_spawn2
+    try:
+        r = client.post("/v1/audio/transcriptions", files=_audio(),
+                        data={"model": "whisper-small"})
+        check(r.status_code == 503, f"refused with 503 (got {r.status_code})")
+        detail = r.json().get("detail", {})
+        check(detail.get("error") == "transcriber_busy",
+              f"named as busy, not as a capacity or startup failure: {detail}")
+        check(detail.get("resident") == WHISPER_DEFAULT,
+              f"and names what IS resident: {detail.get('resident')}")
+        check(r.headers.get("retry-after") == "30",
+              f"with a Retry-After header ({r.headers.get('retry-after')})")
+        check(WHISPER_DEFAULT in mgr.models and mgr.models[WHISPER_DEFAULT] is busy,
+              "the running model is untouched")
+        check(busy.in_flight == 1,
+              f"and its in-flight count is unchanged ({busy.in_flight})")
+        check("whisper-small" not in mgr.models, "the asked-for model was not loaded")
+    except BaseException:
+        sp2.Popen = original_popen2
+        raise
+
+    # The same ask, once the transcription has finished, reaches the spawn. The
+    # spawn is blocked and the attempt is what gets asserted. An earlier version
+    # of this check let the load run and treated any exception as proof the
+    # refusal had lifted — which passed while the spawn happened to fail, and on a
+    # box with room started a real 2.6GB child out of a test whose first line
+    # says it loads nothing.
+    busy.in_flight = 0
+    attempted = []
+
+    def tripwire(*a, **k):
+        attempted.append(a)
+        raise RuntimeError("spawn reached")
+
+    sp2.Popen = tripwire
+    try:
+        ModelManager.load_whisper_model(mgr, "whisper-small")
+        check(False, "an idle swap reaches the spawn (nothing raised at all)")
+    except TranscriberBusy as e:
+        check(False, f"an idle swap is still refused as busy: {e}")
+    except capacity.InsufficientCapacity as e:
+        print(f"  SKIP — the box has no room for whisper-small right now: {e}")
+    except RuntimeError as e:
+        check("spawn reached" in str(e),
+              f"an idle swap reaches the spawn (raised {e})")
+        check(attempted != [], "and a child was actually about to be started")
+        check(WHISPER_DEFAULT not in mgr.models,
+              "and the idle model was unloaded to make room")
+    finally:
+        sp2.Popen = original_popen2
+
+    step(11, "[dead-child] a child that stopped answering is replaced, not served")
+    mgr = _manager()
+    mm = _managed()
+    mm.lease_id = "lease_fake"
+    mgr.models[WHISPER_DEFAULT] = mm
+    released = []
+    mgr.sc.release_lease = lambda lease_id: released.append(lease_id)
+
+    # Alive: the resident path hands back the same entry and spawns nothing.
+    mgr.whisper.health = lambda timeout=2.0: {"status": "ok", "model": "x"}
+    got = ModelManager.load_whisper_model(mgr, WHISPER_DEFAULT)
+    check(got is mm, "a live child is reused")
+    check(got.request_count == 1, f"and the request is counted once ({got.request_count})")
+
+    # Not answering: the entry must be dropped rather than handed back. Nothing
+    # else would ever replace it — the cooldown loop is the only thing that
+    # removes an entry, and the audio route stamps last_used even on a failure,
+    # so serving the dead entry is a 503 on every request until a restart.
+    mgr.whisper.health = lambda timeout=2.0: None
+    spawned2 = []
+
+    def record_spawn(*a, **k):
+        spawned2.append(a)
+        raise RuntimeError("spawn blocked by the test")
+
+    import subprocess as sp3
+    original_popen3 = sp3.Popen
+    sp3.Popen = record_spawn
+    try:
+        try:
+            ModelManager.load_whisper_model(mgr, WHISPER_DEFAULT)
+            check(False, "a dead child leads to a fresh load")
+        except RuntimeError as e:
+            check("spawn blocked by the test" in str(e),
+                  f"a dead child leads to a fresh load attempt ({e})")
+    finally:
+        sp3.Popen = original_popen3
+    check(spawned2 != [], "a replacement child was actually spawned")
+    check(released == ["lease_fake"],
+          f"and the dead entry's lease was released, not leaked: {released}")
 
     print(f"\n{'='*60}")
     for leftover in SPOOL.iterdir():

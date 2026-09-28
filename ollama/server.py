@@ -53,6 +53,7 @@ from .manager import (
     match_vlm_model, match_gguf_model, match_exo_tier,
     WHISPER_MODELS, WHISPER_ALIASES, WHISPER_DEFAULT, match_whisper_model,
 )
+from .manager import TranscriberBusy
 from .exo_client import ExoUnavailable, ExoRequestFailed, ExoStalled
 from .samcloud import SamcloudClient
 from .ollama_client import OllamaClient
@@ -1812,8 +1813,27 @@ def _as_verbose_json(result: dict, granularities: set[str]) -> dict:
     return body
 
 
+# Serialises "decide which whisper model is resident, and claim it". Held across
+# the load and released once `in_flight` is claimed, never across a transcription.
+#
+# It exists to close a check-then-act race with a real cost. There is one child on
+# one port, so a request for the other model unloads the resident one — killing
+# whatever it is mid-way through. `in_flight` is what says "do not kill this", and
+# it is written on the event loop while the load that would read it runs in a
+# thread: without this gate, a load thread can read in_flight == 0, a request
+# handler can claim the model microseconds later, and the thread then kills the
+# child under a transcription that had already started.
+#
+# Both the read and the claim happen here, on the loop, under the lock, so there
+# is no window between them. asyncio.Lock takes no loop at construction from 3.10
+# on, so a module-level one is safe.
+_whisper_gate = asyncio.Lock()
+
+
 async def _resolve_whisper(model: str):
     """The transcription model, loaded if it is not already resident.
+
+    Call it inside `_whisper_gate` and claim `in_flight` before releasing.
 
     Separate from `_resolve_model` on purpose. That one is the chat resolver: it
     substring-matches across three catalogues and falls through to `None` so the
@@ -1841,6 +1861,26 @@ async def _resolve_whisper(model: str):
         return await asyncio.to_thread(mgr.load_whisper_model, model_id)
     except capacity.InsufficientCapacity as e:
         raise _capacity_503(e)
+    except TranscriberBusy as e:
+        # Not a fault and not a capacity answer: the box has the memory, the
+        # other model is simply mid-request. 503 with Retry-After, because the
+        # honest instruction is "ask again shortly", and naming the resident
+        # model so a caller who can use it instead does not have to guess.
+        log.info(f"Refusing a swap to {model_id}: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "transcriber_busy",
+                "message": str(e),
+                "resident": next(
+                    (n for n, mm in mgr.models.items()
+                     if mm.backend == Backend.WHISPER),
+                    None,
+                ),
+                "retry_after_s": 30,
+            },
+            headers={"Retry-After": "30"},
+        )
     except RuntimeError as e:
         log.error(f"whisper load failed for {model_id}: {e}")
         raise HTTPException(
@@ -1964,15 +2004,20 @@ async def create_transcription(
     # second DTW pass, so they are computed only when they will be returned.
     need_words = "word" in granularities
 
-    mm = await _resolve_whisper(model)
-    # Held for the length of the transcription, because this is the first
-    # backend here whose single request outlives the idle cooldown. A one-hour
-    # walkthrough runs ~7 minutes at the measured 8.6x realtime, COOLDOWN_SECONDS
-    # is 300, and `check_cooldowns` would otherwise kill the child mid-sentence
-    # and return a 502 for a request that was working. `last_used` is stamped at
-    # the END of the call for the same reason — stamping it at the start leaves a
-    # long transcription looking idle while it runs.
-    mm.in_flight += 1
+    # Resolve and claim under one lock, with no await between the claim and the
+    # release — see `_whisper_gate`. The transcription itself runs outside it, so
+    # two callers asking for the SAME model do not serialise on each other.
+    async with _whisper_gate:
+        mm = await _resolve_whisper(model)
+        # `in_flight` is held for the length of the transcription, because this is
+        # the first backend here whose single request outlives the idle cooldown.
+        # A one-hour walkthrough runs ~7 minutes at the measured 8.6x realtime,
+        # COOLDOWN_SECONDS is 300, and `check_cooldowns` would otherwise kill the
+        # child mid-sentence and return a 502 for a request that was working. It
+        # also stops a swap doing the same thing. `last_used` is stamped at the END
+        # of the call — stamped at the start, a long transcription looks idle
+        # while it runs.
+        mm.in_flight += 1
     try:
         spooled = await _spool_upload(file)
     except BaseException:

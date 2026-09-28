@@ -204,6 +204,57 @@ OFFERING_HYSTERESIS = _env_int("OFFERING_HYSTERESIS", 2)  # stable polls before 
 # past the oscillation period you are protecting against, not past the noise.
 OFFER_WINDOW_S = _env_int("OFFER_WINDOW_S", 60)
 
+# Floor on how often the hardware is actually read behind the offer, and
+# therefore a ceiling on how big the window can get.
+#
+# `/warm` is auth-exempt, on a port bound to 0.0.0.0, and every call used to
+# run the collector and append a sample: three subprocesses per request on
+# Metal (15.3ms measured on wafer 2026-09-29) and a list pruned by time but
+# never by count. So an unauthenticated caller set the sample rate. At ~333
+# req/s — which one client on the LAN reaches without trying — that is ~1,000
+# process spawns a second on a box whose whole purpose is to be a good
+# neighbour to somebody's Unity session, and ~20,000 entries inside a 60s
+# window (4.05ms of list arithmetic per call, and the total work grows with
+# the SQUARE of the poll rate, because each of those calls also walks it).
+#
+# Rate-limiting the READ fixes both at once: at one sample per second the
+# window holds at most OFFER_WINDOW_S + 1 entries whatever the request rate.
+#
+# WHY NOT A COUNT CAP, which is the obvious fix and is the unsafe one. Capping
+# `_readings` to the N most recent entries evicts the OLDEST first — and the
+# oldest is exactly where the trough lives after a render starts. A flood of
+# requests would push the low reading out of the window early and restore the
+# offer while the render was still running, which is the one direction this
+# whole mechanism exists to prevent. Under-sampling is safe; forgetting is not.
+#
+# One second is invisible to every decision made from this: `stats_loop`
+# samples at 15s and the window is 60s, so nothing here resolves anything
+# finer. (Those two numbers are coupled — 15s into 60s is what guarantees ~4
+# samples on a box with no traffic at all. Lengthening `stats_loop` thins the
+# window silently; claude-wafer-services, reviewing PR #27.)
+OFFER_MIN_SAMPLE_INTERVAL_S = float(
+    _env("OFFER_MIN_SAMPLE_INTERVAL_S", "1.0"))
+
+# Hard ceiling on the window's length, independent of the rate limit above.
+#
+# The rate limit already bounds it at OFFER_WINDOW_S / interval + 1 = 61 by
+# default, so this never engages in normal operation. It is here for the case
+# where that reasoning stops holding — the interval lowered, a caller reaching
+# `_record_reading` by another path, a future sampler — because the cost of
+# being wrong about it is borne by an unauthenticated endpoint.
+#
+# IT MERGES RATHER THAN DROPS, and that is the whole design. Dropping the
+# oldest entries is the obvious cap and the unsafe one: the oldest entry is
+# exactly where the trough sits once a render has started, so a flood of
+# requests would evict the low reading early and restore the offer while the
+# render was still running — the one direction this mechanism exists to
+# prevent. So over the cap, the two oldest entries collapse into one carrying
+# the MINIMUM available and the MAXIMUM device-in-use of the pair, stamped
+# with the LATER of their two timestamps. No extreme is lost, and the merged
+# entry ages out no sooner than the newer of its parts would have (it lives
+# slightly longer, which delays restoration — the conservative direction).
+OFFER_MAX_SAMPLES = max(4, _env_int("OFFER_MAX_SAMPLES", 120))
+
 # THE "SOMEONE IS WORKING" GATE, and it is OFF until a box measures its floor.
 #
 # `available` answers "do I fit". This answers "is anyone working", and they are

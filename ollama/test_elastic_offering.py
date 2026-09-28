@@ -67,15 +67,28 @@ def reading(available, device_inuse=500, total=65536):
 class Fixture:
     """A manager whose every input is chosen here, and restored on exit."""
 
-    def __init__(self, available=40000, device_inuse=500, catalogue=CATALOGUE):
+    def __init__(self, available=40000, device_inuse=500, catalogue=CATALOGUE,
+                 min_interval=0.0):
         self.next = reading(available, device_inuse)
         self.catalogue = catalogue
+        # 0 by default so a step testing WINDOW semantics can take several
+        # readings in the same millisecond. The rate floor is a separate
+        # property with its own step; conflating them would mean neither is
+        # tested, because a step that has to sleep a second per reading is a
+        # step nobody runs.
+        self.min_interval = min_interval
+        self.collects = 0
 
     def __enter__(self):
         self._collect = capacity.collect
         self._idle = config.FOREIGN_IDLE_MB
+        self._interval = config.OFFER_MIN_SAMPLE_INTERVAL_S
         self._vlm = manager_mod.hf_model_installed
-        capacity.collect = lambda: dict(self.next)
+        config.OFFER_MIN_SAMPLE_INTERVAL_S = self.min_interval
+        def _counted():
+            self.collects += 1
+            return dict(self.next)
+        capacity.collect = _counted
         # slice genuinely has a VLM on disk, so without this the catalogue
         # under test is whatever this box happens to hold — the test would
         # pass or fail depending on the machine running it.
@@ -100,6 +113,7 @@ class Fixture:
     def __exit__(self, *a):
         capacity.collect = self._collect
         config.FOREIGN_IDLE_MB = self._idle
+        config.OFFER_MIN_SAMPLE_INTERVAL_S = self._interval
         manager_mod.hf_model_installed = self._vlm
 
 
@@ -391,6 +405,52 @@ def main():
         # ticker gets ~20 turns; anything past a handful proves it yielded.
         check(during >= 5,
               f"the loop kept running while the hardware was read ({during})")
+
+    step(15, "an anonymous request rate is not a subprocess spawn rate")
+    # /warm is auth-exempt, on a port bound to 0.0.0.0, and reading the
+    # hardware is three subprocesses (15.3ms measured on wafer). Without a
+    # floor on the sample rate, ~333 req/s — one client on the LAN — is ~1,000
+    # process spawns a second on a box whose whole job is to be a good
+    # neighbour to somebody's render.
+    with Fixture(min_interval=60.0) as f:     # nothing in this test may re-collect
+        f.mgr.offer_reading()
+        first = f.collects
+        for _ in range(200):
+            f.mgr.offer_reading()
+        print(f"  201 calls -> {f.collects} collector run(s)")
+        check(first == 1, f"the first call reads the hardware ({first})")
+        check(f.collects == 1,
+              f"and 200 more inside the interval read it zero times "
+              f"({f.collects} total)")
+        check(len(f.mgr._readings) <= 2,
+              f"and add nothing to the window ({len(f.mgr._readings)})")
+
+    step(16, "a flood is bounded, and loses no extreme")
+    # The cap merges rather than drops. Dropping the oldest is the obvious
+    # cap and the unsafe one: after a render starts, the oldest entry IS the
+    # trough, so evicting it restores the offer mid-render.
+    with Fixture(available=40000) as f:       # min_interval 0: every call samples
+        f.set(available=900, device_inuse=46000)
+        f.mgr.offer_reading()                 # the trough, and the busy sample
+        f.set(available=40000, device_inuse=500)
+        for _ in range(500):
+            f.mgr.offer_reading()
+        r = f.mgr.offer_reading()
+        print(f"  502 samples -> len(_readings)={len(f.mgr._readings)} "
+              f"min_avail={r['memory_available_mb']} "
+              f"max_inuse={r['memory_device_inuse_mb']}")
+        check(len(f.mgr._readings) <= config.OFFER_MAX_SAMPLES,
+              f"the window is capped at {config.OFFER_MAX_SAMPLES} "
+              f"({len(f.mgr._readings)})")
+        # The assertions that matter: 500 later readings did not wash the
+        # trough out. A drop-oldest cap fails both of these.
+        check(r["memory_available_mb"] == 900,
+              f"the trough survived the flood ({r['memory_available_mb']})")
+        check(r["memory_device_inuse_mb"] == 46000,
+              f"so did the busy sample ({r['memory_device_inuse_mb']})")
+        o = f.mgr.offering()
+        check(o["loadable"] == [],
+              f"so the offer stays withdrawn ({[m['name'] for m in o['loadable']]})")
 
     print(f"\n{'='*60}")
     print(f"  {checks} checks run")

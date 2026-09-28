@@ -2025,6 +2025,36 @@ class ModelManager:
             self._readings = [(t, r) for t, r in self._readings if t >= cutoff]
             if reading:
                 self._readings.append((now, reading))
+            while len(self._readings) > config.OFFER_MAX_SAMPLES:
+                self._readings[:2] = [self._merge_readings(*self._readings[:2])]
+
+    @staticmethod
+    def _merge_readings(a: tuple, b: tuple) -> tuple:
+        """Two window entries as one, losing no extreme. `a` is the older.
+
+        Over `OFFER_MAX_SAMPLES` the window collapses its oldest pair rather
+        than discarding anything. Dropping the oldest is the obvious cap and
+        the unsafe one — see the comment on that constant — because the oldest
+        entry is where the trough lives once a render has started.
+
+        The merged entry takes the MINIMUM available and the MAXIMUM
+        device-in-use of the pair, which is exactly what `offer_reading` would
+        have taken from them separately, and the LATER timestamp, so it ages
+        out no sooner than `b` would have. Every other key comes from `b`:
+        nothing downstream reads them off the window (`offer_reading` takes
+        `memory_total_mb` from the fresh reading, not from here), and taking
+        the newer is the honest choice if that ever changes.
+        """
+        (t_a, r_a), (t_b, r_b) = a, b
+        merged = dict(r_b)
+        avails = [r.get("memory_available_mb") for r in (r_a, r_b)
+                  if r.get("memory_available_mb") is not None]
+        if avails:
+            merged["memory_available_mb"] = min(avails)
+        inuse = [r.get("memory_device_inuse_mb") for r in (r_a, r_b)
+                 if r.get("memory_device_inuse_mb") is not None]
+        merged["memory_device_inuse_mb"] = max(inuse) if inuse else None
+        return (max(t_a, t_b), merged)
 
     def offer_reading(self) -> dict:
         """The conservative view of capacity, over the trailing window.
@@ -2051,7 +2081,23 @@ class ModelManager:
         produce one — one good sample is enough to say the accelerator is busy,
         and taking the max is what makes that true.
         """
-        fresh = self._collect_stats()          # records into the window itself
+        # Rate-limited, because `/warm` is auth-exempt and this is three
+        # subprocesses (15.3ms measured on wafer). Without the floor an
+        # anonymous request rate is a process-spawn rate — ~1,000 spawns a
+        # second at ~333 req/s, on a box whose purpose is to be a good
+        # neighbour to somebody's render. One second of staleness resolves
+        # nothing here: `stats_loop` samples at 15s and the window is 60s.
+        # (claude-wafer-services, reviewing PR #27.)
+        now = time.monotonic()
+        with self._readings_lock:
+            last = self._readings[-1] if self._readings else None
+        if last is not None and now - last[0] < config.OFFER_MIN_SAMPLE_INTERVAL_S:
+            # Reuse, but still age the window — a reading withheld is not a
+            # reason to keep a stale one. Same rule as a failed collect.
+            self._record_reading({})
+            fresh = last[1]
+        else:
+            fresh = self._collect_stats()      # records into the window itself
         with self._readings_lock:
             window = [r for _, r in self._readings]
         if not window:

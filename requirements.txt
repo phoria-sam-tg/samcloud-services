@@ -9,3 +9,9 @@ pydantic>=2.0.0
 # falls back to a conservative chars/token estimate if it is missing — but a box
 # without it refuses good prompts it did not need to refuse.
 tokenizers>=0.22.0
+
+# Multipart form parsing, for POST /v1/audio/transcriptions. FastAPI raises
+# `RuntimeError: Form data requires "python-multipart" to be installed` on the
+# first request without it and imports cleanly, so the gateway starts, every
+# other route works, and only the audio route is broken.
+python-multipart>=0.0.9

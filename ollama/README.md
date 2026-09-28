@@ -12,8 +12,13 @@ with SAMcloud resource leasing for GPU memory.
 | `samcloud.py` | `SamcloudClient` — SAMcloud API (resources, leases, services, health, auth) |
 | `ollama_client.py` | `OllamaClient` — Ollama API (pull, load, unload, generate, chat) |
 | `llama_client.py` | `LlamaServerClient` — llama-server process management (discover, start, stop, health) |
+| `whisper_client.py` | `WhisperClient` — the gateway's half of the whisper child (`/health`, `/transcribe`) |
+| `whisper_server.py` | The whisper child itself. Run by `WHISPER_PYTHON` as a script, so it imports nothing from this package |
 | `test_lifecycle.py` | Integration test: full pull -> lease -> load -> infer -> unload -> release cycle |
 | `test_cooldown.py` | Integration test: load -> idle -> auto-unload -> lease released |
+| `test_whisper_routing.py` | The transcription endpoint: name resolution, refusals, the five response formats |
+| `test_whisper_kill_guard.py` | What `_kill_stray_whisper` may and may not SIGTERM |
+| `test_whisper_child.py` | The child: spool path handling, ffmpeg decoding, numpy in JSON. Needs `WHISPER_PYTHON` |
 
 ## How Requests Flow
 
@@ -32,6 +37,28 @@ _resolve_model("qwen3.5")
 Backend routing
   ├─ OLLAMA:  native /api/chat with think:false → translate to OpenAI format
   └─ LLAMA:   forward to llama-server /v1/chat/completions directly
+```
+
+Transcription is a separate path, and separate on purpose — a transcription model
+cannot answer a chat and `_resolve_model` cannot reach one:
+
+```
+Client
+  │  POST /v1/audio/transcriptions   multipart: file=@note.m4a  model=whisper-1
+  ▼
+SamcloudAuthMiddleware              (the same auth as every other route)
+  ▼
+validate                            response_format, timestamp_granularities[]
+  ▼
+_resolve_whisper("whisper-1")
+  │  → exact match on a catalogue name or an alias → whisper-large-v3-turbo
+  │  → fit gate → lease → spawn the child under WHISPER_PYTHON → poll /health
+  ▼
+spool the upload                    WHISPER_SPOOL_DIR, bounded, unlinked in a finally
+  ▼
+child: ffmpeg → 16kHz mono float32 → mlx_whisper.transcribe
+  ▼
+render                              json | text | verbose_json | srt | vtt
 ```
 
 ## Model Lifecycle
@@ -94,4 +121,12 @@ Both tests require a running SAMcloud registry and Ollama instance.
 cd ollama
 python test_lifecycle.py    # ~30s — pulls a small model, full cycle
 python test_cooldown.py     # ~45s — loads, waits 30s, verifies unload
+```
+
+The transcription tests need neither, and none of them loads a model:
+
+```bash
+python -m ollama.test_whisper_routing        # from the repo root
+python3 ollama/test_whisper_kill_guard.py
+$WHISPER_PYTHON ollama/test_whisper_child.py
 ```

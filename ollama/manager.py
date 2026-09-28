@@ -27,6 +27,7 @@ import httpx
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 from . import capacity
@@ -34,6 +35,7 @@ from . import config
 from .ollama_client import OllamaClient, estimate_memory_mb
 from .exo_client import ExoClient, ExoUnavailable
 from .llama_client import LlamaServerClient, LlamaInstance
+from .whisper_client import WhisperClient
 from .samcloud import SamcloudClient
 
 log = logging.getLogger("model-manager")
@@ -50,7 +52,12 @@ class Backend(str, Enum):
     OLLAMA = "ollama"
     LLAMA = "llama-server"
     VLM = "mlx-vlm"
-    # The pool. Unlike the three above, the gateway does not own the process
+    # Speech to text. Owned like VLM — a child process on its own port, started
+    # on demand and killed on cooldown. Unlike every other backend here it
+    # serves ONE route (/v1/audio/transcriptions) and cannot answer a chat, so
+    # it is deliberately unreachable from the chat resolver.
+    WHISPER = "mlx-whisper"
+    # The pool. Unlike the four above, the gateway does not own the process
     # and does not place the model — it holds an exclusive lease around a
     # generation and proxies. See exo_client.py.
     EXO = "exo"
@@ -64,6 +71,51 @@ VLM_MODELS = {
     "qwen2.5-vl": {"default": "mlx-community/Qwen2.5-VL-7B-Instruct-4bit", "memory_mb": 5700},
 }
 VLM_DEFAULT_MEMORY_MB = 18700
+
+WHISPER_HOST = config.WHISPER_HOST
+WHISPER_PORT = config.WHISPER_PORT
+WHISPER_PYTHON = config.WHISPER_PYTHON
+WHISPER_STARTUP_TIMEOUT = config.WHISPER_STARTUP_TIMEOUT
+# The script the child runs. Resolved from this file so the gateway hands the
+# child an absolute path and neither process depends on a working directory.
+WHISPER_SCRIPT = str(Path(__file__).resolve().parent / "whisper_server.py")
+
+# What /v1/audio/transcriptions will serve, keyed by the id a caller names.
+#
+# `memory_mb` is the peak MLX allocation measured on slice (M1 Pro, 64GB) over
+# 44.7s of narration, rounded up: the fit gate is asked whether the box can
+# hand over that much before the child is spawned. Alongside it, word error
+# rate against a written script, and seconds for that same 44.7s:
+#
+#   whisper-large-v3-turbo       WER 2.8%   2.16s   peak 2507MB
+#   whisper-large-v3-turbo-q4    WER 4.2%   1.97s   peak 2088MB
+#   whisper-small-mlx            WER 4.9%   1.48s   peak 1455MB
+#
+# turbo is the default because it is the most accurate and the 400MB it costs
+# over q4 buys a third off the error rate. `whisper-small` is here as the one
+# that still fits when the box is full, not as a speed option — it is not
+# meaningfully faster on this hardware.
+#
+# What would move these: the audio was macOS `say`, so it is clean, close-mic'd
+# and unaccented. The ORDER should hold on real speech; the absolute rates are a
+# floor and re-measuring on a real walkthrough is the honest way to revisit the
+# default.
+WHISPER_MODELS = {
+    "whisper-large-v3-turbo": {
+        "repo": "mlx-community/whisper-large-v3-turbo",
+        "memory_mb": 2600,
+    },
+    "whisper-small": {
+        "repo": "mlx-community/whisper-small-mlx",
+        "memory_mb": 1600,
+    },
+}
+# OpenAI's own id for this endpoint. A client written against their API sends
+# `model: "whisper-1"` and has no way to know what this box holds, so it maps
+# to whatever the default is rather than 404ing on a name that is correct
+# everywhere else.
+WHISPER_DEFAULT = "whisper-large-v3-turbo"
+WHISPER_ALIASES = {"whisper-1": WHISPER_DEFAULT, "whisper": WHISPER_DEFAULT}
 
 EXO_RESOURCE_ID = config.EXO_RESOURCE_ID
 EXO_TIERS = config.EXO_TIERS
@@ -87,14 +139,14 @@ def match_exo_tier(model_name: str) -> bool:
     return model_name.strip().lower() in EXO_TIERS
 
 
-def vlm_cache_dir():
-    """Where mlx-vlm will look for a repo's weights.
+def hf_cache_dir():
+    """Where a child of this process will look for a repo's weights.
 
-    Reads the same env huggingface_hub reads, in its order, because the VLM is
-    spawned as a child of this process (`load_vlm_model`) and so inherits it.
-    Do not shortcut to `~/.cache/huggingface/hub` -- that is only the default.
+    Reads the same env huggingface_hub reads, in its order, because both the
+    VLM and the whisper child are spawned by this process (`load_vlm_model`,
+    `load_whisper_model`) and so inherit it. Do not shortcut to
+    `~/.cache/huggingface/hub` -- that is only the default.
     """
-    from pathlib import Path
     v = os.environ.get("HF_HUB_CACHE")
     if v:
         return Path(v)
@@ -104,8 +156,8 @@ def vlm_cache_dir():
     return Path.home() / ".cache" / "huggingface" / "hub"
 
 
-def vlm_installed(repo_id: str) -> bool:
-    """Are this VLM's weights already on local disk?
+def hf_model_installed(repo_id: str) -> bool:
+    """Are this model's weights already on local disk?
 
     The other two local backends only advertise what is installed -- Ollama
     lists what has been pulled, llama-server lists GGUF files that exist -- and
@@ -123,15 +175,16 @@ def vlm_installed(repo_id: str) -> bool:
 
     False is the safe answer on any error: it hides a model from discovery,
     which `/models` still shows with `installed: false`, and costs nothing else
-    -- `match_vlm_model` is not gated on this, so a caller who asks for the
-    model by name anyway still reaches the existing load path.
+    -- neither `match_vlm_model` nor `match_whisper_model` is gated on this,
+    so a caller who asks for the model by name anyway still reaches the load
+    path.
     """
     from pathlib import Path
     try:
         p = Path(repo_id).expanduser()
         if p.is_dir():          # a pinned local directory, not a hub repo
             return True
-        snapshots = vlm_cache_dir() / ("models--" + repo_id.replace("/", "--")) / "snapshots"
+        snapshots = hf_cache_dir() / ("models--" + repo_id.replace("/", "--")) / "snapshots"
         return any(any(s.iterdir()) for s in snapshots.iterdir())
     except OSError:
         return False
@@ -152,6 +205,32 @@ def match_vlm_model(model_name: str):
     if "-vl" in lower or "vlm" in lower or "vision" in lower:
         return model_name, VLM_DEFAULT_MEMORY_MB
     return None
+
+
+def match_whisper_model(model_name: str):
+    """Map a requested name to a transcription model. Returns (id, repo, memory_mb) or None.
+
+    An exact, case-insensitive match on a catalogue key or an alias — the same
+    rule as `match_exo_tier` and for a sharper version of the same reason. The
+    substring matching the other backends use is right when a name identifies a
+    file we can load on demand; here it would route by coincidence. A caller
+    POSTing `model: "qwen2.5-vl"` to the audio endpoint has made a mistake worth
+    a 400, and a request naming any model that merely contains "whisper" should
+    not silently become a 2.6GB load.
+
+    An empty or absent name resolves to the default: `model` is required by
+    OpenAI's API but every client hardcodes the same string, and refusing a
+    request whose only fault is not knowing what this box holds costs the caller
+    a round trip to learn something `/v1/models` already says.
+    """
+    key = (model_name or "").strip().lower()
+    if not key:
+        key = WHISPER_DEFAULT
+    key = WHISPER_ALIASES.get(key, key)
+    info = WHISPER_MODELS.get(key)
+    if info is None:
+        return None
+    return key, info["repo"], info["memory_mb"]
 
 
 def match_gguf_model(model_name: str, available: list[dict]):
@@ -200,12 +279,20 @@ class ManagedModel:
     last_used: float
     request_count: int = 0
     managed: bool = True  # False = pre-existing process we adopted
+    # Requests being served right now. Only Backend.WHISPER sets it: a
+    # transcription is the one request here that can outlive COOLDOWN_SECONDS,
+    # so it is the one that needs the cooldown loop to leave its model alone.
+    # Mutated only from the event loop (the request handler and
+    # `check_cooldowns` both run there), so it needs no lock — a load runs in a
+    # thread but never touches this.
+    in_flight: int = 0
     # Set only for Backend.EXO, where the dict key is the *tier* a caller asks
     # for ("think") while `name` is whatever model the pool currently holds.
     # Every other backend keys on the model name itself.
     tier: Optional[str] = None
     llama_instance: Optional[LlamaInstance] = field(default=None, repr=False)
     vlm_process: Optional[subprocess.Popen] = field(default=None, repr=False)
+    whisper_process: Optional[subprocess.Popen] = field(default=None, repr=False)
 
 
 @dataclass
@@ -214,6 +301,7 @@ class ModelManager:
     ollama: OllamaClient = field(default_factory=OllamaClient)
     llama: LlamaServerClient = field(default_factory=LlamaServerClient)
     exo: ExoClient = field(default_factory=ExoClient)
+    whisper: WhisperClient = field(default_factory=WhisperClient)
     models: dict[str, ManagedModel] = field(default_factory=dict)
     # Pool leases currently held by this process, so shutdown can give back
     # what a killed request did not. A set rather than a single slot: the
@@ -334,8 +422,10 @@ class ModelManager:
         # mlx-vlm is NOT adopted: the gateway owns its lifecycle and spins it
         # up on demand (see load_vlm_model). Any mlx-vlm left running from a
         # previous gateway is a stray — kill it so we always start from a clean,
-        # owned state and never route to a process we can't tear down.
+        # owned state and never route to a process we can't tear down. The
+        # whisper child is owned the same way and reaped for the same reason.
         self._kill_stray_vlm()
+        self._kill_stray_whisper()
 
         return adopted
 
@@ -418,6 +508,7 @@ class ModelManager:
             "available": {
                 "ollama": self._safe_ollama_list(),
                 "gguf": [m["name"] for m in self.llama.available_models()],
+                "whisper": self.whisper_catalogue_mb(),
             },
             "resource": self._get_resource_summary(),
             "leases": self._get_active_leases(),
@@ -481,6 +572,46 @@ class ModelManager:
             log.warning(f"Could not read model catalogue: {e}")
         return out
 
+    def _refuse_for_capacity(
+        self,
+        model_name: str,
+        need_mb: int,
+        avail_mb: int,
+        extra: str = "",
+        catalogue: Optional[dict] = None,
+    ):
+        """Always raises. The one place a load turns a fit into a refusal.
+
+        Every owned backend funnels through here so a caller cannot tell them
+        apart by how they decline — `server._capacity_503()` renders whatever
+        this raises. `catalogue` is what "fits right now" is drawn from, and it
+        is a parameter because it is not the same set for every backend: a
+        refused transcription listing only chat models would be answering a
+        question nobody asked.
+        """
+        if catalogue is None:
+            catalogue = self.catalogue_mb()
+        fitting = capacity.servable(catalogue, avail_mb)
+        detail = (
+            f"{model_name} needs ~{need_mb}MB, but only "
+            f"{capacity.usable_mb(avail_mb)}MB is on offer "
+            f"({int(capacity.USABLE_FRACTION * 100)}% of the {avail_mb}MB "
+            f"free right now)"
+        )
+        detail += extra
+        detail += (
+            f". Fits right now: {', '.join(fitting)}" if fitting
+            else ". Nothing in the catalogue fits right now."
+        )
+        log.info(f"Refusing load: {detail}")
+        raise capacity.InsufficientCapacity(
+            detail,
+            need_mb=need_mb,
+            usable_mb=capacity.usable_mb(avail_mb),
+            available_mb=avail_mb,
+            fits_now=fitting,
+        )
+
     def load_ollama_model(self, model_name: str) -> ManagedModel:
         """Load an Ollama model with lease management."""
         if model_name in self.models:
@@ -509,30 +640,13 @@ class ModelManager:
                     log.info(f"Unloading {existing} to make room for {model_name}")
                     self.unload(existing, force=True)
             else:
-                fitting = capacity.servable(self.catalogue_mb(), avail_mb)
-                detail = (
-                    f"{model_name} needs ~{need_mb}MB, but only "
-                    f"{capacity.usable_mb(avail_mb)}MB is on offer "
-                    f"({int(capacity.USABLE_FRACTION * 100)}% of the {avail_mb}MB "
-                    f"free right now)"
-                )
+                extra = ""
                 if resident:
-                    detail += (
+                    extra = (
                         f" ({reclaimable}MB held by {', '.join(resident)}, "
                         f"released on idle)"
                     )
-                detail += (
-                    f". Fits right now: {', '.join(fitting)}" if fitting
-                    else ". Nothing in the catalogue fits right now."
-                )
-                log.info(f"Refusing load: {detail}")
-                raise capacity.InsufficientCapacity(
-                    detail,
-                    need_mb=need_mb,
-                    usable_mb=capacity.usable_mb(avail_mb),
-                    available_mb=avail_mb,
-                    fits_now=fitting,
-                )
+                self._refuse_for_capacity(model_name, need_mb, avail_mb, extra)
 
         # Pull if needed
         local = [m["name"] for m in self.ollama.list_models()]
@@ -816,6 +930,208 @@ class ModelManager:
             vlm_process=proc,
         )
         self.models[resolved] = mm
+        return mm
+
+    # -- speech to text (Backend.WHISPER) --
+
+    def whisper_catalogue_mb(self) -> dict:
+        """Transcription models whose weights are on disk, by memory cost.
+
+        The audio half of `catalogue_mb`, kept separate rather than merged into
+        it: that one feeds `_compute_offering`, where adding a 2.6GB model would
+        change what `offering:full` means on every box without anything about
+        chat capacity having changed.
+        """
+        return {
+            model_id: info["memory_mb"]
+            for model_id, info in WHISPER_MODELS.items()
+            if hf_model_installed(info["repo"])
+        }
+
+    def _whisper_child_log_tail(self, lines: int = 12) -> str:
+        """The last few lines the child printed, for an error that says why."""
+        try:
+            with open(config.WHISPER_LOG_FILE, "r", errors="replace") as fh:
+                tail = fh.readlines()[-lines:]
+        except OSError:
+            return ""
+        return "".join(tail).strip()
+
+    def _kill_stray_whisper(self):
+        """Terminate any whisper child the gateway doesn't own.
+
+        Frees WHISPER_PORT and guarantees we never route to an un-owned process.
+        Same shape and same guard as `_kill_stray_vlm` — `pgrep -f` is a
+        substring match over a whole command line, so every candidate is
+        verified before it is signalled.
+        """
+        owned = {
+            mm.whisper_process.pid
+            for mm in self.models.values()
+            if mm.backend == Backend.WHISPER and mm.whisper_process
+        }
+        try:
+            out = subprocess.run(
+                ["pgrep", "-f", "whisper_server.py"],
+                capture_output=True, text=True,
+            )
+        except Exception as e:
+            log.warning(f"Could not scan for stray whisper processes: {e}")
+            return
+        for line in out.stdout.split():
+            try:
+                pid = int(line)
+            except ValueError:
+                continue
+            if pid in owned or pid == os.getpid():
+                continue
+            if not self._is_whisper_server(pid):
+                log.debug(f"pid {pid} matched the whisper pattern but is not one; leaving it")
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                log.info(f"Killed stray whisper process {pid}")
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                log.warning(f"Failed to kill stray whisper process {pid}: {e}")
+
+    @staticmethod
+    def _is_whisper_server(pid: int) -> bool:
+        """True only if `pid` is genuinely a whisper child we own.
+
+        Our uid, `argv[0]` equal to WHISPER_PYTHON, and WHISPER_SCRIPT present
+        as its own argv token — exactly the shape `load_whisper_model` spawns.
+        The argv[0] check is the load-bearing one for the same reason it is in
+        `_is_vlm_server`: `ps -o command=` prints without quoting, so a single
+        quoted argument containing the script name reappears as separate
+        tokens, and only argv[0] says what a process was EXECUTED as.
+        Asserted by test_whisper_kill_guard.py: without it, cases [2] and [5]
+        signal a process that is not ours.
+        """
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "uid=,command=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            )
+        except Exception:
+            return False
+        line = out.stdout.strip()
+        if not line:
+            return False
+        uid_s, _, cmd = line.partition(" ")
+        try:
+            if int(uid_s.strip()) != os.getuid():
+                return False
+        except ValueError:
+            return False
+        toks = cmd.split()
+        if not toks:
+            return False
+        if toks[0] != WHISPER_PYTHON:
+            return False
+        return WHISPER_SCRIPT in toks[1:]
+
+    def load_whisper_model(self, model_name: str) -> ManagedModel:
+        """Start the whisper child for a transcription model on demand.
+
+        The gateway owns the process: it spawns whisper_server.py under
+        WHISPER_PYTHON, leases the memory the model was measured to peak at, and
+        tears both down on cooldown or unload. One child at a time on
+        WHISPER_PORT — a request for the other model swaps it.
+
+        Blocking, like `load_vlm_model`. Its caller awaits it in a thread.
+        """
+        match = match_whisper_model(model_name)
+        if match is None:
+            raise RuntimeError(f"{model_name} is not a transcription model on this box")
+        model_id, repo, memory_mb = match
+
+        if model_id in self.models:
+            mm = self.models[model_id]
+            mm.last_used = time.time()
+            mm.request_count += 1
+            return mm
+
+        # One child per port — swap out the other whisper model first.
+        for existing, mm in list(self.models.items()):
+            if mm.backend == Backend.WHISPER:
+                log.info(f"Unloading {existing} to make room for {model_id}")
+                self.unload(existing, force=True)
+
+        # Fit before spawn, for the reason every other load gates: the child
+        # would otherwise allocate 2.6GB on a box that does not have it, and on
+        # this hardware that is a kernel panic rather than a failed malloc.
+        avail_mb = capacity.collect().get("memory_available_mb", 0)
+        if not capacity.fits(memory_mb, avail_mb):
+            self._refuse_for_capacity(
+                model_id, memory_mb, avail_mb,
+                catalogue={**self.catalogue_mb(), **self.whisper_catalogue_mb()},
+            )
+
+        self._kill_stray_whisper()
+
+        lease_id = self._request_lease(model_id, memory_mb)
+
+        config.WHISPER_SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+        config.WHISPER_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        log.info(f"Starting whisper child for {repo} on {WHISPER_HOST}:{WHISPER_PORT}...")
+        with open(config.WHISPER_LOG_FILE, "a") as child_log:
+            proc = subprocess.Popen(
+                [
+                    WHISPER_PYTHON, WHISPER_SCRIPT,
+                    "--model", repo,
+                    "--host", WHISPER_HOST,
+                    "--port", str(WHISPER_PORT),
+                    "--spool", str(config.WHISPER_SPOOL_DIR),
+                    "--ffmpeg", config.FFMPEG_BIN,
+                ],
+                stdout=child_log,
+                stderr=subprocess.STDOUT,
+            )
+
+        ready = False
+        for _ in range(WHISPER_STARTUP_TIMEOUT):
+            if proc.poll() is not None:
+                self._release_lease_quietly(lease_id)
+                tail = self._whisper_child_log_tail()
+                raise RuntimeError(
+                    f"whisper child for {repo} exited early (code {proc.returncode})"
+                    + (f": {tail}" if tail else "")
+                )
+            health = self.whisper.health()
+            # The model, not just a 200: a child left over from a previous
+            # gateway would answer /health while holding the OTHER model, and
+            # transcribing on it would return a quality nobody asked for under
+            # the id they did ask for.
+            if health and health.get("model") == repo:
+                ready = True
+                break
+            time.sleep(1)
+
+        if not ready:
+            proc.terminate()
+            self._release_lease_quietly(lease_id)
+            raise RuntimeError(
+                f"whisper child for {repo} did not become healthy in "
+                f"{WHISPER_STARTUP_TIMEOUT}s"
+            )
+
+        now = time.time()
+        mm = ManagedModel(
+            name=model_id,
+            backend=Backend.WHISPER,
+            memory_mb=memory_mb,
+            lease_id=lease_id,
+            port=WHISPER_PORT,
+            loaded_at=now,
+            last_used=now,
+            request_count=1,
+            managed=True,
+            whisper_process=proc,
+        )
+        self.models[model_id] = mm
         return mm
 
     # -- the pool (Backend.EXO) --
@@ -1314,6 +1630,24 @@ class ModelManager:
                 log.info(f"pool resident model changed: {mm.name} -> {resident}")
                 mm.name = resident
             return True
+        if mm.backend == Backend.WHISPER:
+            # Restart our whisper child if it died. Unlike the VLM path this
+            # also asks the child itself, because a child that is alive is not
+            # the same as one that can answer: it holds one model and serves one
+            # transcription at a time, so poll() cannot tell a wedged child from
+            # a working one.
+            if mm.managed and mm.whisper_process and mm.whisper_process.poll() is not None:
+                log.warning(f"whisper child for {mm.name} died — restarting")
+                name = mm.name
+                del self.models[name]
+                try:
+                    self.load_whisper_model(name)
+                    return True
+                except Exception as e:
+                    log.error(f"Failed to restart whisper child for {name}: {e}")
+                    return False
+            return self.whisper.health() is not None
+
         if mm.backend == Backend.VLM:
             # Restart our mlx-vlm process if it died.
             if mm.managed and mm.vlm_process and mm.vlm_process.poll() is not None:
@@ -1379,6 +1713,19 @@ class ModelManager:
         elif mm.backend == Backend.LLAMA:
             result = self.llama.stop(mm.port)
             log.info(f"Stopped llama-server: {result}")
+        elif mm.backend == Backend.WHISPER:
+            if mm.whisper_process:
+                try:
+                    mm.whisper_process.terminate()
+                    try:
+                        mm.whisper_process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        mm.whisper_process.kill()
+                    log.info(f"Stopped whisper child for {mm.name}")
+                except Exception as e:
+                    log.warning(f"whisper stop error: {e}")
+            else:
+                self._kill_stray_whisper()
         elif mm.backend == Backend.VLM:
             if mm.vlm_process:
                 try:
@@ -1418,7 +1765,9 @@ class ModelManager:
         to_unload = [
             name
             for name, mm in self.models.items()
-            if mm.managed and (now - mm.last_used) > COOLDOWN_SECONDS
+            if mm.managed
+            and not mm.in_flight
+            and (now - mm.last_used) > COOLDOWN_SECONDS
         ]
         for name in to_unload:
             idle = int(now - self.models[name].last_used)

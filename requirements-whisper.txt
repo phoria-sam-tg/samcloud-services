@@ -1,0 +1,18 @@
+# The whisper child's venv — NOT the gateway's.
+#
+#   uv venv --python 3.12 ~/code/mlx-whisper-server/.venv
+#   uv pip install --python ~/code/mlx-whisper-server/.venv/bin/python \
+#       -r requirements-whisper.txt
+#   uv pip uninstall --python ~/code/mlx-whisper-server/.venv/bin/python torch
+#
+# Point WHISPER_PYTHON at that interpreter. It runs ollama/whisper_server.py as
+# a script, so it needs nothing else from this repo.
+mlx-whisper>=0.4.3
+fastapi>=0.100.0
+uvicorn>=0.20.0
+
+# That last uninstall line is not a workaround, it is the dependency being
+# wrong: mlx-whisper declares `torch` and imports it only in
+# `torch_whisper.py`, which is the weight CONVERSION path. Transcription never
+# reaches it. Measured on slice 2026-09-29: with torch the venv is 991MB,
+# without it 485MB, and the transcript of the same file is byte-identical.

@@ -4,11 +4,12 @@ This is **samcloud-services** — infrastructure for managed model inference on 
 
 ## What This Does
 
-A FastAPI gateway (`ollama/server.py`) that unifies Ollama (MLX), llama-server (llama.cpp)
-and mlx-vlm (vision-language) behind an OpenAI-compatible API, with SAMcloud resource
-leasing for GPU memory management. Models spin up on demand, unload after 5 min idle.
+A FastAPI gateway (`ollama/server.py`) that unifies Ollama (MLX), llama-server (llama.cpp),
+mlx-vlm (vision-language) and mlx-whisper (speech to text) behind an OpenAI-compatible
+API, with SAMcloud resource leasing for GPU memory management. Models spin up on demand,
+unload after 5 min idle.
 
-A fourth backend, the **exo pool** (`Backend.EXO`), is reached the same way but owned
+A fifth backend, the **exo pool** (`Backend.EXO`), is reached the same way but owned
 differently: the gateway neither starts it nor places its model, and holds an exclusive
 lease around each generation. Placing the model is still out of band — that limitation
 stands. Starting the node is not: the pool ran as `sam` and was believed to need
@@ -59,6 +60,8 @@ Staging (legacy) used `slice-test/*` identities pointing at `stg.samtg.xyz:9443`
 | `ollama/samcloud.py` | SAMcloud API client. All registry calls go through this |
 | `ollama/ollama_client.py` | Ollama API. Note: `chat()` passes `**kwargs` so `think=False` works |
 | `ollama/llama_client.py` | llama-server process management. `discover_running()` parses `ps aux` |
+| `ollama/whisper_client.py` | The gateway's half of the whisper child — `/health` sync (the spawn loop polls it), `/transcribe` async (a transcription runs for minutes) |
+| `ollama/whisper_server.py` | The whisper child. Executed as a SCRIPT by `WHISPER_PYTHON`, so it imports nothing from this package — a relative import here is an ImportError at startup. Decodes with the ffmpeg the gateway names, never PATH |
 | `ollama/exo_client.py` | The exo pool. Already OpenAI-compatible, so chat is a proxy. `resident_model()` reads `/state`; non-streaming goes through `chat_collect()` because exo's own `stream:false` returns no body |
 
 ## Run / Test
@@ -76,6 +79,21 @@ cd ollama && python test_cooldown.py    # Idle unload verification
 python ollama/test_exo_lease.py        # Pool lease verdict + resident model (no network)
 python -m ollama.test_prompt_size      # Prompt gate: 413 shape, and that a refusal takes no lease
 python ollama/test_exo_stall.py        # Abort a generation that starts then stops (no network)
+
+# Transcription. None of these loads a model or reaches the registry.
+python -m ollama.test_whisper_routing        # Endpoint: names, refusals, five formats, cooldown hold
+python3 ollama/test_whisper_kill_guard.py    # What the stray-child reaper may signal
+$WHISPER_PYTHON ollama/test_whisper_child.py # Child: spool paths, ffmpeg, numpy in JSON
+```
+
+The child test runs under the CHILD's interpreter, not the gateway's — it imports
+`whisper_server`, which imports numpy. `WHISPER_TEST_AUDIO=<file>` adds a real
+transcription to it. Setting up that interpreter:
+
+```bash
+uv venv --python 3.12 ~/code/mlx-whisper-server/.venv
+uv pip install --python ~/code/mlx-whisper-server/.venv/bin/python -r requirements-whisper.txt
+uv pip uninstall --python ~/code/mlx-whisper-server/.venv/bin/python torch
 ```
 
 `test_capacity_refusal` loads nothing and leases nothing — the refusal precedes
@@ -153,6 +171,36 @@ the 503 path the test exists for.
   prefill memory grows faster than linearly with prompt length, so 4x the tokens
   cost 7x the memory and an intuited limit lands in the wrong place. It is a
   property of the boxes and the placement: re-measure when either changes.
+- **Speech to text is a child process, not an import** (ticket #858) —
+  `Backend.WHISPER` is owned exactly as mlx-vlm is: `load_whisper_model` spawns
+  `ollama/whisper_server.py` under `WHISPER_PYTHON`, leases, polls `/health`, and
+  kills it on cooldown. Two measurements decided against importing mlx-whisper
+  into the gateway: the wheels are 485MB the gateway never calls, and a
+  transcription peaks at 2.5GB, which a killed process returns to the OS and a
+  dropped Python reference returns to MLX's buffer cache. The child is polled for
+  its **model**, not just a 200 — a leftover child answers `/health` while holding
+  the other model.
+- **The audio and chat name spaces do not meet** (ticket #858) — `match_whisper_model`
+  matches exactly, like `match_exo_tier` and unlike every other matcher here, and
+  `_resolve_model` skips `Backend.WHISPER` entries in both its exact and substring
+  passes. A transcription model shares `mgr.models` so leases, cooldown, status and
+  shutdown cover it for free, and that is precisely what put it in reach of a chat
+  request for a backend with no chat route.
+- **A request can outlive the cooldown** (ticket #858) — a transcription is the
+  first request here that runs longer than `COOLDOWN_SECONDS`: a one-hour
+  walkthrough takes about seven minutes at the measured 8.6x realtime, against a
+  300s idle timer. `ManagedModel.in_flight` is held for the call and
+  `check_cooldowns` skips a model that has one, so the loop cannot kill a child
+  mid-sentence and turn a working request into a 502. `last_used` is stamped at the
+  END of the call — stamping it at the start leaves a long transcription looking
+  idle while it runs.
+- **Whisper memory is measured, and the measurement names its own limits** (ticket
+  #858) — `WHISPER_MODELS[*]["memory_mb"]` is peak MLX allocation on slice over
+  44.7s of narration, alongside word error rate against a written script:
+  turbo 2.8% / 2507MB, turbo-q4 4.2% / 2088MB, small 4.9% / 1455MB. The audio was
+  macOS `say`, so it is clean, close-mic'd and unaccented: the ORDER should hold on
+  real speech and the absolute rates are a floor. Re-measure on a real walkthrough
+  before changing the default on the strength of these.
 - **Three pillars** — SAMcloud provides routing, resources, and auth
 
 ## Current State

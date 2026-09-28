@@ -192,6 +192,59 @@ VLM_PYTHON = _env(
 )
 VLM_STARTUP_TIMEOUT = _env_int("VLM_STARTUP_TIMEOUT", 120)
 
+# --- speech to text (Backend.WHISPER) ---
+# A fourth gateway-owned backend, the same shape as mlx-vlm: a child process on
+# its own port, started on demand, leased, and killed after the idle cooldown.
+# It is a separate process rather than an import for two reasons that are
+# properties of this box, not preferences:
+#
+#   1. mlx-whisper pulls mlx, numba, llvmlite and scipy — 485MB of wheels that
+#      the gateway itself never calls. Keeping them behind an interpreter the
+#      gateway only execs means a broken whisper install cannot stop the
+#      gateway importing.
+#   2. A transcription's peak is 2.5GB (measured below). Killing a process
+#      returns that to the OS; dropping a Python reference to an MLX array
+#      returns it to MLX's buffer cache, which this box's own history says is
+#      not the same thing.
+WHISPER_ENABLED = _env_bool("WHISPER_ENABLED", True)
+WHISPER_HOST = _env("WHISPER_HOST", "127.0.0.1")
+WHISPER_PORT = _env_int("WHISPER_PORT", 8803)
+# The interpreter that has mlx-whisper. Deliberately NOT the gateway's own:
+# see requirements-whisper.txt for what goes in it.
+WHISPER_PYTHON = _env(
+    "WHISPER_PYTHON",
+    str(Path.home() / "code" / "mlx-whisper-server" / ".venv" / "bin" / "python"),
+)
+# Spawn to first healthy /health. Measured on slice with weights already in the
+# HF cache: 3-5s. The budget is wide because a model whose weights are NOT yet
+# cached downloads them at startup, and 1.6GB over a domestic link is minutes.
+WHISPER_STARTUP_TIMEOUT = _env_int("WHISPER_STARTUP_TIMEOUT", 300)
+# One transcription. whisper-large-v3-turbo runs ~8.6x realtime on slice
+# (measured: 308s of audio in 35.9s), so this covers about four hours of audio.
+WHISPER_REQUEST_TIMEOUT = _env_int("WHISPER_REQUEST_TIMEOUT", 1800)
+# Refuse an upload larger than this before reading it. It bounds disk in the
+# spool and, loosely, the runtime above: 200MB of AAC at 64kbit/s is ~7 hours.
+WHISPER_MAX_UPLOAD_MB = _env_int("WHISPER_MAX_UPLOAD_MB", 200)
+# Where an upload lands on its way to the child. The gateway writes here and
+# deletes in a finally; the child refuses any path that is not inside it, so a
+# request cannot name a file it did not upload.
+WHISPER_SPOOL_DIR = Path(
+    _env("WHISPER_SPOOL_DIR", str(Path.home() / "var" / "samcloud-services" / "spool" / "whisper"))
+)
+# The child's stdout and stderr, appended. Not DEVNULL: the failures this
+# backend has are startup failures — a venv without mlx-whisper, a model id
+# that is not a repo, a full disk mid-download — and all of them are only
+# legible in the traceback the child prints on its way out. `load_whisper_model`
+# reads the tail of this file into the error it raises, so a caller is told why
+# and not just that.
+WHISPER_LOG_FILE = Path(
+    _env("WHISPER_LOG_FILE", str(Path.home() / "var" / "samcloud-services" / "logs" / "whisper-child.log"))
+)
+# Every audio format the endpoint accepts is decoded by this binary, so it is
+# named rather than found on PATH: the gateway and its children are started by
+# launchd, whose PATH does not include /opt/homebrew/bin.
+FFMPEG_BIN = _env("FFMPEG_BIN", shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg")
+
 # Force-fit a requested model by unloading whatever is resident.
 # OFF by default: the contract is "publish what is available and let the
 # handshake pick a model that fits", not "evict to satisfy every ask".

@@ -72,8 +72,17 @@ def main():
     check(r["compute_pct"] == 62.0, f"compute_pct 62 ({r['compute_pct']})")
     check(r["temperature_c"] == 72.0, f"temperature_c 72 ({r['temperature_c']})")
     check(r["power_draw_w"] == 115.25, f"power_draw_w 115.25 ({r['power_draw_w']})")
-    missing = [k for k in capacity.CONTRACT_KEYS if k not in r]
-    check(not missing, f"CUDA arm meets the same contract (missing: {missing})")
+    # The parser is pure and so does not carry load_avg_1m — `_collect_cuda`
+    # adds that. Everything the ROW can supply is here; step 10 checks the
+    # assembled reading against the full contract.
+    check("load_avg_1m" not in r,
+          "the parser adds no clock-dependent field of its own")
+    missing = [k for k in capacity.CONTRACT_KEYS
+               if k not in r and k != "load_avg_1m"]
+    check(not missing, f"every memory key the row supplies (missing: {missing})")
+    # A pure function of its input: same row, same dict, twice.
+    check(capacity._parse_cuda_csv(ADA_ROW) == r,
+          "parsing the same row twice gives the same dict")
 
     step(3, "an unreadable sensor is None, never zero")
     r = capacity._parse_cuda_csv(ADA_ROW_NA)
@@ -252,6 +261,32 @@ def main():
           f"and the row comes back parsed ({reading['memory_available_mb']})")
     check(recorded["kw"].get("timeout") == 10,
           f"the call is bounded ({recorded['kw'].get('timeout')})")
+    missing = [k for k in capacity.CONTRACT_KEYS if k not in reading]
+    check(not missing,
+          f"the assembled CUDA reading meets the full contract ({missing})")
+    check("load_avg_1m" in reading, "_collect_cuda adds load_avg_1m")
+
+    step(11, "foreign_mb is a quantity, not a verdict")
+    # The trap this guards: `foreign_mb(...) > 0` reads as "someone is
+    # working" and is permanently TRUE on every box we have. wafer measured
+    # 2796 MB with nothing resident and the gateway owning nothing; ada 5,515
+    # MB idle, 11% of the board. A gate written that way never offers anything
+    # again and looks like correct conservative behaviour while doing it.
+    WAFER_IDLE, ADA_IDLE = 2796, 5515
+    check(capacity.foreign_mb(WAFER_IDLE, 0) > 0,
+          f"wafer idle is foreign {capacity.foreign_mb(WAFER_IDLE, 0)}MB > 0")
+    check(capacity.foreign_mb(ADA_IDLE, 0) > 0,
+          f"ada idle is foreign {capacity.foreign_mb(ADA_IDLE, 0)}MB > 0")
+    # Which is the point: nothing in this module decides. The docstring has to
+    # say so, because the function name reads like a verdict.
+    doc = (capacity.foreign_mb.__doc__ or "").lower()
+    flat = doc.replace(",", "")          # the prose writes 5,515
+    check("never against zero" in doc,
+          "the docstring warns against comparing to zero")
+    check("> 0" in doc, "and names the exact expression that goes wrong")
+    check(str(WAFER_IDLE) in flat and str(ADA_IDLE) in flat,
+          f"and names both measured idle floors ({WAFER_IDLE}, {ADA_IDLE}) "
+          f"so the warning is checkable rather than a vibe")
 
     print(f"\n{'='*60}")
     print(f"  {checks} checks run")

@@ -557,8 +557,10 @@ def _cuda_number(raw: str) -> Optional[float]:
 def _parse_cuda_csv(line: str) -> dict:
     """One `--format=csv,noheader,nounits` row into a capacity reading.
 
-    Split out from the subprocess call so the arm is testable on a box with no
-    NVIDIA card in it — which is every box that reviews this code.
+    A pure function of `line` — no clock, no system state — so the arm is
+    testable on a box with no NVIDIA card in it, which is every box that
+    reviews this code. `_collect_cuda` adds `load_avg_1m` afterwards; it does
+    not belong in here for exactly that reason.
 
     `memory.used` is the WHOLE BOARD: every tenant, including ones this Linux
     side cannot even enumerate (see the module docstring). Subtracting it from
@@ -594,7 +596,6 @@ def _parse_cuda_csv(line: str) -> dict:
         "compute_pct": util,
         "temperature_c": temp,
         "power_draw_w": power,
-        "load_avg_1m": _load_avg(),
     }
 
 
@@ -611,7 +612,12 @@ def _collect_cuda() -> dict:
     rows = [r for r in out.splitlines() if r.strip()]
     if not rows:
         raise ValueError(f"nvidia-smi --id={CUDA_INDEX} returned no rows")
-    return _parse_cuda_csv(rows[0])
+    # `load_avg_1m` is added HERE and not in the parser, so that the parser is
+    # genuinely a pure function of its input string and a test can assert a
+    # whole dict against a recorded row. It was inside, which made a function
+    # the docstring sells as pure read system state and return a field that
+    # moves between runs (claude-wafer-services, reviewing PR #25).
+    return {**_parse_cuda_csv(rows[0]), "load_avg_1m": _load_avg()}
 
 
 def collect() -> dict:
@@ -662,6 +668,17 @@ def foreign_mb(device_inuse_mb: Optional[int], own_mb: int) -> Optional[int]:
     stranger and costs us an offer; over-counting would hide one and let us
     load on top of somebody's work. Only the second is a failure Sam asked us
     to prevent.
+
+    COMPARE IT AGAINST A MEASURED BASELINE, NEVER AGAINST ZERO. The idle floor
+    is nonzero on both arms and differs per box: wafer read 2796 MB with no
+    model resident and the gateway owning nothing (WindowServer and a Unity
+    session), and 1.0-1.2 GB on a quieter day; ada read 5,515 MB idle, 11% of
+    the board before anything loads. So `foreign_mb(...) > 0` is permanently
+    true on every box we have, and a gate written that way never offers
+    anything again while looking like correct conservative behaviour — the
+    failure nobody chases. The threshold is a per-box constant
+    (`config.FOREIGN_IDLE_MB`, which has no default on purpose); this function
+    returns a quantity, not a verdict.
 
     Returns None when the device figure is unavailable — see `_accel_stats`.
     None is not zero and must not be coerced to it by a caller: "we cannot tell

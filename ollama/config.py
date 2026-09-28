@@ -208,7 +208,15 @@ VLM_STARTUP_TIMEOUT = _env_int("VLM_STARTUP_TIMEOUT", 120)
 #      not the same thing.
 WHISPER_ENABLED = _env_bool("WHISPER_ENABLED", True)
 WHISPER_HOST = _env("WHISPER_HOST", "127.0.0.1")
-WHISPER_PORT = _env_int("WHISPER_PORT", 8803)
+# 8805, and the first choice of 8803 is worth recording because the check that
+# cleared it could not see what it was checking. Several samcloud devices are
+# separate ACCOUNTS on one Mac, so they share one port space, and
+# `lsof -iTCP:8803 -sTCP:LISTEN` run as this account listed nothing while
+# ios-dev-slice/tapes-landing was listening on it. The child then started, loaded
+# its weights, and died on `[errno 48] address already in use`.
+# Two things that do see a port held by another account: `GET /services` on the
+# registry, which records the port of every service on the fleet, and a bind.
+WHISPER_PORT = _env_int("WHISPER_PORT", 8805)
 # The interpreter that has mlx-whisper. Deliberately NOT the gateway's own:
 # see requirements-whisper.txt for what goes in it.
 WHISPER_PYTHON = _env(

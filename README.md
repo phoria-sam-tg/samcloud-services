@@ -222,7 +222,7 @@ samcloud registry + the `claude-services-slice` device.
 | `WHISPER_ENABLED` | `true` | Advertise transcription models on `/v1/models` |
 | `WHISPER_PYTHON` | `~/code/mlx-whisper-server/.venv/bin/python` | Python that runs `ollama/whisper_server.py` |
 | `WHISPER_HOST` | `127.0.0.1` | Host the on-demand whisper child binds |
-| `WHISPER_PORT` | `8803` | Port for the on-demand whisper child |
+| `WHISPER_PORT` | `8805` | Port for the on-demand whisper child |
 | `WHISPER_STARTUP_TIMEOUT` | `300` | Seconds to wait for the child to become healthy |
 | `WHISPER_REQUEST_TIMEOUT` | `1800` | Seconds one transcription may take |
 | `WHISPER_MAX_UPLOAD_MB` | `200` | Upload limit, refused with `413` |

@@ -2,13 +2,13 @@
 
 Managed model inference for Apple Silicon Macs on a [SAMcloud](https://github.com/phoria-sam-tg) network.
 
-A FastAPI gateway that unifies [Ollama](https://ollama.com) (MLX) and [llama.cpp](https://github.com/ggml-org/llama.cpp) (Metal) behind a single **OpenAI-compatible API**, with centralized GPU memory management via SAMcloud resource leasing.
+A FastAPI gateway that unifies [Ollama](https://ollama.com) (MLX), [llama.cpp](https://github.com/ggml-org/llama.cpp) (Metal) and [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (speech to text) behind a single **OpenAI-compatible API**, with centralized GPU memory management via SAMcloud resource leasing.
 
 Models spin up on demand and unload after idle timeout, freeing GPU memory for other workloads.
 
 ## Features
 
-- **OpenAI-compatible** — `POST /v1/chat/completions` works with any OpenAI SDK client
+- **OpenAI-compatible** — `POST /v1/chat/completions` and `POST /v1/audio/transcriptions` work with any OpenAI SDK client
 - **Multi-backend** — Routes to Ollama or llama-server transparently based on model type
 - **GPU memory leasing** — Requests SAMcloud leases before loading, releases on unload
 - **Auto spin-up/cooldown** — Models load on first request, unload after 5 min idle
@@ -16,6 +16,7 @@ Models spin up on demand and unload after idle timeout, freeing GPU memory for o
 - **SAMcloud auth** — Verifies caller identity via SAMcloud token verification
 - **MLX + Metal** — Ollama 0.19 MLX for Apple Silicon, llama.cpp Metal for GGUF models
 - **Partial model matching** — Use `qwen3-32b` instead of `Qwen3-32B-Q6_K`
+- **Speech to text** — mlx-whisper behind the same auth, `whisper-1` accepted as a model name
 
 ## Quick Start
 
@@ -76,10 +77,34 @@ All endpoints except `/health` and `/service-docs` require `Authorization: Beare
 |--------|------|-------------|
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat (streaming + non-streaming) |
 | `POST` | `/v1/completions` | OpenAI-compatible text completion |
+| `POST` | `/v1/audio/transcriptions` | OpenAI-compatible speech to text (multipart) |
 
 Model names use **case-insensitive partial matching**:
 - `qwen3-32b` matches `Qwen3-32B-Q6_K` (llama-server)
 - `qwen3.5` matches `qwen3.5:35b-a3b` (Ollama)
+
+The transcription route is the exception: it matches **exactly**, on a catalogue
+name (`whisper-large-v3-turbo`, `whisper-small`) or an alias (`whisper-1`,
+`whisper`). A transcription model has no chat route and a chat model cannot
+transcribe, so each endpoint refuses what the other serves.
+
+```bash
+curl -s https://models-cs.samtg.xyz/v1/audio/transcriptions \
+  -H @"$HOME/.samcloud/token.hdr" \
+  -F file=@walkthrough.m4a \
+  -F model=whisper-1
+# {"text": "Okay, shed shelf two. There are three orange 20-volt batteries..."}
+```
+
+| Form field | Default | Description |
+|---|---|---|
+| `file` | — | the audio, in any format ffmpeg reads (**required**) |
+| `model` | `whisper-large-v3-turbo` | catalogue name or alias |
+| `language` | auto-detect | ISO-639-1 code, e.g. `en` |
+| `prompt` | — | names and spellings to bias towards |
+| `response_format` | `json` | `json`, `text`, `verbose_json`, `srt`, `vtt` |
+| `temperature` | the fallback ladder | a single temperature, if you want one |
+| `timestamp_granularities[]` | `segment` | `segment` or `word`; needs `verbose_json` |
 
 ### Management
 
@@ -194,6 +219,16 @@ samcloud registry + the `claude-services-slice` device.
 | `VLM_HOST` | `127.0.0.1` | Host the on-demand mlx-vlm server binds |
 | `VLM_PORT` | `8801` | Port for the on-demand mlx-vlm server |
 | `VLM_STARTUP_TIMEOUT` | `120` | Seconds to wait for mlx-vlm to become healthy |
+| `WHISPER_ENABLED` | `true` | Advertise transcription models on `/v1/models` |
+| `WHISPER_PYTHON` | `~/code/mlx-whisper-server/.venv/bin/python` | Python that runs `ollama/whisper_server.py` |
+| `WHISPER_HOST` | `127.0.0.1` | Host the on-demand whisper child binds |
+| `WHISPER_PORT` | `8803` | Port for the on-demand whisper child |
+| `WHISPER_STARTUP_TIMEOUT` | `300` | Seconds to wait for the child to become healthy |
+| `WHISPER_REQUEST_TIMEOUT` | `1800` | Seconds one transcription may take |
+| `WHISPER_MAX_UPLOAD_MB` | `200` | Upload limit, refused with `413` |
+| `WHISPER_SPOOL_DIR` | `~/var/samcloud-services/spool/whisper` | Where an upload lands on its way to the child |
+| `WHISPER_LOG_FILE` | `~/var/samcloud-services/logs/whisper-child.log` | The child's stdout and stderr |
+| `FFMPEG_BIN` | `$(which ffmpeg)` or `/opt/homebrew/bin/ffmpeg` | Decodes every upload |
 
 ### Tuning (manager.py constants)
 
@@ -235,6 +270,18 @@ The service integrates with SAMcloud across three pillars:
   gateway always begins from a clean owned state.
 - Configured via `VLM_PYTHON` / `VLM_HOST` / `VLM_PORT` (see Configuration)
 
+### mlx-whisper (speech to text)
+
+- `whisper-large-v3-turbo` (the default) and `whisper-small`, from `mlx-community`
+- Owned exactly like mlx-vlm: the gateway starts `ollama/whisper_server.py` under
+  `WHISPER_PYTHON` on demand, leases the memory the model was measured to peak
+  at, and kills it on idle cooldown. A stray child is reaped on startup.
+- A separate interpreter, not the gateway's: see `requirements-whisper.txt` for
+  what goes in it and why `torch` comes straight back out.
+- One transcription at a time, and the cooldown loop leaves a model alone while
+  a request is in flight — a one-hour walkthrough runs about seven minutes,
+  which outlives the five-minute idle timer.
+
 ## Project Structure
 
 ```
@@ -243,7 +290,8 @@ samcloud-services/
 ├── CLAUDE.md                    # Development brief for AI assistants
 ├── SPEC-satellite-agents.md     # Spec: isolated agent environments
 ├── CHANGELOG.md                 # Project history and working notes
-├── requirements.txt             # Python dependencies
+├── requirements.txt             # Python dependencies (the gateway)
+├── requirements-whisper.txt     # Python dependencies (the whisper child's venv)
 └── ollama/
     ├── README.md                # Module documentation
     ├── server.py                # FastAPI server + auth middleware
@@ -251,6 +299,8 @@ samcloud-services/
     ├── samcloud.py              # SAMcloud API client
     ├── ollama_client.py         # Ollama backend client
     ├── llama_client.py          # llama-server backend client
+    ├── whisper_client.py        # The gateway's half of the whisper child
+    ├── whisper_server.py        # The whisper child itself — run by WHISPER_PYTHON
     ├── test_lifecycle.py        # Integration test: full lease cycle
     └── test_cooldown.py         # Integration test: idle unload
 ```
@@ -262,6 +312,18 @@ cd ollama
 python test_lifecycle.py    # Pull → lease → load → infer → unload → release
 python test_cooldown.py     # Load → idle → auto-unload → lease released
 ```
+
+Transcription, from the repo root — none of these load a model or reach the
+registry:
+
+```bash
+python -m ollama.test_whisper_routing        # the endpoint: names, refusals, five formats
+python3 ollama/test_whisper_kill_guard.py    # what the stray-child reaper may signal
+$WHISPER_PYTHON ollama/test_whisper_child.py # the child: paths, ffmpeg, numpy in JSON
+```
+
+The last one needs the child's interpreter. Give it
+`WHISPER_TEST_AUDIO=<file>` to add a real transcription on top.
 
 ## Related
 

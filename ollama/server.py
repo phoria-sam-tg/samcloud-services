@@ -12,26 +12,35 @@ Endpoints:
   POST /models/unload       - Unload a model (releases lease)
   POST /v1/chat/completions - OpenAI-compatible chat (routes to correct backend)
   POST /v1/completions      - OpenAI-compatible completion
+  POST /v1/audio/transcriptions - OpenAI-compatible speech to text
 
-Backends: Ollama (MLX), llama-server (llama.cpp), mlx-vlm (vision), and the
-exo pool. The first three are owned by this gateway, which loads and unloads
-them against a byte-metered lease on gpu-0. The pool is not: it is placed out
-of band, spans two machines, serves one request at a time, and is held with an
-**exclusive** lease taken around each generation and released after. Ask for
-it by tier (`model: "think"`), not by model name.
+Backends: Ollama (MLX), llama-server (llama.cpp), mlx-vlm (vision),
+mlx-whisper (speech to text), and the exo pool. The first four are owned by
+this gateway, which loads and unloads them against a byte-metered lease on
+gpu-0. The pool is not: it is placed out of band, spans two machines, serves
+one request at a time, and is held with an **exclusive** lease taken around
+each generation and released after. Ask for it by tier (`model: "think"`), not
+by model name.
+
+The chat and the audio name spaces are separate and neither reaches the other:
+a transcription model has no chat route and a chat model cannot transcribe, so
+each endpoint refuses what the other serves rather than routing by substring
+into a backend that cannot answer.
 """
 
 import asyncio
 import os
 import json
+import tempfile
 import time
 import hashlib
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 from typing import Optional
@@ -40,13 +49,15 @@ from . import capacity
 from . import config
 from . import prompt_size
 from .manager import (
-    ModelManager, Backend, VLM_PORT, VLM_MODELS, vlm_installed,
+    ModelManager, Backend, VLM_PORT, VLM_MODELS, hf_model_installed,
     match_vlm_model, match_gguf_model, match_exo_tier,
+    WHISPER_MODELS, WHISPER_ALIASES, WHISPER_DEFAULT, match_whisper_model,
 )
 from .exo_client import ExoUnavailable, ExoRequestFailed, ExoStalled
 from .samcloud import SamcloudClient
 from .ollama_client import OllamaClient
 from .llama_client import LlamaServerClient
+from .whisper_client import WhisperUnavailable, WhisperFailed
 
 logging.basicConfig(
     level=logging.INFO,
@@ -332,7 +343,8 @@ async def service_docs():
         "name": config.SC_SERVICE_NAME,
         "description": (
             f"Unified inference gateway for {config.SC_DEVICE}. "
-            "Wraps Ollama (MLX) and llama-server (llama.cpp Metal) behind "
+            "Wraps Ollama (MLX), llama-server (llama.cpp Metal) and "
+            "mlx-whisper (speech to text) behind "
             "a single OpenAI-compatible API. Manages GPU memory via SAMcloud "
             "resource leasing — models spin up on demand and unload after 5 min idle. "
             "Requires SAMcloud token (Bearer) for authenticated access."
@@ -354,6 +366,28 @@ async def service_docs():
                 "description": "OpenAI-compatible text completion",
                 "auth": True,
                 "body": {"model": "<name>", "prompt": "...", "stream": True},
+            },
+            "POST /v1/audio/transcriptions": {
+                "description": "OpenAI-compatible speech to text",
+                "auth": True,
+                "content_type": "multipart/form-data",
+                "form": {
+                    "file": "<the audio, any format ffmpeg reads>",
+                    "model": f"{WHISPER_DEFAULT} | whisper-1 | whisper-small",
+                    "language": "ISO-639-1, optional — auto-detected if absent",
+                    "prompt": "optional: names and spellings to bias towards",
+                    "response_format": "json | text | verbose_json | srt | vtt",
+                    "temperature": "optional float",
+                    "timestamp_granularities[]": "segment | word (verbose_json only)",
+                },
+                "returns": {"text": "..."},
+                "notes": (
+                    "Exact model names only, unlike the chat routes: a "
+                    "transcription model cannot serve chat and is not reachable "
+                    "from /v1/chat/completions. whisper-1 is accepted so an "
+                    "OpenAI client needs no change. Limits: "
+                    f"{config.WHISPER_MAX_UPLOAD_MB}MB per upload."
+                ),
             },
             "GET /models": {
                 "description": "List managed and available models",
@@ -392,6 +426,13 @@ async def service_docs():
                 "version": "b8500",
                 "features": ["metal", "flash-attention", "quantized-kv-cache"],
                 "port": 8000,
+            },
+            "mlx-whisper": {
+                "features": ["mlx", "apple-silicon", "speech-to-text"],
+                "port": config.WHISPER_PORT,
+                "models": sorted(WHISPER_MODELS),
+                "default": WHISPER_DEFAULT,
+                "enabled": config.WHISPER_ENABLED,
             },
         },
         "loaded_models": loaded,
@@ -479,12 +520,25 @@ async def list_models_openai():
     # request; match_vlm_model takes either.
     #
     # Only the ones whose weights are on disk, which is what "can be asked for"
-    # means for the other two local backends as well -- see vlm_installed for
+    # means for the other two local backends as well -- see hf_model_installed for
     # why an uninstalled VLM is worse than merely slow. `/models` lists the
     # whole catalogue with the flag, so nothing is hidden from an operator.
     for info in VLM_MODELS.values():
-        if vlm_installed(info["default"]):
+        if hf_model_installed(info["default"]):
             add(info["default"], Backend.VLM.value)
+
+    # Transcription models, on the same terms as the VLM catalogue above: by the
+    # id a request names, only when the weights are on disk, whether or not a
+    # child is resident right now.
+    #
+    # The aliases are NOT listed, `whisper-1` included. They resolve on request
+    # and listing them would advertise two models where the box holds one — the
+    # same reason the VLM aliases are absent. A client that only knows OpenAI's
+    # id does not need to find it here: it already sends it.
+    if config.WHISPER_ENABLED:
+        for model_id, info in WHISPER_MODELS.items():
+            if hf_model_installed(info["repo"]):
+                add(model_id, Backend.WHISPER.value)
 
     try:
         for m in mgr.ollama.list_models():
@@ -527,9 +581,23 @@ async def list_models():
              # first, uncapped and unmeasured -- so it is absent from
              # /v1/models, but named here so the gap is visible rather than
              # looking like the model was never configured.
-             "installed": vlm_installed(info["default"])}
+             "installed": hf_model_installed(info["default"])}
             for alias, info in VLM_MODELS.items()
         ],
+        "available_whisper": [
+            {
+                "model": model_id,
+                "repo": info["repo"],
+                "memory_mb": info["memory_mb"],
+                # Weights on disk. False means a request for it would download
+                # 1.6GB inside the startup timeout -- so it is absent from
+                # /v1/models, and named here so the gap is visible.
+                "installed": hf_model_installed(info["repo"]),
+                "default": model_id == WHISPER_DEFAULT,
+            }
+            for model_id, info in WHISPER_MODELS.items()
+        ],
+        "whisper_aliases": WHISPER_ALIASES,
         "exo_pool": await _exo_pool_view(),
     }
 
@@ -949,11 +1017,20 @@ async def _resolve_model(model_name: str):
 
     # Check already-loaded models (exact then partial match)
     matched_name = None
-    if model_name in mgr.models:
+    if model_name in mgr.models and mgr.models[model_name].backend != Backend.WHISPER:
         matched_name = model_name
     else:
         lower = model_name.lower()
         for name in mgr.models:
+            # A resident transcription model is skipped, not matched. It shares
+            # `mgr.models` so that leases, cooldown, status and shutdown cover
+            # it for free, which also puts it in reach of this substring scan —
+            # and a chat request for "whisper-large-v3-turbo", or for anything
+            # whose name is a substring of it, would be routed to a backend
+            # that has no chat route at all. Asserted by
+            # test_whisper_routing.py case [chat-cannot-reach-whisper].
+            if mgr.models[name].backend == Backend.WHISPER:
+                continue
             if lower in name.lower():
                 matched_name = name
                 break
@@ -1649,6 +1726,317 @@ async def completions(req: CompletionRequest):
                     timeout=300,
                 )
                 return resp.json()
+
+
+# -- speech to text --
+
+TRANSCRIPTION_FORMATS = ("json", "text", "srt", "verbose_json", "vtt")
+
+
+def _timecode(seconds: float, sep: str) -> str:
+    """Seconds -> HH:MM:SS,mmm (SRT) or HH:MM:SS.mmm (WebVTT)."""
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
+
+
+def _as_srt(segments: list[dict]) -> str:
+    out = []
+    for i, seg in enumerate(segments, start=1):
+        out.append(
+            f"{i}\n"
+            f"{_timecode(seg['start'], ',')} --> {_timecode(seg['end'], ',')}\n"
+            f"{seg['text'].strip()}\n"
+        )
+    return "\n".join(out)
+
+
+def _as_vtt(segments: list[dict]) -> str:
+    out = ["WEBVTT\n"]
+    for seg in segments:
+        out.append(
+            f"{_timecode(seg['start'], '.')} --> {_timecode(seg['end'], '.')}\n"
+            f"{seg['text'].strip()}\n"
+        )
+    return "\n".join(out)
+
+
+def _as_verbose_json(result: dict, granularities: set[str]) -> dict:
+    """OpenAI's verbose_json: the text, plus the timings asked for.
+
+    `segments` and `words` are each present only when requested, which is
+    OpenAI's behaviour and not a saving: a walkthrough's word list is tens of
+    thousands of entries, and a caller who asked for segments should not have to
+    receive it.
+    """
+    body: dict = {
+        "task": "transcribe",
+        # OpenAI's name, so a client reading `language` gets what it expects.
+        "language": result.get("language_name") or result.get("language"),
+        # The ISO code as well, because that is what you pass back in to pin
+        # the language on the next call and the name is not accepted there.
+        "language_code": result.get("language"),
+        "duration": result.get("duration"),
+        "text": (result.get("text") or "").strip(),
+    }
+    segments = result.get("segments") or []
+    if "segment" in granularities:
+        body["segments"] = [
+            {
+                "id": seg.get("id"),
+                "seek": seg.get("seek"),
+                "start": seg.get("start"),
+                "end": seg.get("end"),
+                "text": seg.get("text", "").strip(),
+                "tokens": seg.get("tokens"),
+                "temperature": seg.get("temperature"),
+                "avg_logprob": seg.get("avg_logprob"),
+                "compression_ratio": seg.get("compression_ratio"),
+                "no_speech_prob": seg.get("no_speech_prob"),
+            }
+            for seg in segments
+        ]
+    if "word" in granularities:
+        body["words"] = [
+            {
+                "word": w.get("word", "").strip(),
+                "start": w.get("start"),
+                "end": w.get("end"),
+                "probability": w.get("probability"),
+            }
+            for seg in segments
+            for w in (seg.get("words") or [])
+        ]
+    return body
+
+
+async def _resolve_whisper(model: str):
+    """The transcription model, loaded if it is not already resident.
+
+    Separate from `_resolve_model` on purpose. That one is the chat resolver: it
+    substring-matches across three catalogues and falls through to `None` so the
+    caller can answer "no such model". Neither behaviour is right here — a
+    transcription model cannot serve chat, and a chat model cannot transcribe,
+    so the two name spaces are kept apart and each endpoint refuses what the
+    other serves.
+    """
+    match = match_whisper_model(model)
+    if match is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "unknown_transcription_model",
+                "message": f"{model!r} is not a transcription model on this box",
+                "available": sorted(WHISPER_MODELS) + sorted(WHISPER_ALIASES),
+            },
+        )
+    model_id = match[0]
+    try:
+        # In a thread: the load spawns a process and polls it for up to
+        # WHISPER_STARTUP_TIMEOUT seconds, and doing that on the event loop
+        # would stop every other route for the duration — the same failure the
+        # pool's `/state` read caused before it was moved off.
+        return await asyncio.to_thread(mgr.load_whisper_model, model_id)
+    except capacity.InsufficientCapacity as e:
+        raise _capacity_503(e)
+    except RuntimeError as e:
+        log.error(f"whisper load failed for {model_id}: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "transcriber_unavailable", "message": str(e)},
+        )
+
+
+async def _spool_upload(file: UploadFile) -> Path:
+    """Copy the upload into the spool, bounded, and hand back its path.
+
+    Copied in 1MB chunks and never held whole in memory. Starlette has already
+    spooled the body to its own temp file by the time this runs — it keeps at
+    most 1MB of a multipart part in RAM and rolls the rest to disk — so this
+    bounds the gateway's own footprint and the child's input, and it is NOT a
+    defence against a client sending an enormous body. That belongs in front of
+    the gateway.
+
+    The limit counts bytes written rather than reading Content-Length, so an
+    upload that declares no length — every chunked upload — is bounded too.
+    Asserted by test_whisper_routing.py case [oversize-chunked].
+    """
+    limit = config.WHISPER_MAX_UPLOAD_MB * 1024 * 1024
+    config.WHISPER_SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = Path(file.filename or "audio").suffix[:16]
+    fd, tmp = tempfile.mkstemp(dir=config.WHISPER_SPOOL_DIR, suffix=suffix)
+    written = 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                written += len(chunk)
+                if written > limit:
+                    raise HTTPException(
+                        status_code=413,
+                        detail={
+                            "error": "audio_too_large",
+                            "message": (
+                                f"upload exceeds {config.WHISPER_MAX_UPLOAD_MB}MB. "
+                                f"Split the audio, or re-encode it: 64kbit/s AAC "
+                                f"holds about seven hours in that budget."
+                            ),
+                            "limit_mb": config.WHISPER_MAX_UPLOAD_MB,
+                        },
+                    )
+                out.write(chunk)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+    if written == 0:
+        os.unlink(tmp)
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "empty_file", "message": "the uploaded file has no bytes"},
+        )
+    return Path(tmp)
+
+
+@app.post("/v1/audio/transcriptions")
+async def create_transcription(
+    file: UploadFile = File(..., description="the audio to transcribe"),
+    model: str = Form(WHISPER_DEFAULT),
+    language: Optional[str] = Form(None, description="ISO-639-1 code; auto-detected if absent"),
+    prompt: Optional[str] = Form(None, description="names and spellings to bias towards"),
+    response_format: str = Form("json"),
+    temperature: Optional[float] = Form(None),
+    timestamp_granularities: Optional[list[str]] = Form(None, alias="timestamp_granularities[]"),
+):
+    """OpenAI-shaped speech to text. Multipart `file` + `model`, `{"text": ...}` back.
+
+    Shaped after OpenAI's endpoint rather than after this gateway's own habits,
+    because the point of it is that a client already written against that API
+    needs no change beyond a base URL — the same reason `/v1/models` exists here.
+    `model` therefore defaults, and `whisper-1` resolves: a client that hardcodes
+    OpenAI's only model id is not wrong about anything we should make it fix.
+
+    Any format ffmpeg can decode is accepted, which is what makes it useful for a
+    walkthrough: the audio track of an .mp4 works as it stands, with no
+    demuxing step on the caller's side.
+    """
+    fmt = (response_format or "json").strip().lower()
+    if fmt not in TRANSCRIPTION_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "unsupported_response_format",
+                "message": f"{response_format!r} is not a response format",
+                "supported": list(TRANSCRIPTION_FORMATS),
+            },
+        )
+
+    granularities = {g.strip().lower() for g in (timestamp_granularities or [])}
+    unknown = granularities - {"segment", "word"}
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "unsupported_timestamp_granularity",
+                "message": f"{sorted(unknown)} is not a timestamp granularity",
+                "supported": ["segment", "word"],
+            },
+        )
+    if granularities and fmt != "verbose_json":
+        # OpenAI's own rule, and worth keeping rather than quietly widening:
+        # there is nowhere in `{"text": ...}` to put a timestamp, so accepting
+        # the parameter would be accepting a request we cannot answer.
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "granularity_needs_verbose_json",
+                "message": (
+                    "timestamp_granularities[] requires "
+                    "response_format=verbose_json"
+                ),
+            },
+        )
+    if fmt == "verbose_json" and not granularities:
+        granularities = {"segment"}
+    # Only the WORD timings are optional in the decoder. Segments come back from
+    # every transcription whether or not anyone asked, which is what lets srt
+    # and vtt be rendered without a granularity parameter. Word timings cost a
+    # second DTW pass, so they are computed only when they will be returned.
+    need_words = "word" in granularities
+
+    mm = await _resolve_whisper(model)
+    # Held for the length of the transcription, because this is the first
+    # backend here whose single request outlives the idle cooldown. A one-hour
+    # walkthrough runs ~7 minutes at the measured 8.6x realtime, COOLDOWN_SECONDS
+    # is 300, and `check_cooldowns` would otherwise kill the child mid-sentence
+    # and return a 502 for a request that was working. `last_used` is stamped at
+    # the END of the call for the same reason — stamping it at the start leaves a
+    # long transcription looking idle while it runs.
+    mm.in_flight += 1
+    try:
+        spooled = await _spool_upload(file)
+    except BaseException:
+        mm.in_flight -= 1
+        raise
+    try:
+        result = await mgr.whisper.transcribe(
+            path=str(spooled),
+            language=language,
+            prompt=prompt,
+            temperature=temperature,
+            word_timestamps=need_words,
+        )
+    except WhisperUnavailable as e:
+        # The child died or is not answering. `ensure_running` restarts it on
+        # the next request; this one is honestly a 503.
+        log.error(f"whisper child unreachable: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "transcriber_unavailable", "message": str(e)},
+        )
+    except WhisperFailed as e:
+        # 422 from the child is "ffmpeg could not decode this", which is the
+        # caller's file and so a 400 to them. Anything else is ours.
+        if e.status in (400, 404, 422):
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "undecodable_audio", "message": str(e)},
+            )
+        log.error(f"whisper child failed ({e.status}): {e}")
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "transcription_failed", "message": str(e)},
+        )
+    finally:
+        mm.in_flight -= 1
+        mm.last_used = time.time()
+        # The spool is not a store. One unlink, in a finally, whatever happened
+        # above — a refusal path that leaves the file behind fills a disk that
+        # this box has run to 99% before.
+        try:
+            spooled.unlink()
+        except OSError as e:
+            log.warning(f"could not remove {spooled}: {e}")
+
+    # No `mgr.touch()`: `load_whisper_model` has already counted this request on
+    # both the fresh-load and the already-resident path, and touch() counts as
+    # well as stamping. The stamp is in the finally above.
+    text = (result.get("text") or "").strip()
+    segments = result.get("segments") or []
+    log.info(
+        f"transcribed {result.get('duration')}s with {mm.name} in "
+        f"{result.get('transcribe_seconds')}s ({len(text)} chars)"
+    )
+
+    if fmt == "text":
+        return PlainTextResponse(text + "\n")
+    if fmt == "srt":
+        return PlainTextResponse(_as_srt(segments), media_type="application/x-subrip")
+    if fmt == "vtt":
+        return PlainTextResponse(_as_vtt(segments), media_type="text/vtt")
+    if fmt == "verbose_json":
+        return _as_verbose_json(result, granularities)
+    return {"text": text}
 
 
 if __name__ == "__main__":

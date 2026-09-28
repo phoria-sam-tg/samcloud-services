@@ -73,6 +73,7 @@ SC_TOKEN=<token> python -m uvicorn ollama.server:app --host 0.0.0.0 --port 8800
 # raises ImportError: attempted relative import with no known parent package.
 python -m ollama.test_capacity_refusal   # Refusal path: 503 + the numbers, not 500
 python -m ollama.test_capacity_backends  # Both capacity arms meet one contract (no GPU needed)
+python -m ollama.test_elastic_offering   # The offer: windowed, measured, same at every endpoint
 
 # Older tests, from inside ollama/ — these lease and load for real.
 cd ollama && python test_lifecycle.py   # Full lease cycle
@@ -96,6 +97,15 @@ uv venv --python 3.12 ~/code/mlx-whisper-server/.venv
 uv pip install --python ~/code/mlx-whisper-server/.venv/bin/python -r requirements-whisper.txt
 uv pip uninstall --python ~/code/mlx-whisper-server/.venv/bin/python torch
 ```
+
+**The two invocation forms are not interchangeable, and the exit code does not
+tell you which mistake you made.** Everything under `python -m ollama.<name>`
+uses relative imports and exits 1 with `ImportError` if run as
+`python ollama/<name>.py`; the older files (`test_cooldown`, `test_lifecycle`,
+`test_whisper_kill_guard`) are the opposite and want the direct path. Both
+misinvocations look exactly like a regression from your own branch — this cost
+samclaude-admin and claude-wafer-services a minute each on 2026-09-29, on the
+same file. Run it the way the list above writes it before believing a failure.
 
 `test_capacity_refusal` loads nothing and leases nothing — the refusal precedes
 both — so it is the one safe to run against a live box. It reads real memory, so
@@ -126,6 +136,10 @@ the 503 path the test exists for.
 - **Two questions, not one** (ticket #861) — `memory_available_mb` answers "do I fit"; `memory_device_inuse_mb` and `capacity.foreign_mb(device_inuse_mb, own_mb)` answer "is anyone working". They are not the same question and only coincide when the other tenant takes the whole device. Measured on ada: inside ONE continuous 46 GB Unreal render, free memory swung 188 → 2963 MiB, so a fit check alone offers up to 1939 MB *mid-render* and logs it as a success; `foreign` reads ~46.5 GB throughout. `device_inuse` is IOAccelerator `"In use system memory"` on Metal (~1 GiB idle, against ~22 GiB of `memory_used_mb`) and `nvidia-smi memory.used` on CUDA (the same number as `memory_used_mb` there, because the board is the accelerator). An earlier draft subtracted from `used`, which would have been garbage on the Metal arm with every test green
 - **Attribution comes from our own bookkeeping** (ticket #861) — `own_mb` is never a sum over a process table, because neither arm has one. `nvidia-smi --query-compute-apps` returns zero rows against 46 GB of real usage under WDDM; IOAccelerator publishes one aggregate with no per-process split. The error direction is deliberate — under-counting what we hold invents a stranger and costs us an offer, rather than letting us load on top of somebody's render. `foreign_mb` returns **None**, never 0, when the device figure is unreadable: 0 means "nobody is working", which is the wrong way to fail
 - **Never gate on utilisation** (ticket #861) — measured on both arms independently. wafer, 24 samples with Unity active: `compute_pct` min 10 / median 32 / max 49, 15 distinct values. ada, mid-render: `utilization.gpu` fell to **0–4% for 12 seconds** while `memory.used` held flat at 43.6 GB. A zero utilisation reading during an active render is real, not a glitch. Only the memory figures say whether work is present — and `load_avg_1m` is worse than useless on the CUDA arm, where it read 0.13 while a render held 46 GB (it moves independently of GPU state, not merely late)
+- **The offer is measured, never the registry's** (ticket #861) — `ModelManager.offering()` is the one source for `/warm`, `/v1/models` and `/status`, so those three cannot disagree with each other or with the load gate. The registry's `available_memory_mb` is spec-minus-leases and cannot see a tenant who took no lease: measured on wafer 2026-09-29, on `main`, no leases and nothing resident, `/status` advertised 36,864 MB while the collector one import away measured 11,066. `/status` now reports the measured number under that name and keeps the registry's as `registry_available_memory_mb`
+- **`/v1/models` lists only what can load right now** (ticket #861) — a deliberate departure from the convention, which is to list everything askable. On a box sharing a GPU with somebody's work, "askable" and "serveable" come apart: wafer listed a 17.5 GB model with 11 GB free. Blocked models are omitted so a caller cannot ask for one that was never offered; `/models` carries the whole catalogue with `blocked` and the reason, so nothing is hidden from an operator
+- **The offer is computed over a window, not a sample** (ticket #861) — minimum `available` and maximum `device_inuse` across a trailing `OFFER_WINDOW_S`. One choice gives both behaviours: withdrawal on the first bad reading (it enters the window at once), restoration only once the trough has aged out. A single sample cannot do it — `available` spanned 9988–12938 over 24 samples on an *idle* wafer, and 188 → 2963 MiB inside one ada render, so two consecutive samples can both sit at the top of a swing but cannot both be its minimum. The window is a **duration**, not a sample count: a fixed count covers two minutes on an idle box and four seconds under load, i.e. it shortens exactly when the protection matters
+- **A failed capacity read still ages the window** (ticket #861) — `_record_reading` prunes before it appends, and is called even when there is nothing to append. The CUDA arm *raises* where Metal degrades to `None` fields, and an earlier version pruned only on the way past an append: a collector that started failing stopped pruning, so the last good reading stayed and the node advertised a number nobody could still measure. Now the offer collapses to nothing within one window. Found by `test_elastic_offering` step 13, not by inspection
 - **The constants are per-backend; the formula is not** (ticket #861) — `usable = min(fraction × available, available − floor)` is shared. Metal keeps 0.9 / 1024 MiB. The CUDA floor is a *time-derived* quantity with no Metal analogue — how much VRAM a render can claim between our reading and the next reconcile — and is **not measured yet**; it ships as the Metal value with `SC_MIN_HEADROOM_MB` to override, and lands with the ada profile. Don't round it to 4096 because 4 GB is a nice number
 - **Offering tier derives from the catalogue** — `full` = everything we hold fits, `mini` = exactly one does, `none` = nothing does. Fixed MB bands go stale the moment the catalogue changes (ticket #135, doc #8)
 - **One stats push per box, from the gateway** — `ModelManager.stats_loop()`, lifecycle-managed. Not a separate daemon; `capacity.registry_payload()` narrows the reading to what the registry's strict schema accepts

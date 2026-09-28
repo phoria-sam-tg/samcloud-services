@@ -74,7 +74,11 @@ AUTH_CACHE_TTL = config.AUTH_CACHE_TTL
 AUTH_ENABLED = config.AUTH_ENABLED
 
 # Paths that don't require auth
-AUTH_EXEMPT_PATHS = {"/health", "/service-docs"}
+# /warm is exempt for the reason /service-docs is: it exists so another
+# provider, in another environment, can decide whether to route here without
+# first holding a credential for this box. It discloses model names and a
+# memory figure and takes no action.
+AUTH_EXEMPT_PATHS = {"/health", "/service-docs", "/warm"}
 
 
 class SamcloudAuthMiddleware(BaseHTTPMiddleware):
@@ -317,6 +321,37 @@ async def health():
     return {"status": "ok", "service": "model-service", "models": len(mgr.models)}
 
 
+@app.get("/warm")
+async def warm():
+    """What this node can serve right now — resident, loadable, blocked.
+
+    Auth-exempt. A consumer in another environment reads this to decide
+    whether to route here (model already hot, or loadable) or go elsewhere,
+    which is a decision it has to be able to make before it has a credential
+    for this box.
+
+    Every number comes from this box's own hardware, windowed over
+    `OFFER_WINDOW_S`, never from the registry — see `ModelManager.offering`
+    for what the registry's figure misses and by how much.
+
+    OFF THE EVENT LOOP, here and at the other three consumers. Reading the
+    hardware means subprocesses — `vm_stat`, `sysctl`, `ioreg` on Metal, one
+    `nvidia-smi` on CUDA — measured at 22ms per call on slice 2026-09-29,
+    every call, with no cache. Awaiting that inline would stall the loop for
+    22ms per request on an endpoint whose whole purpose is to be polled by
+    other providers, and with it `stats_loop` (15s) and `offering_loop` (30s)
+    — an offering poll delayed behind a discovery read looks exactly like a
+    memory-pressure change. Same reasoning and the same tool as
+    `_exo_pool_view`: a bounded read that holds no lease, where nothing is
+    harmed by it finishing after the caller has gone. NOT the tool for the
+    generation path, which needs cancellation — see that function's note.
+    """
+    if not mgr:
+        return {"resident": [], "loadable": [], "blocked": [],
+                "cooldown_seconds": config.COOLDOWN_SECONDS, "capacity": {}}
+    return await asyncio.to_thread(mgr.offering)
+
+
 @app.get("/service-docs", response_class=JSONResponse)
 async def service_docs():
     """Public service documentation for discovery by agents and consumers.
@@ -390,9 +425,36 @@ async def service_docs():
                     f"{config.WHISPER_MAX_UPLOAD_MB}MB per upload."
                 ),
             },
+            "GET /warm": {
+                "description": (
+                    "What this node can serve right now: resident (loaded), "
+                    "loadable (fits in current free memory) and blocked (with "
+                    "the reason). Measured from this box's own hardware over a "
+                    "trailing window, never from the registry's lease view, so "
+                    "it accounts for tenants that hold memory without a lease "
+                    "— renders, editors, other people's work."
+                ),
+                "auth": False,
+                "notes": (
+                    "Auth-exempt so another provider can decide whether to "
+                    "route here before holding a credential for this box."
+                ),
+            },
             "GET /models": {
-                "description": "List managed and available models",
+                "description": "List managed and available models, with the offering",
                 "auth": True,
+            },
+            "GET /v1/models": {
+                "description": "OpenAI-compatible list — resident + loadable only",
+                "auth": True,
+                "notes": (
+                    "Deliberately narrower than the convention: models that "
+                    "cannot load right now are omitted rather than listed, so "
+                    "a caller cannot ask for one that was never on offer. Each "
+                    "entry carries a non-standard `status` (resident|loadable|"
+                    "tier). /models lists the whole catalogue including what is "
+                    "blocked and why."
+                ),
             },
             "GET /status": {
                 "description": "Full status — backends, models, leases, resource utilisation",
@@ -449,28 +511,51 @@ async def service_docs():
 
 @app.get("/status")
 async def status():
-    return mgr.status()
+    return await asyncio.to_thread(mgr.status)
 
 
 @app.get("/v1/models")
 async def list_models_openai():
-    """OpenAI-compatible model list.
+    """OpenAI-compatible model list — only what is serveable right now.
 
     Exists because the rest of this gateway's OpenAI surface lives under `/v1`
     — `/v1/chat/completions`, `/v1/completions` — while the only listing was at
     `/models`. A client that found chat where the standard puts it has every
     reason to look for the list where the standard puts it too, and got a 404.
-    That is a discovery failure on an otherwise working backend, which is the
-    confusing kind: chat succeeds, so the endpoint is clearly right, but the
-    client cannot enumerate anything.
 
-    Deliberately cheap. It reports what this gateway can be *asked* for, not
-    what is resident — exactly as `/v1/models` does for every other
-    OpenAI-compatible server, where an unloaded model is still listed. The pool
-    tier is included whenever EXO is enabled rather than only when the pool is
-    ready, for the same reason: it is a configured route, and a request for it
-    while the pool is down gets the structured `pool_unavailable` 503 that path
-    already returns. Readiness lives on `/models` (`exo_pool.ready`,
+    IT DELIBERATELY DEPARTS FROM THE CONVENTION, and this used to say the
+    opposite. Every other OpenAI-compatible server lists what it can be
+    *asked* for, unloaded models included, and so did this — the previous
+    version of this docstring defended that at length. It is the wrong
+    contract for a box that shares a GPU with somebody's work. Measured on
+    wafer 2026-09-29, on `main`: all three models listed with 11 GB actually
+    free, including a 17.5 GB one that could not have loaded without swapping.
+    A caller reading that list has no way to find out which entries are real
+    except by asking for one and taking the refusal.
+
+    So `data[]` carries resident + loadable and omits blocked. A caller cannot
+    fail to load a model that was never offered, which is worth more here than
+    convention. `/models` still lists the whole catalogue with the reasons, so
+    nothing is hidden from an operator, and each entry here carries a
+    non-standard `status` (`resident` | `loadable` | `tier`) plus its memory
+    estimate — OpenAI SDKs ignore unknown fields.
+
+    What is listed, and why each is on the same terms, is now decided in one
+    place: `ModelManager.offering()`. The VLM and transcription catalogues
+    used to be enumerated here, each with its own reasoning about weights on
+    disk; they are bucketed there instead, by the id a request names and only
+    when installed — unchanged in meaning, and now sharing the fit test with
+    every other backend. An mlx-vlm model is not "pulled" and has no GGUF on
+    disk, so `offering()` is the only record of it: if it is not listed from
+    there it is not listed at all. The aliases stay unlisted and still resolve
+    on request; listing them would advertise two models where the box holds
+    one.
+
+    The pool tier is included whenever EXO is enabled rather than only when
+    the pool is ready: it is a configured route, and a request for it while
+    the pool is down gets the structured `pool_unavailable` 503 that path
+    already returns. Its memory is not ours to account for and it does not
+    pass through the buckets. Readiness lives on `/models` (`exo_pool.ready`,
     `exo_pool.busy`) where there is somewhere to put it.
 
     No pool read at all, so a wedged pool cannot make discovery hang — the one
@@ -480,78 +565,34 @@ async def list_models_openai():
     seen: set = set()
     data: list[dict] = []
 
-    def add(model_id: str, owned_by: str):
+    def add(model_id: str, owned_by: str, status: str, memory_mb=None):
         if model_id and model_id not in seen:
             seen.add(model_id)
-            data.append({
+            entry = {
                 "id": model_id,
                 "object": "model",
                 "created": now,
                 "owned_by": owned_by,
-            })
+                "status": status,
+            }
+            if memory_mb is not None:
+                entry["memory_mb"] = memory_mb
+            data.append(entry)
 
     # Tiers first: a caller asking this gateway for the pool asks by tier, and
     # listing the resident model id instead would invite a request naming a
     # model we cannot promise to still hold.
     if config.EXO_ENABLED:
         for tier in config.EXO_TIERS:
-            add(tier, "exo")
+            add(tier, "exo", "tier")
 
-    for name in mgr.models:
-        mm = mgr.models[name]
-        if mm.backend != Backend.EXO:      # tiers already added under their tier name
-            add(name, mm.backend.value)
-
-    # The VLM catalogue. Unlike the two catalogue reads below it needs no
-    # try/except: VLM_MODELS is a static dict in manager.py, not a backend that
-    # can be down. And unlike them it is the *only* record of what these models
-    # are -- an mlx-vlm model is not "pulled" and has no GGUF on disk, so if it
-    # is not listed from here it is not listed at all. That was the gap: the
-    # gateway has served vision since the mlx-vlm backend landed, and because
-    # the process is on-demand and unloads after COOLDOWN_SECONDS, `mgr.models`
-    # above held it only for the few minutes after a request. So discovery
-    # showed a text-only gateway to anyone who asked while it was idle, which
-    # is the same discovery-failure-on-a-working-backend this endpoint was
-    # added to fix (ticket #815).
-    #
-    # Listed by resolved id, not by alias, so the entry is the same string
-    # whether or not the model is resident -- load_vlm_model registers under
-    # the resolved id, so a loaded VLM has already added itself above and
-    # `seen` collapses the two. The alias ("qwen2.5-vl") still resolves on
-    # request; match_vlm_model takes either.
-    #
-    # Only the ones whose weights are on disk, which is what "can be asked for"
-    # means for the other two local backends as well -- see hf_model_installed for
-    # why an uninstalled VLM is worse than merely slow. `/models` lists the
-    # whole catalogue with the flag, so nothing is hidden from an operator.
-    for info in VLM_MODELS.values():
-        if hf_model_installed(info["default"]):
-            add(info["default"], Backend.VLM.value)
-
-    # Transcription models, on the same terms as the VLM catalogue above: by the
-    # id a request names, only when the weights are on disk, whether or not a
-    # child is resident right now.
-    #
-    # The aliases are NOT listed, `whisper-1` included. They resolve on request
-    # and listing them would advertise two models where the box holds one — the
-    # same reason the VLM aliases are absent. A client that only knows OpenAI's
-    # id does not need to find it here: it already sends it.
-    if config.WHISPER_ENABLED:
-        for model_id, info in WHISPER_MODELS.items():
-            if hf_model_installed(info["repo"]):
-                add(model_id, Backend.WHISPER.value)
-
-    try:
-        for m in mgr.ollama.list_models():
-            add(m.get("name", ""), "ollama")
-    except Exception as e:
-        log.warning(f"/v1/models: ollama catalogue unavailable: {e}")
-
-    try:
-        for m in mgr.llama.available_models():
-            add(m.get("name", ""), "llama-server")
-    except Exception as e:
-        log.warning(f"/v1/models: gguf catalogue unavailable: {e}")
+    offering = (await asyncio.to_thread(mgr.offering) if mgr
+                else {"resident": [], "loadable": []})
+    for m in offering["resident"]:
+        if m["backend"] != Backend.EXO.value:   # already added under its tier
+            add(m["name"], m["backend"], "resident", m.get("memory_mb"))
+    for m in offering["loadable"]:
+        add(m["name"], m["backend"], "loadable", m.get("need_mb"))
 
     return {"object": "list", "data": data}
 
@@ -600,6 +641,11 @@ async def list_models():
         ],
         "whisper_aliases": WHISPER_ALIASES,
         "exo_pool": await _exo_pool_view(),
+        # The same buckets /warm serves, so an operator reading the full
+        # catalogue above can see which of it is actually on offer and, for
+        # the rest, why not. /v1/models omits `blocked` entirely; this is
+        # where nothing is hidden.
+        "offering": await asyncio.to_thread(mgr.offering),
     }
 
 

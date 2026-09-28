@@ -341,6 +341,12 @@ class ModelManager:
     _pool_renewal_task: Optional[asyncio.Task] = field(default=None, repr=False)
     _offering_task: Optional[asyncio.Task] = field(default=None, repr=False)
     _offering_tier: Optional[str] = field(default=None, repr=False)
+    # Trailing window of capacity readings, `(monotonic_ts, reading)`, oldest
+    # first. The offer is computed over this rather than over one sample — see
+    # `offer_reading`. Appended by every read, so it fills from ordinary
+    # traffic and from `stats_loop` without needing a loop of its own.
+    _readings: list = field(default_factory=list, repr=False)
+    _readings_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def discover(self) -> list[ManagedModel]:
         """Discover and adopt already-running model processes.
@@ -531,19 +537,47 @@ class ModelManager:
             return []
 
     def _get_resource_summary(self) -> dict:
+        """What `/status` says about this box's device.
+
+        `available_memory_mb` IS THE MEASURED NUMBER, not the registry's, and
+        the change of source matters more than any code here. The registry
+        computes spec-minus-leases and never consults utilisation, so it
+        cannot see a tenant who took no lease. Measured on wafer 2026-09-29,
+        on `main`, no leases and no models resident: this endpoint advertised
+        36,864 MB while `capacity.collect()` measured 11,066, because a Unity
+        session held ~25 GB of the same unified pool. Callers scrape this.
+
+        The registry's view is kept, under a name that says whose view it is,
+        because it is still the right number for "how much of this resource
+        has been formally claimed" — it is only wrong as an answer to "how
+        much can I use".
+        """
+        out = {}
+        try:
+            r = self.offer_reading()
+            out["available_memory_mb"] = r["memory_available_mb"]
+            out["usable_memory_mb"] = capacity.usable_mb(r["memory_available_mb"])
+            out["device_inuse_mb"] = r["memory_device_inuse_mb"]
+            out["measured_over_s"] = r["window_s"]
+        except Exception as e:
+            log.warning(f"Capacity read for /status failed: {e}")
         try:
             dash = self.sc.resource_dashboard()
             for r in dash:
                 if r["id"] == RESOURCE_ID:
-                    return {
+                    out.update({
                         "memory_pct": r["memory_pct"],
                         "compute_pct": r["compute_pct"],
                         "health": r["health"],
-                        "available_memory_mb": r["available_memory_mb"],
-                    }
+                        # Spec minus leases. Blind to any tenant that holds
+                        # memory without holding a lease, which is the case
+                        # this whole module exists for (#861).
+                        "registry_available_memory_mb": r["available_memory_mb"],
+                    })
+                    break
         except Exception as e:
             log.warning(f"Resource dashboard error: {e}")
-        return {}
+        return out
 
     def _get_active_leases(self) -> list[dict]:
         """Active leases on this box's GPU, matched here rather than on the wire.
@@ -621,6 +655,127 @@ class ModelManager:
             available_mb=avail_mb,
             fits_now=fitting,
         )
+
+    def offering(self) -> dict:
+        """What this node can serve RIGHT NOW: resident, loadable, blocked.
+
+        The single source for `/warm`, `/v1/models` and `/status`, so those
+        three cannot disagree with each other or with the load gate.
+
+        WHY THIS EXISTS. All three used to advertise the registry's
+        `available_memory_mb`, which is spec-minus-leases and never consults
+        utilisation. It therefore cannot see a tenant who took no lease, which
+        is every tenant that matters here: a Unity session, an Unreal render.
+        Measured on wafer 2026-09-29, on `main`, with no leases held and no
+        models resident — `/status` advertised 36,864 MB while the collector
+        one import away measured 11,066. A 3.3x over-promise, to any caller
+        that read it. ada is the same bug with a bigger number: the registry
+        called `ada-wsl/gpu-0` 49,140 MB free while the card held 48,016.
+
+        So every number here comes from `offer_reading()` — this box's own
+        hardware, windowed — and never from the registry.
+
+        The per-model estimate is `max(1024, disk_mb)`, which is exactly what
+        `OllamaClient.memory_estimate_mb` returns for a model that is already
+        pulled, and the catalogue contains nothing else. Reproduced here from
+        one `catalogue_mb()` call rather than called per model (that would be
+        one HTTP round trip each), and `test_elastic_offering` asserts the two
+        agree for every entry. They have to: an offer computed by a different
+        rule from the gate promises models the gate then refuses, which is a
+        worse failure than not offering them.
+
+        Every owned backend is bucketed, not just ollama. A whisper child, a
+        VLM and a GGUF occupy the same device as a chat model, so "can this
+        box start it right now" is one question with one answer; exempting a
+        backend would make the offer depend on which backend a model happens
+        to live in. EXO is the exception and is absent from the buckets: the
+        gateway neither starts the pool nor sizes it, and it is reached by
+        tier rather than by model.
+        """
+        r = self.offer_reading()
+        avail = r["memory_available_mb"]
+        usable = capacity.usable_mb(avail)
+        own = self.own_device_mb()
+        foreign = capacity.foreign_mb(r["memory_device_inuse_mb"], own)
+        working = self.work_in_progress(foreign)
+
+        now = time.time()
+        resident = [
+            {
+                "name": name,
+                "backend": mm.backend.value,
+                "memory_mb": mm.memory_mb,
+                "idle_seconds": int(now - mm.last_used),
+                "request_count": mm.request_count,
+            }
+            for name, mm in self.models.items()
+        ]
+        resident_names = {name for name in self.models}
+
+        candidates: dict = {}
+        for name, size_mb in self.catalogue_mb().items():
+            if name not in resident_names:
+                candidates[name] = (Backend.OLLAMA.value, max(1024, size_mb))
+        for info in VLM_MODELS.values():
+            name = info["default"]
+            if name not in resident_names and hf_model_installed(name):
+                candidates.setdefault(name, (Backend.VLM.value, info["memory_mb"]))
+        if config.WHISPER_ENABLED:
+            for model_id, info in WHISPER_MODELS.items():
+                if model_id not in resident_names and hf_model_installed(info["repo"]):
+                    candidates.setdefault(
+                        model_id, (Backend.WHISPER.value, info["memory_mb"]))
+        try:
+            for m in self.llama.available_models():
+                name = m.get("name", "")
+                if name and name not in resident_names:
+                    candidates.setdefault(
+                        name,
+                        (Backend.LLAMA.value, max(1024, int(m.get("memory_mb", 0)))),
+                    )
+        except Exception as e:
+            log.warning(f"offering: gguf catalogue unavailable: {e}")
+
+        loadable, blocked = [], []
+        for name, (backend, need) in sorted(
+            candidates.items(), key=lambda kv: kv[1][1], reverse=True
+        ):
+            entry = {"name": name, "backend": backend, "need_mb": need}
+            if working:
+                # Not a fit refusal: it might fit fine. The device is in use by
+                # somebody whose work we are not going to take memory from, and
+                # `short_by_mb` would invite a caller to wait for a number to
+                # move when what has to change is that the other tenant stops.
+                blocked.append({**entry, "reason": "work_in_progress"})
+            elif capacity.fits(need, avail):
+                loadable.append(entry)
+            else:
+                blocked.append({**entry, "reason": "insufficient_capacity",
+                                "short_by_mb": max(0, need - usable)})
+
+        return {
+            "resident": resident,
+            "loadable": loadable,
+            "blocked": blocked,
+            "cooldown_seconds": config.COOLDOWN_SECONDS,
+            # The reading the three lists were computed from, so a caller that
+            # disagrees with the answer can see what produced it rather than
+            # guessing. `available_mb` is the window MINIMUM, not the instant.
+            "capacity": {
+                "available_mb": avail,
+                "usable_mb": usable,
+                "total_mb": r.get("memory_total_mb"),
+                "device_inuse_mb": r["memory_device_inuse_mb"],
+                "own_mb": own,
+                "foreign_mb": foreign,
+                # None means "this box has not declared an idle floor, so we
+                # did not ask" — not "nobody is working". A caller must not
+                # collapse the two.
+                "work_in_progress": working,
+                "samples": r["samples"],
+                "window_s": r["window_s"],
+            },
+        }
 
     def load_ollama_model(self, model_name: str) -> ManagedModel:
         """Load an Ollama model with lease management."""
@@ -1836,10 +1991,126 @@ class ModelManager:
         shared collector reports.
         """
         try:
-            return capacity.collect()
+            reading = capacity.collect()
         except Exception as e:
+            # The CUDA arm RAISES where Metal degrades to None fields —
+            # nvidia-smi runs with check=True and a 10s timeout. Both have to
+            # end in the same place, so a failed read still ages the window;
+            # see _record_reading.
             log.warning(f"Capacity read failed: {e}")
+            self._record_reading({})
             return {}
+        self._record_reading(reading)
+        return reading
+
+    def _record_reading(self, reading: dict) -> None:
+        """Age the trailing window, then add `reading` if there is one.
+
+        THE AGEING HAPPENS EVEN WHEN THERE IS NOTHING TO ADD, and that order
+        is the whole of it. An earlier version pruned only on the way past an
+        append and returned early on an empty reading, so a collector that had
+        started failing stopped pruning: the last good reading stayed in the
+        window for as long as the failure lasted, and the node went on
+        advertising a number nobody could still measure. Found by
+        `test_elastic_offering`, not by inspection.
+
+        A window is a duration, not a count: the sample rate is whatever
+        traffic and `stats_loop` produce together, so a fixed length would
+        cover two minutes on an idle box and four seconds under load —
+        shortest exactly when the protection matters most.
+        """
+        now = time.monotonic()
+        cutoff = now - config.OFFER_WINDOW_S
+        with self._readings_lock:
+            self._readings = [(t, r) for t, r in self._readings if t >= cutoff]
+            if reading:
+                self._readings.append((now, reading))
+
+    def offer_reading(self) -> dict:
+        """The conservative view of capacity, over the trailing window.
+
+        Takes a fresh reading, then reports the MINIMUM available and the
+        MAXIMUM device-in-use seen within `OFFER_WINDOW_S`. One choice, both
+        of the behaviours the ticket asks for:
+
+            withdraw  the moment a bad reading lands, because it enters the
+                      window at once and the minimum drops with it
+            restore   only once every reading in the window agrees, because
+                      the old trough has to age out first
+
+        A single sample cannot do this. Measured on an IDLE wafer 2026-09-29,
+        `memory_available_mb` spanned 9988-12938 over 24 samples — 2950 MB of
+        desktop churn, wider than several models in the catalogue, so a bare
+        per-request comparison flaps across the whole offer rather than at its
+        margin. Nor is "two consecutive readings agree" enough: inside ONE ada
+        render free memory swung 188 -> 2963 MiB, and two samples 5s apart can
+        both sit at the top of that swing. They cannot both be the minimum of
+        a window longer than the swing.
+
+        `device_inuse_mb` is None only if EVERY reading in the window failed to
+        produce one — one good sample is enough to say the accelerator is busy,
+        and taking the max is what makes that true.
+        """
+        fresh = self._collect_stats()          # records into the window itself
+        with self._readings_lock:
+            window = [r for _, r in self._readings]
+        if not window:
+            window = [fresh] if fresh else []
+        if not window:
+            return {"memory_available_mb": 0, "memory_device_inuse_mb": None,
+                    "samples": 0, "window_s": config.OFFER_WINDOW_S}
+        inuse = [r.get("memory_device_inuse_mb") for r in window
+                 if r.get("memory_device_inuse_mb") is not None]
+        return {
+            "memory_available_mb": min(
+                r.get("memory_available_mb", 0) for r in window),
+            "memory_device_inuse_mb": max(inuse) if inuse else None,
+            "memory_total_mb": fresh.get("memory_total_mb"),
+            "samples": len(window),
+            "window_s": config.OFFER_WINDOW_S,
+        }
+
+    def own_device_mb(self) -> int:
+        """What this gateway knows it holds on the accelerator.
+
+        The `own_mb` half of `capacity.foreign_mb`, and the only attribution
+        available: neither backend offers a per-process split (nvidia-smi
+        `--query-compute-apps` returns zero rows under WDDM against 46 GB of
+        real usage; IOAccelerator publishes one aggregate). Every resident
+        model counts, whichever backend holds it — they are all on the same
+        device.
+
+        EXO is excluded. The pool's pages belong to a process this gateway
+        neither started nor sized, its lease reserves no bytes (`memory_mb`
+        must be null, #770), and `ManagedModel.memory_mb` for a tier is not a
+        measurement of anything we allocated. Counting it would subtract
+        memory we do not hold from the foreign figure, which is the
+        over-counting direction — the one that hides another tenant.
+        """
+        return sum(
+            mm.memory_mb or 0
+            for mm in self.models.values()
+            if mm.backend != Backend.EXO
+        )
+
+    def work_in_progress(self, foreign_mb: Optional[int]) -> Optional[bool]:
+        """Is somebody else using this device for work right now?
+
+        None when the box has not declared its idle floor — which is every box
+        today (`config.FOREIGN_IDLE_MB` has no default on purpose). None means
+        "not asked", and a caller must not read it as False: the distinction
+        between "nobody is working" and "we never checked" is the whole point
+        of not inventing a floor.
+
+        True when the floor is known but the device figure is not. "We cannot
+        tell who holds the GPU" has to behave as "assume someone does", because
+        the alternative loads a model on top of a render.
+        """
+        if config.FOREIGN_IDLE_MB is None:
+            return None
+        if foreign_mb is None:
+            return True
+        return foreign_mb > config.FOREIGN_IDLE_MB + config.FOREIGN_MARGIN_MB
 
     async def stats_loop(self):
         """Push unified-memory stats to this box's SAMcloud resource every 15s.
@@ -1875,7 +2146,10 @@ class ModelManager:
         Returns None if memory cannot be read, leaving the tier unchanged.
         """
         try:
-            avail = capacity.collect().get("memory_available_mb")
+            # The same windowed, conservative number the offer uses. An
+            # `offering:` capability computed off a different reading than
+            # /warm is a second answer to one question.
+            avail = self.offer_reading().get("memory_available_mb")
             if avail is None:
                 return None
             return capacity.offering_tier(self.catalogue_mb(), avail)

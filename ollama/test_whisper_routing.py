@@ -29,7 +29,7 @@ os.environ["WHISPER_MAX_UPLOAD_MB"] = "1"
 
 from fastapi.testclient import TestClient
 
-from . import capacity, config, server
+from . import capacity, config, manager, server
 from .manager import (
     Backend, ManagedModel, ModelManager, WHISPER_DEFAULT, WHISPER_MODELS,
     match_whisper_model,
@@ -365,7 +365,15 @@ def main():
     mgr = _manager()
     server.mgr = mgr
     original_installed = server.hf_model_installed
+    original_mgr_installed = manager.hf_model_installed
     server.hf_model_installed = lambda repo: "whisper-large-v3-turbo" in repo
+    # BOTH bindings, because the decision moved. /v1/models now asks
+    # `ModelManager.offering()` what is serveable rather than enumerating the
+    # catalogues itself (#861), so the call this case turns on is
+    # `manager.hf_model_installed`; `/models` below still reads the one in
+    # `server`. Patching only the server binding left `whisper-small` listed
+    # while this test went on passing its other four checks.
+    manager.hf_model_installed = lambda repo: "whisper-large-v3-turbo" in repo
     try:
         client = TestClient(server.app, raise_server_exceptions=False)
         ids = {m["id"]: m["owned_by"] for m in client.get("/v1/models").json()["data"]}
@@ -385,6 +393,7 @@ def main():
               "and what whisper-1 means here")
     finally:
         server.hf_model_installed = original_installed
+        manager.hf_model_installed = original_mgr_installed
 
     step(10, "[swap-while-busy] a swap cannot kill a transcription that is running")
     mgr = _manager()

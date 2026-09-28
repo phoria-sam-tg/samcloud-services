@@ -177,6 +177,139 @@ OFFERING_ENABLED = _env_bool("OFFERING_ENABLED", True)
 OFFERING_POLL_SECONDS = _env_int("OFFERING_POLL_SECONDS", 30)
 OFFERING_HYSTERESIS = _env_int("OFFERING_HYSTERESIS", 2)  # stable polls before a tier change
 
+# --- The offer (#861) -------------------------------------------------------
+# What /warm, /v1/models and /status advertise, and the two things that stop it
+# being a lie.
+#
+# WHY A WINDOW. A single reading is not a stable basis for an offer. Measured
+# on an IDLE wafer 2026-09-29, 24 samples over 2 minutes: memory_available_mb
+# min 9988, median 10711, max 12938 — a 2950 MB spread from ordinary desktop
+# churn, which is larger than several models in the catalogue. On ada it is
+# worse and for a different reason: inside ONE continuous render, free memory
+# swung 188 -> 2963 MiB, so the spread is not noise around a level, it is the
+# work's own oscillation.
+#
+# So the offer is computed over a trailing window, taking the MINIMUM
+# available and the MAXIMUM device-in-use across it. That single choice gives
+# both behaviours Sam asked for, with no separate withdraw/restore thresholds:
+#
+#   withdraw  happens on the first bad reading, because it lands in the window
+#             immediately and the minimum drops at once  ("within one reconcile")
+#   restore   cannot happen until every reading in the window agrees, because
+#             the old trough has to AGE OUT first          ("restores after")
+#
+# It also answers the objection that "two consecutive readings agree" does not:
+# two samples 5s apart can both sit at the top of a render's swing, but they
+# cannot both be the minimum of a window longer than the swing. Size the window
+# past the oscillation period you are protecting against, not past the noise.
+OFFER_WINDOW_S = _env_int("OFFER_WINDOW_S", 60)
+
+# Floor on how often the hardware is actually read behind the offer, and
+# therefore a ceiling on how big the window can get.
+#
+# `/warm` is auth-exempt, on a port bound to 0.0.0.0, and every call used to
+# run the collector and append a sample: three subprocesses per request on
+# Metal (15.3ms measured on wafer 2026-09-29) and a list pruned by time but
+# never by count. So an unauthenticated caller set the sample rate. At ~333
+# req/s — which one client on the LAN reaches without trying — that is ~1,000
+# process spawns a second on a box whose whole purpose is to be a good
+# neighbour to somebody's Unity session, and ~20,000 entries inside a 60s
+# window (4.05ms of list arithmetic per call, and the total work grows with
+# the SQUARE of the poll rate, because each of those calls also walks it).
+#
+# Rate-limiting the READ fixes both at once: at one sample per second the
+# window holds at most OFFER_WINDOW_S + 1 entries whatever the request rate.
+#
+# WHY NOT A COUNT CAP, which is the obvious fix and is the unsafe one. Capping
+# `_readings` to the N most recent entries evicts the OLDEST first — and the
+# oldest is exactly where the trough lives after a render starts. A flood of
+# requests would push the low reading out of the window early and restore the
+# offer while the render was still running, which is the one direction this
+# whole mechanism exists to prevent. Under-sampling is safe; forgetting is not.
+#
+# One second is invisible to every decision made from this: `stats_loop`
+# samples at 15s and the window is 60s, so nothing here resolves anything
+# finer. (Those two numbers are coupled — 15s into 60s is what guarantees ~4
+# samples on a box with no traffic at all. Lengthening `stats_loop` thins the
+# window silently; claude-wafer-services, reviewing PR #27.)
+OFFER_MIN_SAMPLE_INTERVAL_S = float(
+    _env("OFFER_MIN_SAMPLE_INTERVAL_S", "1.0"))
+
+# Hard ceiling on the window's length, independent of the rate limit above.
+#
+# The rate limit already bounds it at OFFER_WINDOW_S / interval + 1 = 61 by
+# default, so this never engages in normal operation. It is here for the case
+# where that reasoning stops holding — the interval lowered, a caller reaching
+# `_record_reading` by another path, a future sampler — because the cost of
+# being wrong about it is borne by an unauthenticated endpoint.
+#
+# IT MERGES RATHER THAN DROPS, and that is the whole design. Dropping the
+# oldest entries is the obvious cap and the unsafe one: the oldest entry is
+# exactly where the trough sits once a render has started, so a flood of
+# requests would evict the low reading early and restore the offer while the
+# render was still running — the one direction this mechanism exists to
+# prevent. So over the cap, the two oldest entries collapse into one carrying
+# the MINIMUM available and the MAXIMUM device-in-use of the pair, stamped
+# with the LATER of their two timestamps. No extreme is lost, and the merged
+# entry ages out no sooner than the newer of its parts would have (it lives
+# slightly longer, which delays restoration — the conservative direction).
+OFFER_MAX_SAMPLES = max(4, _env_int("OFFER_MAX_SAMPLES", 120))
+
+# THE "SOMEONE IS WORKING" GATE, and it is OFF until a box measures its floor.
+#
+# `available` answers "do I fit". This answers "is anyone working", and they are
+# different questions — they coincide only when the other tenant takes the whole
+# device, which is every render we have observed so far and cannot be assumed.
+# A lighter render holding 20 GB of a 48 GB board clears any floor we could set
+# and only this term would see it.
+#
+# FOREIGN_IDLE_MB is the box's own idle floor: device memory in use when nobody
+# is working. It has NO safe default and none is supplied — a wrong floor is
+# worse than no gate, because too low permanently withdraws the offer and too
+# high never fires. Unset means the gate does not run, which is exactly today's
+# behaviour. What is known so far:
+#
+#   wafer   ~1000-1200 MB idle (WindowServer and friends), ~3% of 36864
+#   ada     ONE reading of 5515 MB, 11% of 49140, taken 2026-09-28 22:5x by
+#           samclaude-admin. NOT a baseline: a single sample cannot distinguish
+#           a floor from a trough, and every subsequent observation has had a
+#           46 GB render in it. claude-ada is sampling for a real idle window.
+#
+# FOREIGN_MARGIN_MB is how far above the floor counts as work rather than
+# drift. It wants to clear the idle spread, not the render — a render is three
+# orders of magnitude above either floor above and needs no margin to detect.
+#
+# Parsed by hand rather than through _env_int, because _env_int's contract is
+# "fall back to the default", and here there IS no default — falling back to a
+# number would be inventing the measurement the comment above says we do not
+# have. An unparseable value leaves the gate OFF and says so, which is the only
+# safe reading of "the operator meant something we cannot understand".
+def _foreign_idle_mb() -> "int | None":
+    raw = os.environ.get("FOREIGN_IDLE_MB", "").strip()
+    if not raw:
+        return None
+    try:
+        v = int(raw)
+    except ValueError:
+        log.error(
+            f"FOREIGN_IDLE_MB={raw!r} is not an integer — the "
+            f"work-in-progress gate stays OFF. It has no default: set it to "
+            f"this box's measured idle device memory in MB, or leave it unset."
+        )
+        return None
+    if v < 0:
+        log.error(
+            f"FOREIGN_IDLE_MB={v} is negative — the gate stays OFF. A floor "
+            f"below zero fires on every reading and would withdraw this "
+            f"node's offer permanently."
+        )
+        return None
+    return v
+
+
+FOREIGN_IDLE_MB = _foreign_idle_mb()
+FOREIGN_MARGIN_MB = max(0, _env_int("FOREIGN_MARGIN_MB", 1024))
+
 # --- backends ---
 OLLAMA_BASE = _env("OLLAMA_BASE", "http://localhost:11434")
 MODELS_DIR = Path(_env("MODELS_DIR", str(Path.home() / "models")))

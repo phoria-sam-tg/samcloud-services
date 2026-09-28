@@ -967,8 +967,11 @@ def test_v1_models_lists_tier_and_never_touches_the_pool():
     to fail, and a discovery call that hangs on it turns a listing into the
     outage it is supposed to describe.
     """
-    import asyncio, types
+    import asyncio
     import ollama.server as srv
+    from ollama import capacity, manager as manager_mod
+    from ollama.manager import ModelManager
+    from ollama.samcloud import SamcloudClient
 
     class ExplodingExo:
         def pool_status(self, *a, **k):
@@ -979,17 +982,47 @@ def test_v1_models_lists_tier_and_never_touches_the_pool():
             raise AssertionError("/v1/models must not read the pool")
 
     class FakeOllama:
-        def list_models(self): return [{"name": "qwen3:1.7b"}, {"name": "qwen3.8:27b-mlx"}]
+        def list_models(self):
+            # Sizes matter now: /v1/models lists what FITS, so a catalogue
+            # with no sizes would be silently unlistable (#861).
+            return [{"name": "qwen3:1.7b", "size": 2000 * 1024 * 1024},
+                    {"name": "qwen3.8:27b-mlx", "size": 17500 * 1024 * 1024}]
+        def memory_estimate_mb(self, name):
+            for m in self.list_models():
+                if m["name"] == name:
+                    return max(1024, round(m["size"] / 1024 / 1024))
+            return 1024
     class FakeLlama:
-        def available_models(self): return [{"name": "qwen2.5-32b-agi-q4_k_m"}]
+        def available_models(self):
+            return [{"name": "qwen2.5-32b-agi-q4_k_m", "memory_mb": 20000}]
 
+    # A REAL ModelManager with fake backends, not a SimpleNamespace. The stub
+    # this replaced carried exactly the four attributes the handler happened
+    # to touch, so the moment /v1/models called one more manager method it
+    # raised AttributeError rather than failing an assertion — it could not
+    # test the contract because it could not refuse the way the real object
+    # does. ExplodingExo still proves the pool is never read, which is the
+    # property this test exists for.
     real = getattr(srv, "mgr", None)
-    srv.mgr = types.SimpleNamespace(
-        exo=ExplodingExo(), models={}, ollama=FakeOllama(), llama=FakeLlama())
+    real_collect = capacity.collect
+    real_installed = manager_mod.hf_model_installed
+    # Enough room for everything in the fake catalogue, so this test asserts
+    # what is LISTED and not what happens to fit on the box running it.
+    capacity.collect = lambda: {
+        "memory_total_mb": 65536, "memory_used_mb": 5536,
+        "memory_available_mb": 60000, "memory_device_inuse_mb": 500,
+        "compute_pct": 0.0, "load_avg_1m": 0.0,
+    }
+    manager_mod.hf_model_installed = lambda repo_id: False
+    srv.mgr = ModelManager(sc=SamcloudClient(token="test"),
+                           ollama=FakeOllama(), llama=FakeLlama(),
+                           exo=ExplodingExo())
     try:
         out = asyncio.run(srv.list_models_openai())
     finally:
         srv.mgr = real
+        capacity.collect = real_collect
+        manager_mod.hf_model_installed = real_installed
 
     ids = [m["id"] for m in out["data"]]
     check("openai envelope", out["object"], "list")
@@ -1002,24 +1035,50 @@ def test_v1_models_lists_tier_and_never_touches_the_pool():
     check("gguf listed", "qwen2.5-32b-agi-q4_k_m" in ids, True)
     check("no duplicates", len(ids), len(set(ids)))
 
+    # And the half that is new: with room for everything, everything is
+    # offered. The companion case — a model omitted because it does not fit —
+    # is test_elastic_offering step 10, which can choose the reading.
+    check("everything that fits is listed", len(ids), 4)
+    check("each carries which it is",
+          {m.get("status") for m in out["data"]}, {"tier", "loadable"})
+
 
 def test_v1_models_survives_a_dead_ollama():
     """One catalogue being down must not fail the whole listing."""
-    import asyncio, types
+    import asyncio
     import ollama.server as srv
+    from ollama import capacity, manager as manager_mod
+    from ollama.manager import ModelManager
+    from ollama.samcloud import SamcloudClient
 
     class DeadOllama:
         def list_models(self): raise RuntimeError("connection refused")
+        def memory_estimate_mb(self, name): raise RuntimeError("connection refused")
     class FakeLlama:
         def available_models(self): return []
 
+    # A real ModelManager, for the reason given in the test above. It also
+    # widens what this case covers: the listing now goes through
+    # `offering()`, so "one catalogue being down must not fail the whole
+    # listing" is being asserted of the bucket computation too, not only of
+    # the handler.
     real = getattr(srv, "mgr", None)
-    srv.mgr = types.SimpleNamespace(
-        exo=object(), models={}, ollama=DeadOllama(), llama=FakeLlama())
+    real_collect = capacity.collect
+    real_installed = manager_mod.hf_model_installed
+    capacity.collect = lambda: {
+        "memory_total_mb": 65536, "memory_used_mb": 5536,
+        "memory_available_mb": 60000, "memory_device_inuse_mb": 500,
+        "compute_pct": 0.0, "load_avg_1m": 0.0,
+    }
+    manager_mod.hf_model_installed = lambda repo_id: False
+    srv.mgr = ModelManager(sc=SamcloudClient(token="test"),
+                           ollama=DeadOllama(), llama=FakeLlama())
     try:
         out = asyncio.run(srv.list_models_openai())
     finally:
         srv.mgr = real
+        capacity.collect = real_collect
+        manager_mod.hf_model_installed = real_installed
     check("still returns a list", out["object"], "list")
     check("tier still listed", "think" in [m["id"] for m in out["data"]], True)
 

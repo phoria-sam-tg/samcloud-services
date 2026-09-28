@@ -719,6 +719,22 @@ def _capacity_503(e: "capacity.InsufficientCapacity") -> HTTPException:
     return HTTPException(status_code=503, detail=e.as_dict())
 
 
+def _device_in_use_503(e: "capacity.DeviceInUse") -> HTTPException:
+    """Another tenant is working on this device. 503, same shape as the other
+    two refusals, and deliberately with NO Retry-After.
+
+    A caller must be able to tell three things apart without parsing prose:
+    "does not fit here" (`insufficient_capacity`), "someone holds the
+    exclusive resource, come back" (`resource_busy`), and this —
+    `device_in_use`, which means go to another node. The first two can name a
+    time because a lease expires and memory frees. A render ends when a
+    person is finished with it, and a made-up Retry-After would tell a caller
+    to poll a node that has three siblings.
+    """
+    log.info(f"Refused, device in use by other work: {e}")
+    return HTTPException(status_code=503, detail=e.as_dict())
+
+
 def _busy_503(e: "capacity.PoolBusy") -> HTTPException:
     """The pool is taken. Same 503 shape as a capacity refusal, plus Retry-After.
 
@@ -886,6 +902,8 @@ async def load_model(req: LoadRequest):
             "memory_mb": mm.memory_mb,
             "lease_id": mm.lease_id,
         }
+    except capacity.DeviceInUse as e:
+        raise _device_in_use_503(e)
     except capacity.InsufficientCapacity as e:
         raise _capacity_503(e)
     except capacity.PoolBusy as e:
@@ -1122,6 +1140,8 @@ async def _resolve_model(model_name: str):
             try:
                 mm = mgr.load_ollama_model(ollama_name)
                 return mm
+            except capacity.DeviceInUse as e:
+                raise _device_in_use_503(e)
             except capacity.InsufficientCapacity as e:
                 # Not a missing model — a capacity answer. Surface it, with the
                 # list of what does fit, instead of collapsing to "not pulled".
@@ -1137,6 +1157,8 @@ async def _resolve_model(model_name: str):
             try:
                 mm = mgr.load_llama_model(m["file"])
                 return mm
+            except capacity.DeviceInUse as e:
+                raise _device_in_use_503(e)
             except capacity.InsufficientCapacity as e:
                 # Not a missing model — a capacity answer. Surface it, with the
                 # list of what does fit, instead of collapsing to "not pulled".
@@ -1905,6 +1927,8 @@ async def _resolve_whisper(model: str):
         # would stop every other route for the duration — the same failure the
         # pool's `/state` read caused before it was moved off.
         return await asyncio.to_thread(mgr.load_whisper_model, model_id)
+    except capacity.DeviceInUse as e:
+        raise _device_in_use_503(e)
     except capacity.InsufficientCapacity as e:
         raise _capacity_503(e)
     except TranscriberBusy as e:

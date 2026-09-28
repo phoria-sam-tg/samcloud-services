@@ -366,6 +366,57 @@ class PoolBusy(Exception):
         }
 
 
+class DeviceInUse(Exception):
+    """Someone else is using this device for work, so we are not taking it.
+
+    The third refusal, and a different question from the other two.
+    `InsufficientCapacity` says "that does not fit here"; `PoolBusy` says "an
+    exclusive resource is held". This says "it might fit and nothing is
+    formally held, and we are still declining, because another tenant is
+    working on this device and their work is not ours to take memory from."
+
+    It exists because a fit check cannot answer that question. Measured on ada
+    2026-09-29 (claude-ada, 53 samples): inside ONE continuous 46 GB Unreal
+    render, free memory swung 188 -> 2963 MiB, so at the render's own peak the
+    fit check offers 1939 MB — enough for a small model, loaded into a gap
+    inside somebody's render, recorded as a success in every log we keep.
+
+    `retry_after_s` is honestly None and stays that way. The other two
+    refusals can say when to come back because a lease expires and memory
+    frees; a render ends when a person is finished, and inventing a number
+    would tell a caller to poll rather than to go somewhere else — which is
+    the whole point of the fleet having three nodes.
+    """
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        foreign_mb: Optional[int] = None,
+        idle_floor_mb: Optional[int] = None,
+        margin_mb: Optional[int] = None,
+        resource_id: Optional[str] = None,
+    ):
+        super().__init__(detail)
+        self.detail = detail
+        self.foreign_mb = foreign_mb
+        self.idle_floor_mb = idle_floor_mb
+        self.margin_mb = margin_mb
+        self.resource_id = resource_id
+
+    def as_dict(self) -> dict:
+        """Body for a 503, in the same shape as the other two refusals."""
+        return {
+            "error": "device_in_use",
+            "message": self.detail,
+            "resource_id": self.resource_id,
+            "foreign_mb": self.foreign_mb,
+            "idle_floor_mb": self.idle_floor_mb,
+            "margin_mb": self.margin_mb,
+            "retry_after_s": None,
+        }
+
+
 def usable_mb(available_mb: int) -> int:
     """How much of `available_mb` we are willing to commit."""
     return max(0, min(int(available_mb * USABLE_FRACTION),

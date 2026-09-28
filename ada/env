@@ -1,0 +1,86 @@
+# ada-wsl profile for samcloud-services / model-gateway (#861).
+#
+# Read as `EnvironmentFile=` by the systemd unit, or sourced by run.sh.
+# Values NOT listed here take ollama/config.py's defaults, which target the
+# production registry already. Everything here is either an identity or a
+# number measured on this box.
+#
+# THERE IS NO SC_TOKEN IN THIS FILE AND THERE MUST NEVER BE ONE. The bearer is
+# read from a 0600 file by the process itself (#845). An earlier version of
+# this profile did `set -a` around it and exported SC_TOKEN, which put the
+# token in the environment of every child the gateway spawns — visible to any
+# reader of that uid through `ps eww`.
+
+# --- identity ---------------------------------------------------------------
+SC_DEVICE=ada-wsl
+SC_SERVICE_NAME=model-gateway
+SC_RESOURCE_ID=ada-wsl/gpu-0
+
+# The gateway's OWN identity: agent `ada-model-service`, scopes exactly
+# ["device:ada-wsl"]. Not the seat's ~/.samcloud/token, and not the old
+# `service:self` service token, which could not lease at all — every lease
+# request 404'd for months because `service:` scopes grant no device
+# visibility, and `_request_lease` swallows the error and loads anyway, so
+# the box looked healthy the whole time (#861).
+SC_TOKEN_FILE=/home/phoria/.config/samcloud-services/ada-model-service.token
+
+# What the gateway demands of CALLERS. A different question from the line
+# above, and the split slice and wafer already run: the gateway's own identity
+# is as narrow as possible; who may ask it for a model is a group.
+SC_REQUIRED_SCOPE=group:services
+
+# --- the device -------------------------------------------------------------
+# Declared rather than detected. Detection would get it right here, but every
+# other identity on this service is declared and a box that has nvidia-smi
+# installed should be able to say it serves from somewhere else.
+SC_CAPACITY_BACKEND=cuda
+SC_CUDA_INDEX=0
+
+# --- the work gate ----------------------------------------------------------
+# ada is a WORK MACHINE. Windows-side renders (Unreal, on the `Phoria - RN02`
+# account) hold VRAM this gateway never allocated and holds no lease on, and
+# `nvidia-smi memory.used` inside WSL counts them at full size — measured
+# 2026-09-29 against the Windows-side counter: UnrealEditor pid 15240 at
+# 46,331 MB dedicated, against 46,207-47,954 read from inside WSL.
+#
+# FOREIGN_IDLE_MB is device memory in use when nobody is working. Two idle
+# measurements disagree: 3,118 MB median over 31 samples at 5s (claude-ada,
+# 23:21-23:23 UTC, spread only 116 MB) and a single 5,515 MB sample 25 minutes
+# earlier (samclaude-admin). The HIGHER is set here, and the reason is that
+# the gap changes no verdict: a render reads ~46,000 MB, so anything in
+# 3,118-5,515 plus the margin separates the two states unambiguously. Only the
+# low end can fail invisibly — a floor under the true idle level withdraws
+# this node's offer permanently while looking conservative.
+#
+# SETTING THIS IS WHAT TURNS THE WORK GATE ON. It has no default; slice and
+# wafer leave it unset and behave exactly as before. Re-measure at another
+# time of day before treating 5,515 as settled.
+FOREIGN_IDLE_MB=5515
+FOREIGN_MARGIN_MB=1024
+
+# Backstop under the gate above, not a substitute for it, and derived rather
+# than chosen: 2,963 MB is the MAXIMUM free memory observed at any point
+# during a render (claude-ada, 53 samples across one continuous 46 GB Unreal
+# session; the minimum was 188 MB). A floor above that means the fit check
+# alone cannot offer anything at any moment of a render it has seen — which
+# matters because `usable()` on the default 1024 MB floor would offer up to
+# 1,939 MB at that same peak, enough for a small model, loaded into a gap
+# inside somebody's render.
+#
+# Rounded UP to the next hundred, not to 4096. It is a measured ceiling on
+# render-time free memory, and it stops meaning anything if renders change
+# shape — re-measure, do not pad.
+SC_MIN_HEADROOM_MB=3000
+
+# --- backends ---------------------------------------------------------------
+# No exo node on ada: the pool is two Macs.
+EXO_ENABLED=0
+# mlx-whisper is Apple-silicon only. (There is deliberately no VLM_ENABLED:
+# mlx-vlm is equally Mac-only but needs no switch, because `hf_model_installed`
+# finds no weights here, so `offering()` never advertises one and
+# `match_vlm_model` never resolves one. A flag to make a Linux box look
+# symmetrical on paper would be a knob with nothing behind it.)
+WHISPER_ENABLED=0
+
+OLLAMA_BASE=http://localhost:11434
+SERVICE_PORT=8800

@@ -296,6 +296,11 @@ class ManagedModel:
     # `check_cooldowns` both run there), so it needs no lock — a load runs in a
     # thread but never touches this.
     in_flight: int = 0
+    # Set when a renewal could not get the lease back and the model is STILL
+    # RESIDENT. Distinct from `lease_id is None`, which also covers a model
+    # that never got one. Residency is unaffected on purpose — see
+    # `own_device_mb`.
+    lease_lost: bool = False
     # Set only for Backend.EXO, where the dict key is the *tier* a caller asks
     # for ("think") while `name` is whatever model the pool currently holds.
     # Every other backend keys on the model name itself.
@@ -345,6 +350,10 @@ class ModelManager:
     # first. The offer is computed over this rather than over one sample — see
     # `offer_reading`. Appended by every read, so it fills from ordinary
     # traffic and from `stats_loop` without needing a loop of its own.
+    # Monotonic time of the last lease refusal that meant CONTENTION
+    # (`queued` or `conflict`), never a transport error. See
+    # `config.LEASE_CONTENTION_TTL_S` for why the distinction is load-bearing.
+    _lease_contended_at: Optional[float] = field(default=None, repr=False)
     _readings: list = field(default_factory=list, repr=False)
     _readings_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -785,6 +794,9 @@ class ModelManager:
             mm.request_count += 1
             return mm
 
+        # Work wins (#861): a resident model keeps serving, a NEW one does not
+        # start while somebody else is using this device.
+        self.refuse_if_device_in_use(model_name)
 
         # Fit against what this box can hand over WITHOUT swapping, instead of
         # evicting whatever is resident to force-fit the ask. The contract is
@@ -872,6 +884,10 @@ class ModelManager:
             mm.last_used = time.time()
             mm.request_count += 1
             return mm
+
+        # Work wins (#861): a resident model keeps serving, a NEW one does not
+        # start while somebody else is using this device.
+        self.refuse_if_device_in_use(name)
 
         # Check if port is already in use by an adopted instance
         if port in self.llama.instances:
@@ -1034,6 +1050,10 @@ class ModelManager:
             mm.last_used = time.time()
             mm.request_count += 1
             return mm
+
+        # Work wins (#861): a resident model keeps serving, a NEW one does not
+        # start while somebody else is using this device.
+        self.refuse_if_device_in_use(resolved)
 
         # Single VLM per port — evict any other VLM first.
         for existing, mm in list(self.models.items()):
@@ -1239,6 +1259,10 @@ class ModelManager:
                 f"whisper child for {model_id} is not answering — reloading it"
             )
             self.unload(model_id, force=True)
+
+        # Work wins (#861): a resident child keeps serving, a NEW one does not
+        # start while somebody else is using this device.
+        self.refuse_if_device_in_use(model_id)
 
         # One child per port — swap out the other whisper model first. A swap
         # kills the child, so anything it is in the middle of dies with it: the
@@ -1530,6 +1554,9 @@ class ModelManager:
 
         outcome = self._lease_outcome(resp)
         if outcome.granted:
+            # A grant is the end of any contention we were remembering: the
+            # registry has just told us the resource has room for us.
+            self._lease_contended_at = None
             if outcome.expires_at is None:
                 log.warning(
                     f"Lease {outcome.lease_id} granted without expiry — relying "
@@ -1540,6 +1567,10 @@ class ModelManager:
                 f"({memory_mb}MB, TTL={LEASE_TTL}s)"
             )
             return outcome.lease_id
+
+        # Contention, not a fault: the registry considered it and said the
+        # resource is full. `error` states deliberately do not count.
+        self.note_lease_contention(outcome.state, model_name)
 
         if outcome.state == "queued":
             log.warning(
@@ -1949,16 +1980,35 @@ class ModelManager:
         """Unload idle models past cooldown."""
         now = time.time()
         results = []
+        # Under foreign work the cooldown collapses to zero: a model that is
+        # not serving anything is memory we are holding out of somebody's
+        # render for no reason. Sam's line is "if someone's using it for work,
+        # it doesn't offer" — withdrawing the offer while still sitting on
+        # 40 GB of their card is half an answer.
+        #
+        # `in_flight` still protects a request mid-flight. Cutting one is
+        # admin's policy (work wins) but needs a measured grace period, which
+        # is C2; until then a running request finishes and the model goes on
+        # the next tick.
+        working = self.work_in_progress(
+            capacity.foreign_mb(
+                self.offer_reading()["memory_device_inuse_mb"],
+                self.own_device_mb(),
+            )
+        )
+        cooldown = 0 if working else COOLDOWN_SECONDS
         to_unload = [
             name
             for name, mm in self.models.items()
             if mm.managed
             and not mm.in_flight
-            and (now - mm.last_used) > COOLDOWN_SECONDS
+            and (now - mm.last_used) > cooldown
         ]
         for name in to_unload:
             idle = int(now - self.models[name].last_used)
-            log.info(f"{name} idle {idle}s (>{COOLDOWN_SECONDS}s), unloading...")
+            why = ("another tenant is using this device"
+                   if working else f"idle {idle}s (>{COOLDOWN_SECONDS}s)")
+            log.info(f"{name} {why}, unloading...")
             results.append(self.unload(name))
         return results
 
@@ -2153,10 +2203,79 @@ class ModelManager:
         the alternative loads a model on top of a render.
         """
         if config.FOREIGN_IDLE_MB is None:
+            # The floor is also the switch: a box that has not measured its
+            # idle device memory does not participate in the work gate at
+            # all, lease signal included. Only ada sets it.
             return None
+        if self.lease_contention_fresh():
+            return True
         if foreign_mb is None:
             return True
         return foreign_mb > config.FOREIGN_IDLE_MB + config.FOREIGN_MARGIN_MB
+
+    def note_lease_contention(self, state: str, model_name: str = "") -> None:
+        """Record that the registry refused a lease because the GPU is full.
+
+        `queued` and `conflict` only. An `error` — a 404, a timeout, a dead
+        registry — means we could not ask, which is not evidence about who is
+        using the device. ada's gateway spent months 404ing every lease
+        request on a scope it never had; counting that would have read a
+        permanent authentication fault as a permanent render (#861).
+        """
+        if state not in ("queued", "conflict"):
+            return
+        self._lease_contended_at = time.monotonic()
+        log.info(
+            f"Lease contention ({state}) on {RESOURCE_ID}"
+            + (f" for {model_name}" if model_name else "")
+            + f" — treating as work in progress for "
+            f"{config.LEASE_CONTENTION_TTL_S}s"
+        )
+
+    def lease_contention_fresh(self) -> bool:
+        """Is a lease refusal recent enough to still count as evidence?"""
+        at = self._lease_contended_at
+        if at is None:
+            return False
+        return (time.monotonic() - at) <= config.LEASE_CONTENTION_TTL_S
+
+    def refuse_if_device_in_use(self, model_name: str) -> None:
+        """Raise `capacity.DeviceInUse` if another tenant is working. No-op
+        on a box that has not declared an idle floor.
+
+        THE OFFER AND THE GATE ARE DIFFERENT THINGS, and this is the gate.
+        `offering()` stops advertising when work is present; it cannot stop a
+        caller who asks anyway, and `POST /models/load` names a model
+        directly. Without this, a node withdraws its offer and then loads onto
+        the render for the next caller who ignores it.
+        """
+        r = self.offer_reading()
+        own = self.own_device_mb()
+        foreign = capacity.foreign_mb(r["memory_device_inuse_mb"], own)
+        if not self.work_in_progress(foreign):
+            return
+        if self.lease_contention_fresh():
+            why = (f"the registry refused this node a lease within the last "
+                   f"{config.LEASE_CONTENTION_TTL_S}s")
+        elif foreign is None:
+            why = "this node cannot read how much of the device is in use"
+        else:
+            why = (f"{foreign}MB is held by someone else, over the "
+                   f"{config.FOREIGN_IDLE_MB}MB idle floor + "
+                   f"{config.FOREIGN_MARGIN_MB}MB margin")
+        detail = (
+            f"{model_name} was not loaded: this device is in use for other "
+            f"work ({why}). Its memory is not ours to take — try another "
+            f"node rather than waiting."
+        )
+        log.info(f"Refusing load, device in use: {detail}")
+        raise capacity.DeviceInUse(
+            detail,
+            foreign_mb=foreign,
+            idle_floor_mb=config.FOREIGN_IDLE_MB,
+            margin_mb=config.FOREIGN_MARGIN_MB,
+            resource_id=RESOURCE_ID,
+        )
 
     async def stats_loop(self):
         """Push unified-memory stats to this box's SAMcloud resource every 15s.
@@ -2277,7 +2396,24 @@ class ModelManager:
                 self.sc.release_lease(mm.lease_id)
                 new_id = self._request_lease(name, mm.memory_mb)
                 mm.lease_id = new_id
-                log.info(f"Renewed lease for {name}: {new_id}")
+                # LEASE STATE CHANGES, RESIDENCY DOES NOT (#861). The model is
+                # still on the GPU; all that has changed is that nothing in
+                # the registry accounts for it. Dropping it from
+                # `self.models` here would make `own_device_mb()` fall by its
+                # size while the memory is still held, so `foreign_mb` would
+                # rise by the same amount in the same instant and the gateway
+                # would read its own resident model as another tenant — and
+                # step back from itself, permanently, looking conservative
+                # while doing it (claude-wafer-services, reviewing C1).
+                mm.lease_lost = new_id is None
+                if new_id is None:
+                    log.warning(
+                        f"{name} is resident and UNLEASED: the renewal could "
+                        f"not get the lease back. Nothing in the registry "
+                        f"accounts for its {mm.memory_mb}MB. Still resident."
+                    )
+                else:
+                    log.info(f"Renewed lease for {name}: {new_id}")
             except Exception as e:
                 log.warning(f"Failed to renew lease for {name}: {e}")
 

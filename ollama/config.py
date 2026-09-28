@@ -253,6 +253,13 @@ OFFER_MIN_SAMPLE_INTERVAL_S = float(
 # with the LATER of their two timestamps. No extreme is lost, and the merged
 # entry ages out no sooner than the newer of its parts would have (it lives
 # slightly longer, which delays restoration — the conservative direction).
+#
+# AND IT IS MEANT NEVER TO FIRE. At the defaults the rate floor above holds a
+# natural window near 60 entries against this 120, so in production the cap is
+# dead code — which is the point, not an argument for tightening it to 60. It
+# exists for the case where the floor stops holding, and a cap that engages in
+# normal operation would be merging readings the window was entitled to keep
+# separate (claude-wafer-services, reviewing PR #27).
 OFFER_MAX_SAMPLES = max(4, _env_int("OFFER_MAX_SAMPLES", 120))
 
 # THE "SOMEONE IS WORKING" GATE, and it is OFF until a box measures its floor.
@@ -309,6 +316,31 @@ def _foreign_idle_mb() -> "int | None":
 
 FOREIGN_IDLE_MB = _foreign_idle_mb()
 FOREIGN_MARGIN_MB = max(0, _env_int("FOREIGN_MARGIN_MB", 1024))
+
+# How long a refused lease counts as evidence that somebody else is working.
+#
+# WHY A LEASE REFUSAL IS A SEPARATE SIGNAL AT ALL, when foreign_mb measures
+# the device directly: because there is one case where foreign_mb is wrong in
+# the dangerous direction, and it is ada's case. Under WDDM the driver may
+# page OUR allocation out to system memory to satisfy a render. If it does,
+# `memory.used` shows the render's ~44 GB while `own_mb` still reports the
+# model we think we hold — so `foreign = used - own` comes out small and the
+# gateway concludes nobody is working, in the middle of a render. The
+# registry sees it from the other side and refuses our renewal, because the
+# resource really is oversubscribed. One signal covers the other's blind spot.
+#
+# ONLY CONTENTION COUNTS, never a transport failure. `queued` and `conflict`
+# mean the registry considered the request and said the resource is full;
+# `error` means we could not ask. ada's gateway has been 404ing every lease
+# request for months on a scope it never had (#861), and if that counted, the
+# node would read a permanent authentication fault as a permanent render and
+# never offer anything — a failure that looks exactly like caution.
+#
+# Short, because it is corroboration and not the primary reading. The fit
+# check against `available` is what actually protects during a render (free
+# memory sits at 188-2963 MiB while one runs), and every load attempt and
+# every renewal refreshes this. Stale evidence is not evidence.
+LEASE_CONTENTION_TTL_S = max(0, _env_int("LEASE_CONTENTION_TTL_S", OFFER_WINDOW_S))
 
 # --- backends ---
 OLLAMA_BASE = _env("OLLAMA_BASE", "http://localhost:11434")

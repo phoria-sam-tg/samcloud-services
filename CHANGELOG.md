@@ -2,6 +2,72 @@
 
 Project history and current state. This is a living document.
 
+## 2026-09-29 — Speech to text: the gateway takes audio (#858)
+
+- **What was missing.** The gateway served text and vision. Audio had nowhere to
+  go, so anything spoken on this fleet reached a model only by way of a phone's
+  transcriber and a clipboard. `POST /v1/audio/transcriptions` now takes
+  multipart `file` + `model` and returns `{"text": ...}`, shaped after OpenAI's
+  endpoint so a client already written against that API needs no change but a
+  base URL. `whisper-1` resolves to the default.
+- **Which model, measured.** 44.7s of narration, six utterances, four voices,
+  scripted so there is a ground truth to diff against (142 words, word error
+  rate after normalising digits-vs-words):
+
+  | model | time | WER | peak MLX memory |
+  |---|---|---|---|
+  | `whisper-large-v3-turbo` | 2.16s | **2.8%** | 2507 MB |
+  | `whisper-large-v3-turbo-q4` | 1.97s | 4.2% | 2088 MB |
+  | `whisper-small-mlx` | 1.48s | 4.9% | 1455 MB |
+
+  turbo is the default. `whisper-small` is in the catalogue as the model that
+  still fits when the box is full, not as a speed option — it is not faster on
+  this hardware. Longer file, 5 min 08 s: turbo in 35.9s, **~8.6x realtime**.
+- **The limit of that measurement.** The audio was macOS `say`: clean,
+  close-mic'd, unaccented, no room and no compressor running. The ORDER should
+  hold on real speech; the absolute rates are a floor. Re-measure on a real
+  walkthrough before moving the default on the strength of these numbers.
+- **A child process, not an import.** `Backend.WHISPER` is owned exactly as
+  mlx-vlm is. Two measurements decided it: mlx-whisper's wheels are 485 MB the
+  gateway never calls, and a transcription peaks at 2.5 GB — which a killed
+  process returns to the OS, and a dropped Python reference returns to MLX's
+  buffer cache. The child is polled for its **model**, not just a 200, because a
+  child left over from a previous gateway answers `/health` while holding the
+  other one.
+- **mlx-whisper's `torch` dependency is wrong, and `requirements-whisper.txt`
+  says so.** It declares `torch` and imports it only in `torch_whisper.py`, the
+  weight *conversion* path; `transcribe` never reaches it. With torch the venv is
+  991 MB, without it 485 MB, and the transcript of the same file is
+  byte-identical.
+- **A request that outlives the cooldown**, the first one here. A one-hour
+  walkthrough is about seven minutes against a 300s idle timer, so
+  `ManagedModel.in_flight` is held for the call and `check_cooldowns` skips a
+  model that has one. `last_used` is stamped at the END — at the start, a long
+  transcription looks idle while it runs.
+- **The two name spaces do not meet.** `match_whisper_model` matches exactly,
+  like `match_exo_tier`; `_resolve_model` skips `Backend.WHISPER` in both its
+  exact and substring passes. Sharing `mgr.models` is what gives the transcriber
+  leases, cooldown, status and shutdown for free, and is also exactly what put it
+  in reach of a chat request for a backend with no chat route.
+- **A comment that was wrong, and how it was caught.** `jsonable()` claimed
+  `json.dumps(np.float64(...))` raises, and that word timestamps would be a 500
+  without it. Removing the coercion and re-running showed every response still
+  working: `np.float64` subclasses Python `float`. It stays for `np.float32` and
+  `np.int32`, which json does refuse, and the comment now separates the
+  measurement from what the guard is actually for.
+- **A verification that measured the wrong thing.** The first check that a clean
+  shutdown reaps the child found the child with `pgrep -f whisper_server.py` and
+  reported PASS. This box has several user accounts and `pgrep` sees all of them:
+  the pid it matched was the shell that had written the test script. Redone
+  against the port the child listens on. The same property is why
+  `_is_whisper_server` checks uid and `argv[0]` — `whisper_server.py` is a plain
+  filename and turns up in any command line that greps, tails or edits the file.
+- **Found while checking for regressions, filed separately (#862):**
+  `requirements.txt` admits `tokenizers` 0.23, on which `test_prompt_size` fails
+  three checks — on `main` as well — because the prompt gate falls back to the
+  chars/token estimate instead of counting through the model's template.
+  Production runs 0.22.2 and passes.
+
 ## 2026-09-25 — The gateway now measures a prompt before it dispatches it (#837)
 
 - **What happened.** slice kernel-panicked at 11:50:43 and was down about three

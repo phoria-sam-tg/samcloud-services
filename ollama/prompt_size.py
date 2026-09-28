@@ -28,8 +28,30 @@ Counting goes through the model's own chat template and tokenizer — the same t
 files exo renders and tokenizes with — so the number means what the measurements
 behind the limit mean: tokens the model is actually handed. Tools count, because
 this template renders every definition inline. Missing template or tokenizer fall
-back to the serialised request and then to a chars/token estimate, both of which
-over-count; the refusal always says which method produced its number.
+back to the serialised request and then to a chars/token estimate; the refusal
+always says which method produced its number.
+
+THE FALLBACKS DO NOT ALL OVER-COUNT, which this docstring used to claim and
+which is the wrong way round for the requests that matter. Measured on wafer
+2026-09-29 against GLM-4.7-Flash-6bit, one user message and a varying number of
+tools, `serialised` minus `chat template`:
+
+    tools      0     1     4     8    16    32
+    delta    +30   -68   -68   -68   -68   -68
+
+A bare prompt over-counts by the serialised form's keys and quotes. The moment
+tools are present it UNDER-counts by a constant 68 tokens — the template's own
+wrapping, which the serialised form never sees — so the fallback admits prompts
+the template would refuse. Bounded and small against a 12,288-token limit, and
+so not a reason to panic, but it is a floor on the gate rather than a margin of
+safety, and the direction matters if the limit ever comes down.
+
+HOW TO TELL WHICH PATH A COUNT CAME THROUGH, without running the test:
+`count()` returns it as the second element of its tuple, `PromptTooLarge`
+carries it to the caller as `counted_with` in the 503 body, and `_load` and
+`_template` each log once per model on first use — INFO naming the path taken,
+WARNING naming what was missing. If you are looking at a `serialised` count and
+expected `chat template`, the WARNING says which of the three causes it was.
 """
 
 import json
@@ -166,7 +188,24 @@ def _template(model_id: str, models_dir: str):
     tmpl = None
     path = os.path.join(models_dir, model_id.replace("/", "--"), "chat_template.jinja")
     try:
-        from jinja2.sandbox import ImmutableSandboxedEnvironment  # noqa: PLC0415
+        # Imported on its own so a MISSING DEPENDENCY cannot be mistaken for a
+        # missing model asset. Both used to land on the one `except` below and
+        # print "no chat template for <model> at <path>", which reads as "this
+        # model ships no template" — it sent #862 looking at `tokenizers`
+        # versions and at the model directory for most of an investigation,
+        # when the real answer was that `jinja2` was not installed at all and
+        # `requirements.txt` had never declared it.
+        try:
+            from jinja2.sandbox import ImmutableSandboxedEnvironment  # noqa: PLC0415
+        except ImportError as e:
+            log.warning(
+                f"prompt-size: jinja2 is not installed ({e}); every count will "
+                f"use the serialised fallback, which under-counts a prompt "
+                f"carrying tools. `pip install jinja2` — it is in "
+                f"requirements.txt."
+            )
+            _CACHE[key] = None
+            return None
         import datetime  # noqa: PLC0415
 
         def raise_exception(msg):

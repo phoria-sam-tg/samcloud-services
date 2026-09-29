@@ -855,12 +855,16 @@ class ModelManager:
                     log.info(f"Actual VRAM for {model_name}: {actual_mb}MB (estimated {memory_mb}MB)")
                 break
 
+        lease_id, lease_lost = self._reconcile_lease(
+            model_name, lease_id, memory_mb, actual_mb)
+
         now = time.time()
         mm = ManagedModel(
             name=model_name,
             backend=Backend.OLLAMA,
             memory_mb=actual_mb,
             lease_id=lease_id,
+            lease_lost=lease_lost,
             port=11434,
             loaded_at=now,
             last_used=now,
@@ -1528,6 +1532,124 @@ class ModelManager:
             granted=True, state="active", lease_id=lease_id,
             expires_at=resp.get("expires_at"), held_by=resp.get("service_id"),
         )
+
+    # How far the estimate has to be out before a reconcile is worth its
+    # window. Release-then-reacquire leaves the resource momentarily unheld
+    # (see `_renew_leases` for why that is survivable on a share and not on an
+    # exclusive lease), so it is not worth paying for a rounding error.
+    #
+    # The gap it is sized for is not a rounding error. Measured on wafer
+    # 2026-09-29 (claude-wafer-services), one resident model:
+    #
+    #     qwen3:1.7b   lease reserves 1296 MB   actually occupies 3354 MB
+    #
+    # 1296 is `memory_estimate_mb` — `max(1024, disk_mb)` — and 3354 is the
+    # model with its context. 2.6x, on the number every other tenant reads.
+    _RECONCILE_RATIO = 1.25
+
+    def _reconcile_lease(
+        self,
+        model_name: str,
+        lease_id: Optional[str],
+        estimated_mb: int,
+        actual_mb: int,
+    ) -> tuple[Optional[str], bool]:
+        """Re-lease at the size the model actually turned out to be.
+
+        Returns `(lease_id, lease_lost)`.
+
+        WHY IT MATTERS, and it is the whole of "make GPU usage legible to
+        other tenants": the lease is requested from a disk-size estimate,
+        before the weights are resident and before their context exists. The
+        registry then publishes that number as what this box has claimed, and
+        `available_memory_mb` is computed from it. Under-reserving does not
+        cost us anything — nothing enforces a lease — it costs whoever reads
+        the registry next and concludes there is room.
+
+        The new lease is ACQUIRED BEFORE the old one is released — see the
+        comment at that line for the measurement that forced the order.
+
+        IT DOES NOT UNDO THE LOAD, and that is a deliberate departure from the
+        version of this on the `ada-linux-cuda-profile` branch, which unloaded
+        the model and raised if the reconcile could not be granted. The local
+        capacity gate has already decided this model fits this box, from a
+        direct reading of the hardware; the registry's byte count is
+        spec-minus-leases and cannot see a tenant who took no lease, which is
+        the case #861 exists for. Refusing on a disagreement with the weaker
+        instrument would be a regression, and `_request_lease` already says so
+        for the same reason on the first attempt.
+
+        WHAT IT DOES INSTEAD is make the failure legible without making the
+        accounting worse. A reconcile that comes back queued is not nothing:
+        the registry is telling us the resource is oversubscribed at the true
+        size, which is exactly the contention signal C1 added, so it feeds
+        `note_lease_contention`. On ada that reads as "someone is working" and
+        the node stops accepting; on slice and wafer, where no idle floor is
+        declared, it is a log line. The model keeps its estimate lease either
+        way, so `lease_lost` stays False on this path — it is leased, at the
+        wrong size, which is where it already was.
+
+        `lease_lost` is therefore reachable from `_renew_leases` and not from
+        here. That is not an oversight: a renewal has already released its
+        lease by the time it asks for a new one, and cannot take it back.
+
+        Residency is untouched on every path — see `_renew_leases`.
+        """
+        if not lease_id or actual_mb <= estimated_mb * self._RECONCILE_RATIO:
+            return lease_id, False
+
+        # ACQUIRE BEFORE RELEASE. The order is the whole of the failure path.
+        #
+        # Release-first is the obvious way round — the registry cannot resize a
+        # lease, so the old row has to go — and it leaves the registry FURTHER
+        # from the truth than before the reconcile ran whenever the new request
+        # is refused. Measured live against wafer-services/gpu-metal
+        # (claude-wafer-services, reviewing PR #29):
+        #
+        #     estimate lease held        registry accounted 1296 MB
+        #     released, re-request fails registry accounted    0 MB
+        #     model still resident, occupying 3354
+        #
+        # The under-accounting goes from 2058 MB to 3354 — 1.63x worse, at the
+        # exact moment we learn the true size, in the direction this ticket
+        # exists to correct. And it bites where it is least visible: on ada the
+        # contention signal stops the node accepting, so the node protects
+        # itself; on slice and wafer no floor is declared, so it is only a log
+        # line — and those are the boxes whose registry figure others read.
+        #
+        # Asking first removes the window rather than compensating for it
+        # (samclaude-admin). It also closes a second gap release-first has:
+        # between the release and the re-request another tenant can take the
+        # memory we just handed back.
+        #
+        # THE COST, which is real: for the length of one request the registry
+        # counts this model twice, so on a nearly full shared resource the
+        # double-count can itself turn a grant into a refusal. That lands on
+        # exactly the same outcome as being refused for any other reason — we
+        # keep the estimate lease — so it costs an improvement, never a
+        # correct row. `mm.lease_id` names one lease at every instant; the two
+        # only coexist inside this function.
+        new_id = self._request_lease(model_name, actual_mb)
+        if new_id:
+            self._release_lease_quietly(lease_id)
+            log.info(
+                f"Lease for {model_name} reconciled to actual VRAM: "
+                f"{actual_mb}MB (was leased at {estimated_mb}MB)"
+            )
+            return new_id, False
+
+        # Refused. We still hold the estimate's lease, so there is no third
+        # state to name and nothing to mark lost: the model is leased, at the
+        # wrong size, which is exactly where it was before this ran.
+        # `_request_lease` has already recorded contention if that is what
+        # this was, and logged which; say the consequence, which it cannot know.
+        log.warning(
+            f"{model_name} occupies {actual_mb}MB but the registry would not "
+            f"grant that. Keeping the {estimated_mb}MB lease {lease_id}: the "
+            f"registry under-accounts it by {actual_mb - estimated_mb}MB, "
+            f"which is where it was before the reconcile."
+        )
+        return lease_id, False
 
     def _request_lease(self, model_name: str, memory_mb: int) -> Optional[str]:
         """Lease memory for a model on the shared GPU resource.

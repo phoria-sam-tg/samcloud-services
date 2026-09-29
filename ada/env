@@ -58,18 +58,39 @@ SC_CUDA_INDEX=0
 FOREIGN_IDLE_MB=5515
 FOREIGN_MARGIN_MB=1024
 
-# Backstop under the gate above, not a substitute for it, and derived rather
-# than chosen: 2,963 MB is the MAXIMUM free memory observed at any point
-# during a render (claude-ada, 53 samples across one continuous 46 GB Unreal
-# session; the minimum was 188 MB). A floor above that means the fit check
-# alone cannot offer anything at any moment of a render it has seen — which
-# matters because `usable()` on the default 1024 MB floor would offer up to
-# 1,939 MB at that same peak, enough for a small model, loaded into a gap
-# inside somebody's render.
+# Backstop under the gate above. It was derived from one render — 2,963 MB was
+# the maximum free memory observed at any point across 53 samples of one
+# continuous 46 GB Unreal session (claude-ada), minimum 188 MB — and rounded up
+# to the next hundred, so that the fit check alone could not offer anything at
+# any moment of THAT render.
 #
-# Rounded UP to the next hundred, not to 4096. It is a measured ceiling on
-# render-time free memory, and it stops meaning anything if renders change
-# shape — re-measure, do not pad.
+# THAT DERIVATION IS ALREADY OUT OF DATE, and the number is kept anyway. Read
+# on before changing it.
+#
+# Measured live on ada 2026-09-29, C1's first hour, mid-render:
+#
+#     available_mb 5064   usable_mb 2064   device_inuse_mb 44076
+#     foreign_mb 44076    work_in_progress TRUE
+#
+# 5,064 MB free is ABOVE the 2,963 this floor was sized to clear, so
+# usable(0.9, 3000) = min(4557, 2064) = 2064 — the floor did NOT bring the
+# offer to zero, and the fit check alone would have offered 2 GB into a live
+# 44 GB render. (On the Metal default of 1024 it would have offered 4 GB.)
+# What actually refused every model was `work_in_progress`, from foreign_mb.
+#
+# So renders on ada do not all leave the same free memory: a second shape
+# appeared within hours of the first one's constant being written. The lesson
+# is NOT to raise the floor to chase it (claude-wafer-services). Free memory
+# during a render has now been seen anywhere from 188 to 5,064 MB, so no
+# ceiling on it separates render from idle reliably — the number that
+# generalises is `foreign_mb`, which read 44,076 against an idle floor of
+# 3,118-5,515. The floor is a backstop for the case where the foreign reading
+# is unavailable or wrong; it is not the mechanism, and sizing it as though it
+# were would be fitting a constant to one render twice.
+#
+# Asserted, so this cannot quietly become untrue again: `test_work_gate`
+# checks that usable() is 0 at the first render's peak and NONZERO at the
+# second's, and that the work gate refuses at both.
 SC_MIN_HEADROOM_MB=3000
 
 # --- backends ---------------------------------------------------------------

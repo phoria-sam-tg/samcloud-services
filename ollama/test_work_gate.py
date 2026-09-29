@@ -264,6 +264,44 @@ def main():
         check(o["loadable"] == [], "/warm offers nothing at the same moment")
         check(o["capacity"]["work_in_progress"] is True, "and says why")
 
+    step(11, "the floor is a backstop, and it is already outside its own data")
+    # SC_MIN_HEADROOM_MB=3000 was derived as "above the maximum free memory
+    # observed during a render" — 2,963 MiB, from claude-ada's 53 samples of
+    # one continuous 46 GB Unreal session. C1's first hour on ada produced a
+    # SECOND render shape sitting at 5,064 MB free, above that ceiling. So the
+    # derivation is out of date within hours of being written, and this step
+    # exists so nobody discovers that by reading a comment that is wrong.
+    #
+    # The conclusion is NOT to raise the floor (claude-wafer-services): free
+    # memory during a render has now been seen from 188 to 5,064 MB, so no
+    # ceiling on it separates render from idle. `foreign_mb` does.
+    real_floor = capacity.MIN_HEADROOM_MB
+    capacity.MIN_HEADROOM_MB = 3000                    # ada's value
+    try:
+        RENDER1_PEAK, RENDER2_LIVE = 2963, 5064
+        u1, u2 = capacity.usable_mb(RENDER1_PEAK), capacity.usable_mb(RENDER2_LIVE)
+        print(f"  usable(free={RENDER1_PEAK}) = {u1}   "
+              f"usable(free={RENDER2_LIVE}) = {u2}")
+        check(u1 == 0, f"zero at the render it was derived from ({u1})")
+        # The honest assertion, not the hoped-for one.
+        check(u2 > 0,
+              f"NONZERO at the second render shape ({u2}MB) — the fit check "
+              f"alone would offer that much into a live 44 GB render")
+        check(u2 == 2064, f"reproducing ada's live figure exactly ({u2})")
+    finally:
+        capacity.MIN_HEADROOM_MB = real_floor
+
+    # And what actually refuses, at both: the foreign term.
+    with Ada(device_inuse=44076) as f:      # ada's live reading, same moment
+        o = f.mgr.offering()
+        cap = o["capacity"]
+        print(f"  foreign={cap['foreign_mb']} work_in_progress={cap['work_in_progress']}")
+        check(cap["work_in_progress"] is True,
+              "the work gate refuses where the floor did not")
+        check(o["loadable"] == [], f"nothing offered ({o['loadable']})")
+        check(all(m["reason"] == "work_in_progress" for m in o["blocked"]),
+              "and every model is blocked for THAT reason, not for fit")
+
     print(f"\n{'='*60}")
     print(f"  {checks} checks run")
     if failures:

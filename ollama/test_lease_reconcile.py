@@ -54,6 +54,9 @@ class Box:
         self.leased = []          # (memory_mb) of every lease REQUESTED
         self.released = []        # every lease id released
         self.unloaded = []
+        # Ordered log of both, because the ORDER is the property under test:
+        # acquire-before-release is what stops the registry passing through 0.
+        self.events = []
 
     def __enter__(self):
         self._collect = capacity.collect
@@ -81,6 +84,7 @@ class Box:
 
         def _request_lease(model_name, memory_mb):
             self.leased.append(memory_mb)
+            self.events.append(("request", memory_mb))
             # The first lease is always granted; the RECONCILE is what this
             # test varies, so `grant` governs any request after the first.
             if len(self.leased) == 1 or self.grant:
@@ -89,7 +93,10 @@ class Box:
             return None
 
         mgr._request_lease = _request_lease
-        mgr.sc.release_lease = lambda lid: self.released.append(lid)
+        def _release(lid):
+            self.released.append(lid)
+            self.events.append(("release", lid))
+        mgr.sc.release_lease = _release
         self.mgr = mgr
         return self
 
@@ -108,7 +115,14 @@ def main():
         check(b.leased == [ESTIMATE, ACTUAL],
               f"leased at the estimate, then re-leased at the actual ({b.leased})")
         check(b.released == ["lease_1"],
-              f"the estimate's lease was released first ({b.released})")
+              f"the estimate's lease was released ({b.released})")
+        # THE ORDER IS THE POINT. Release-first leaves the registry accounting
+        # 0 for this model between the two calls, and permanently so if the
+        # new request is refused.
+        print(f"  events: {b.events}")
+        check(b.events == [("request", ESTIMATE), ("request", ACTUAL),
+                           ("release", "lease_1")],
+              "the new lease was acquired BEFORE the old one was released")
         check(mm.lease_id == "lease_2", f"the model holds the new one ({mm.lease_id})")
         check(mm.lease_lost is False, "and is not marked unleased")
         check(mm.memory_mb == ACTUAL, f"manager records the real size ({mm.memory_mb})")
@@ -125,7 +139,25 @@ def main():
         check(b.released == [], f"and nothing released ({b.released})")
         check(mm.lease_id == "lease_1", "the original lease stands")
 
-    step(3, "a refused reconcile does NOT undo the load")
+    step(3, "a refused reconcile leaves the estimate lease standing")
+    # The failure this ordering exists to prevent, measured live on
+    # wafer-services/gpu-metal by claude-wafer-services: with release-first,
+    # a refused re-request took the registry from accounting 1296 MB to
+    # accounting 0 for a model still occupying 3354 — under-accounting 1.63x
+    # WORSE than before the reconcile ran, at the moment we learn the truth.
+    with Box(grant=False) as b:
+        mm = b.mgr.load_ollama_model("qwen3:1.7b")
+        print(f"  events: {b.events}")
+        check(b.released == [],
+              f"the estimate's lease was NOT released ({b.released})")
+        check(mm.lease_id == "lease_1",
+              f"the model still holds it ({mm.lease_id})")
+        check(mm.lease_lost is False,
+              "and is not marked lost — it is leased, at the wrong size")
+        check(("release", "lease_1") not in b.events,
+              "the registry never passes through 0 for this model")
+
+    step(4, "a refused reconcile does NOT undo the load")
     # Deliberately different from the version on `ada-linux-cuda-profile`,
     # which unloaded and raised. The local capacity gate already decided this
     # model fits, from the hardware; the registry's figure is
@@ -137,9 +169,6 @@ def main():
         print(f"  leases {b.leased}  released {b.released}  unloaded {b.unloaded}")
         check(b.unloaded == [], f"the model was not unloaded ({b.unloaded})")
         check("qwen3:1.7b" in b.mgr.models, "it is still resident")
-        check(mm.lease_id is None, "with no lease")
-        check(mm.lease_lost is True,
-              "marked as a LOSS, not as never having had one")
         check(mm.memory_mb == ACTUAL,
               f"and still accounted to us at its real size ({mm.memory_mb})")
         # The invariant from C1, restated on this path: residency is what
@@ -149,7 +178,7 @@ def main():
         check(capacity.foreign_mb(ACTUAL, b.mgr.own_device_mb()) == 0,
               "so the gateway does not read its own model as a foreign tenant")
 
-    step(4, "a queued reconcile is a work signal; a broken one is not")
+    step(5, "a queued reconcile is a work signal; a broken one is not")
     with Box(grant=False, refusal="queued", floor=5515) as b:
         b.mgr.load_ollama_model("qwen3:1.7b")
         check(b.mgr.lease_contention_fresh() is True,
@@ -164,10 +193,10 @@ def main():
         # This is the case ada was in for months. Counting it would have read
         # a permanent authentication fault as a permanent render.
 
-    step(5, "on a box with no declared floor it is a log line and nothing more")
+    step(6, "on a box with no declared floor it is a log line and nothing more")
     with Box(grant=False, floor=None) as b:
-        mm = b.mgr.load_ollama_model("qwen3:1.7b")
-        check(mm.lease_lost is True, "the loss is still recorded")
+        b.mgr.load_ollama_model("qwen3:1.7b")
+        check(b.mgr.lease_contention_fresh() is True, "the refusal is recorded")
         check(b.mgr.work_in_progress(0) is None,
               "but nothing is gated — slice and wafer are unaffected")
 

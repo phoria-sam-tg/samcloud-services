@@ -75,6 +75,7 @@ python -m ollama.test_capacity_refusal   # Refusal path: 503 + the numbers, not 
 python -m ollama.test_capacity_backends  # Both capacity arms meet one contract (no GPU needed)
 python -m ollama.test_elastic_offering   # The offer: windowed, measured, same at every endpoint
 python -m ollama.test_work_gate          # Work wins: the gate, its signals, what it must not break
+python -m ollama.test_lease_reconcile    # The lease says what the model actually occupies
 
 # Older tests, from inside ollama/ — these lease and load for real.
 cd ollama && python test_lifecycle.py   # Full lease cycle
@@ -126,7 +127,7 @@ the 503 path the test exists for.
 
 - **Bounded TTL leases** — renewed every 30 min, not indefinite (ticket #42)
 - **Health-bound revocation** — stale services should lose leases
-- **Actual VRAM** — use `ollama ps` sizes, not file-size estimates
+- **Actual VRAM** — use `ollama ps` sizes, not file-size estimates, **and tell the registry** (ticket #861). The lease is requested from `max(1024, disk_mb)` before the weights are resident and before their context exists; measured on wafer 2026-09-29, `qwen3:1.7b` reserved 1296 MB and occupied 3354. Under-reserving costs us nothing — nothing enforces a lease — it costs whoever reads `available_memory_mb` next and concludes there is room. `_reconcile_lease` re-leases at the real size past `_RECONCILE_RATIO`, and **does not undo the load** if the registry refuses: the local gate already decided it fits from the hardware, and the registry's figure is the weaker instrument. A refused reconcile marks the model `lease_lost` and feeds the contention signal instead
 - **Agents lease, not register** — resource registration is device-daemon territory
 - **Ollama think workaround** — route through native `/api/chat` with `think:false`, translate to OpenAI format ourselves (ticket #69)
 - **On-demand mlx-vlm, gateway-owned** — the gateway starts/stops `mlx_vlm.server` itself (`load_vlm_model` + `match_vlm_model`), rather than adopting a pre-started process. On startup it reaps any stray `mlx_vlm.server`. No boot-order dependency; one VLM per `VLM_PORT`

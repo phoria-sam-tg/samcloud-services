@@ -194,8 +194,12 @@ and *"a samcloud-services directory"* are different claims and only `lsof`
 separates them. It is also how wafer's 57-commit drift was found in the first
 place.
 
-**5. Then delete the Run/Test warning** in `CLAUDE.md` for that box — see the
-note there. A warning that has stopped being true is worse than none.
+**5. Leave the `CLAUDE.md` warning alone until the LAST box is over.** The
+condition is per machine and `CLAUDE.md` is one shared file, so it cannot be
+deleted per box — removing it when the first box cuts over would take away a
+warning that is still true for the others. Its own wording is per-box on
+purpose (*"until THIS BOX's launcher…"*), so it stays correct throughout; it
+is only the deletion that waits.
 
 ## Per-box setup afterwards
 

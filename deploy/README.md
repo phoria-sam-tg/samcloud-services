@@ -77,6 +77,42 @@ clone's interpreter before restarting:
 cd ~/var/samcloud-services-deploy && .venv/bin/python -m ollama.test_renew_ordering
 ```
 
+## Moving work out of a deploy path — the order matters
+
+If you find your own work in a path a service runs from, the sequence is:
+
+```sh
+git -C <deploy path> add -A && git commit -m "wip: #NNN"
+git -C <deploy path> push -u origin <branch>          # off this laptop's disk
+git -C <deploy path> checkout main                     # FREE THE BRANCH FIRST
+git -C <deploy path> worktree add ~/code/<repo>-wt/<branch> <branch>
+```
+
+**`worktree add` before `checkout main` cannot work**, and the failure does not
+say so:
+
+```
+fatal: 'samclaude-services/ring-short-offering' is already checked out at
+       ~/code/samcloud-services
+```
+
+A branch cannot be checked out in two trees. That message reads like a path or
+a permissions problem, and it arrives at the moment someone is already being
+asked to get out of the way — so it costs twenty minutes at the worst time
+(#861, the #870 holder hit it exactly).
+
+The **push** matters independently of the worktree. Uncommitted work in a
+directory a restart can surprise exists in one place only; a pushed branch
+survives the box.
+
+## This is the pattern, not a fix for one box
+
+Apply it anywhere the gateway could run, not only where it has already bitten.
+`claude-wafer-services` has **four** `samcloud-services` directories and none
+is a deploy path today — so if the service is ever installed there, "the
+obvious place to work" is ambiguous four ways before anyone starts, and the
+collision is available without anyone doing anything unusual.
+
 ## Per-box setup, once
 
 The env file stays where it is — `~/.config/samcloud-services/env`, outside the

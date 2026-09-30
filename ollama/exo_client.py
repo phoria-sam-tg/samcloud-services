@@ -348,11 +348,61 @@ class ExoClient:
                 "no serviceable exo instance: %s",
                 {i["model"]: i["runners"] for i in instances},
             )
+
+        # The ring, so a decline can say WHY there is nothing resident (#870).
+        # "The pool has no model" has three quite different causes and only one
+        # of them is anybody's problem: a short ring is a roaming laptop and
+        # resolves itself, a whole ring with nothing placed wants an operator,
+        # and mid-swap wants patience.
+        #
+        # LIVE is `topology.nodes`, which is actively reaped -- the master emits
+        # `NodeTimedOut` after 30s of staleness and `apply_node_timed_out`
+        # removes the node. KNOWN is `nodeIdentities`, which that filter does not
+        # touch, so it remembers a departed node and is the only thing here that
+        # can say the ring is SHORT rather than merely small.
+        #
+        # `nodeIdentities` IS NOT A RELIABLE RING SIZE, and this was measured
+        # rather than reasoned: it empties on an API-state reset plus an event-log
+        # rotation, which every exo restart performs. Live on slice 2026-09-30 at
+        # 00:24Z, 17 minutes after slice's node restarted, wafer genuinely away —
+        # `topology.nodes` and `nodeIdentities` both held slice alone, so the
+        # subtraction said the ring was whole while a node was missing.
+        #
+        # So the authority is `EXO_RING_MIN_NODES` when a box has configured it,
+        # and the subtraction only as a fallback. `ring_basis` says which was
+        # used, because a caller acting on `ring_short` deserves to know whether
+        # it was established or inferred — and when it is inferred, "not short"
+        # does NOT mean "whole". See config.EXO_RING_MIN_NODES.
+        topo = state.get("topology") or {}
+        nodes_live = len(topo.get("nodes") or [])
+        nodes_known = len(state.get("nodeIdentities") or {})
+        expected = config.EXO_RING_MIN_NODES
+        if expected:
+            ring_short = nodes_live < expected
+            ring_basis = "configured"
+        else:
+            ring_short = nodes_known > nodes_live
+            ring_basis = "identities"
+
+        if live is not None:
+            reason = None
+        elif ring_short:
+            reason = "ring_short"
+        elif instances:
+            reason = "not_ready"          # placed, runners not serviceable: mid-swap or loading
+        else:
+            reason = "no_instance"
         return {
             "resident_model": live["model"] if live else None,
             "ready": live is not None,
             "busy": bool(live and live["busy"]),
             "instances": instances,
+            "nodes_live": nodes_live,
+            "nodes_known": nodes_known,
+            "nodes_expected": expected,
+            "ring_short": ring_short,
+            "ring_basis": ring_basis,
+            "unavailable_reason": reason,
         }
 
     def resident_model(self) -> Optional[str]:

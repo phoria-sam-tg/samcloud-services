@@ -571,15 +571,22 @@ async def list_models_openai():
     on request; listing them would advertise two models where the box holds
     one.
 
-    The pool tier is included whenever EXO is enabled rather than only when
-    the pool is ready: it is a configured route, and a request for it while
-    the pool is down gets the structured `pool_unavailable` 503 that path
-    already returns. Its memory is not ours to account for and it does not
-    pass through the buckets. Readiness lives on `/models` (`exo_pool.ready`,
-    `exo_pool.busy`) where there is somewhere to put it.
+    The pool tier now follows the same rule as every other entry: listed when it
+    can serve, omitted when it cannot (#870). It used to be listed whenever EXO
+    was enabled, on the reasoning that a configured route should be discoverable
+    and a request would get a structured 503 anyway. That was the wrong side of
+    this endpoint's own convention — `/v1/models` lists what is serveable *right
+    now*, which is why a model blocked for capacity is omitted — and it made
+    `think` the one entry here that could be advertised for 22 hours while
+    nothing was placed. A caller cannot ask for what was never offered; the full
+    picture with reasons is on `/models` and `/warm`.
 
-    No pool read at all, so a wedged pool cannot make discovery hang — the one
-    thing that would turn a listing into the outage it is meant to describe.
+    STILL NO POOL READ ON THIS PATH, which is the property that mattered and the
+    reason this reads `offering()` rather than the pool: a wedged pool must not
+    make discovery hang. `ModelManager.pool_watch_loop` does the reading on a
+    timer and `offering()` consults its snapshot, so the cost here is a dict
+    lookup. A snapshot too old to trust leaves the tier listed rather than hiding
+    it — see `config.EXO_POOL_VIEW_MAX_AGE_S`.
     """
     now = int(time.time())
     seen: set = set()
@@ -602,22 +609,25 @@ async def list_models_openai():
                 entry["context_length"] = context_length
             data.append(entry)
 
-    # Tiers first: a caller asking this gateway for the pool asks by tier, and
-    # listing the resident model id instead would invite a request naming a
-    # model we cannot promise to still hold.
-    if config.EXO_ENABLED:
-        for tier in config.EXO_TIERS:
-            add(tier, "exo", "tier")
-
     offering = (await asyncio.to_thread(mgr.offering) if mgr
                 else {"resident": [], "loadable": []})
+    # The tier arrives through the buckets now, like everything else, so it is
+    # listed exactly when the offer says it can serve. `status` stays `tier` for
+    # it rather than `resident`/`loadable`: a caller asking by tier is asking for
+    # whatever the pool holds, and naming the resident model id here would invite
+    # a request for a model we cannot promise to still hold.
     for m in offering["resident"]:
-        if m["backend"] != Backend.EXO.value:   # already added under its tier
+        if m["backend"] == Backend.EXO.value:
+            add(m["name"], "exo", "tier")
+        else:
             add(m["name"], m["backend"], "resident", m.get("memory_mb"),
                 m.get("context_length"))
     for m in offering["loadable"]:
-        add(m["name"], m["backend"], "loadable", m.get("need_mb"),
-            m.get("context_length"))
+        if m["backend"] == Backend.EXO.value:
+            add(m["name"], "exo", "tier")
+        else:
+            add(m["name"], m["backend"], "loadable", m.get("need_mb"),
+                m.get("context_length"))
 
     return {"object": "list", "data": data}
 
@@ -913,19 +923,62 @@ def _pool_unavailable_503(e: Exception) -> HTTPException:
     The relaunch half of that used to be true as well, and is not: a node no
     longer needs a human at a Terminal (see `config.EXO_BASE`). Under launchd it
     restarts itself; what it cannot do is place a model.
+
+    THE ERROR CODE NAMES THE CAUSE (#870), because one of the causes is not a
+    fault. A short ring is a roaming laptop and resolves itself with nobody
+    acting, so `pool_ring_short` must not arrive looking like the outage
+    `pool_unavailable` describes — a caller that retries later is right, and a
+    reader who goes looking for something to restart has been misled. The code
+    comes from the offer's snapshot rather than from the exception text: the
+    message is prose and matching on it would be a parser of our own sentences.
+
+    NO SUBSTITUTE IS EVER SERVED. Sam, 2026-09-30: the tier exists to be a
+    multi-device model, and a caller that asked for `think` and silently received
+    another model has been told something untrue. `alternatives` is information —
+    what this same gateway can serve right now — so a caller can fall back by its
+    own choice, in one line, having been told.
     """
     log.warning(f"Pool unavailable: {e}")
-    return HTTPException(status_code=503, detail={
-        "error": "pool_unavailable",
+    reason, note, alternatives = "pool_unavailable", None, []
+    if mgr:
+        try:
+            pool = mgr.pool_offer()
+            if pool and pool.get("reason"):
+                reason = pool["reason"]
+                note = pool.get("detail")
+            offer = mgr.offering()
+            alternatives = [
+                m["name"] for m in offer["resident"] + offer["loadable"]
+                if m.get("backend") != Backend.EXO.value
+            ]
+        except Exception as inner:
+            # A decline must not fail. Losing the sharper reason costs a caller
+            # nothing it had yesterday; raising here would turn a 503 into a 500.
+            log.warning(f"could not classify pool decline: {inner}")
+    detail = {
+        "error": reason,
         "message": str(e),
         "resource_id": config.EXO_RESOURCE_ID,
         "endpoint": config.EXO_BASE,
-        "note": (
+        "note": note or (
             "the exo pool's model is placed out of band — the gateway does not "
             "place it. The nodes themselves are supervised and need no human at "
             "a Terminal; ask whoever operates the pool to place a model on it"
         ),
-    })
+    }
+    if reason == "pool_ring_short":
+        # The one cause that is normal, said plainly, because the note is prose
+        # and a machine reads flags.
+        detail["transient"] = True
+        detail["operator_action_required"] = False
+    if alternatives:
+        detail["alternatives"] = alternatives
+        detail["alternatives_note"] = (
+            "models this gateway can serve right now, offered as information: "
+            "nothing is substituted for the tier you asked for, so falling back "
+            "is your choice and needs a second request naming one of these"
+        )
+    return HTTPException(status_code=503, detail=detail)
 
 
 @app.post("/models/load")

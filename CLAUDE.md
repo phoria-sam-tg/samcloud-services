@@ -77,9 +77,12 @@ three times in two days someone was three hours into a task before finding out
 The trigger is the **launcher**, not the merge. `deploy/rollout.sh` landing
 changes nothing about what runs; each box is cut over separately
 (`deploy/README.md`), so this warning goes stale per box and at different
-times. Delete the paragraph above once `lsof` on this box names the deploy
-clone — a warning that has stopped being true is worse than none, because the
-next reader acts on it.
+times. Delete the paragraph above once `lsof` names the deploy clone on **every**
+box, not the one you are on — this file is shared and the condition is per
+machine, so removing it at the first cutover takes the warning away from the
+boxes that still need it. A warning that has stopped being true is worse than
+none, because the next reader acts on it; one deleted too early is the same
+failure pointed the other way.
 
 
 ```bash

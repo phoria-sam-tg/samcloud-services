@@ -141,7 +141,23 @@ clone), so no identity or token changes.
 **1. Fill the clone.**
 
 ```sh
-deploy/rollout.sh <the commit this box should run>
+deploy/rollout.sh 9d002c9        # name the SHA — see below
+```
+
+**Name the commit.** `deploy/rollout.sh` with no argument takes `origin/main`
+as of that moment, which is convenient for a scratch clone and wrong for a
+cutover: two no-argument runs a week apart deploy different code and both
+report success, so the command history stops answering *"what is this box
+running?"*. The script warns when you omit it.
+
+Exit codes, so a refusal is not mistaken for a broken script:
+
+```
+0    done
+3    the clone is a working checkout (branch + uncommitted changes)
+4    below the disk floor — nothing touched
+5    pip install failed; code rolled back, venv may be partial
+6    the commit could not be resolved — nothing touched
 ```
 
 Expect `exit 4` sometimes and **retry rather than debug it.** wafer's free
@@ -154,9 +170,14 @@ on each box.** Find the `cd` *and the variable that feeds it*:
 
 | box | launcher | what to change |
 |---|---|---|
-| slice | `~/.local/bin/cs-model-service-run.sh` | `cd "$HOME/code/samcloud-services"` |
-| wafer | `~/.local/bin/start-model-service.sh` | `REPO=…` (:6) **and** `cd "$REPO"` (:25) — two lines |
+| slice | `~/.local/bin/cs-model-service-run.sh` | the `cd`, which names the path directly |
+| wafer | `~/.local/bin/start-model-service.sh` | the `REPO=` assignment; the `cd "$REPO"` below it then follows — **change the variable, check the `cd` uses it, do not edit both** |
 | ada | systemd unit | `ExecStart` → the deploy clone's `ada/run.sh`; the script itself needs no edit, it derives the repo from its own location |
+
+**No line numbers here on purpose.** An earlier draft cited wafer's as `:6`
+and `:25`; adding the explanatory comment moved them to `:11` and `:30` before
+anyone else read it. A coordinate into a file someone is about to edit is
+stale by the time it is used — describe the thing, not where it sat.
 
 **3. Restart through the gate**, never by hand:
 
@@ -165,21 +186,54 @@ restart-when-idle.sh --check gateway --resource <this box's resource> \
   --action '<the box's restart>'
 ```
 
-**4. Verify the cwd — this is the step that proves the cutover, not step 2.**
+**4. Verify — this is the step that proves the cutover, not step 2.** Three
+checks, and the third is the one people skip:
 
 ```sh
-lsof -p <gateway pid> | grep cwd
+PID=<gateway pid>
+lsof -p $PID | grep cwd                                    # 1. runs there
+lsof -p $PID | grep "$HOME/var/samcloud-services-deploy"   # 2. loads from there
+! lsof -p $PID | grep -q "$HOME/code/samcloud-services"    # 3. and nowhere else
 ```
 
-It has to name the deploy clone. This is not a formality: wafer has **four**
-`samcloud-services` paths (`~/.config/…` env, `~/code/…` the working checkout,
-`~/var/…` logs, `~/work/845/…` an old task checkout), so *"the deploy clone"*
-and *"a samcloud-services directory"* are different claims and only `lsof`
-separates them. It is also how wafer's 57-commit drift was found in the first
-place.
+**Check 3 is written with `!` and `-q` on purpose.** The obvious form,
+`grep -c …`, prints `0` and **exits 1** when it matches nothing — so under
+`set -e` the *passing* case is the one that aborts the script, and by exit
+code alone a clean cutover is indistinguishable from a broken command. Read
+by hand it is fine; wrapped in anything it inverts. The `!` form exits 0 on
+success and 1 when the old path really is still open, which is the way round
+a caller expects.
 
-**5. Then delete the Run/Test warning** in `CLAUDE.md` for that box — see the
-note there. A warning that has stopped being true is worse than none.
+**Name the full path, never just `samcloud-services`.** On a box with several
+such directories the bare word also matches the log directory
+(`~/var/samcloud-services/logs/server.log`, open as fd 1 and 2), which is
+correctly neither checkout — so `grep -c samcloud-services` reads 4 and tells
+you nothing.
+
+**Check 2 needs an open file under `.venv`, not the cwd.** A launcher can
+`cd` into the deploy clone and still `exec` an interpreter from somewhere
+else, and check 1 would pass. What proves the venv is a loaded extension:
+
+```
+…/samcloud-services-deploy/.venv/lib/python3.14/site-packages/pydantic_core/….so
+```
+
+**`ps -o command=` cannot do this.** It shows the base interpreter
+(`/opt/homebrew/.../Python.app/.../Python`) rather than `.venv/bin/python`,
+because a venv's python resolves to the interpreter it was built from. Read
+as proof of the venv it is misleading.
+
+This is not a formality: wafer has four `samcloud-services` paths — env,
+working checkout, logs, and an old task checkout — so *"the deploy clone"* and
+*"a samcloud-services directory"* are different claims and only the full-path
+form separates them. It is also how wafer's 57-commit drift was found.
+
+**5. Leave the `CLAUDE.md` warning alone until the LAST box is over.** The
+condition is per machine and `CLAUDE.md` is one shared file, so it cannot be
+deleted per box — removing it when the first box cuts over would take away a
+warning that is still true for the others. Its own wording is per-box on
+purpose (*"until THIS BOX's launcher…"*), so it stays correct throughout; it
+is only the deletion that waits.
 
 ## Per-box setup afterwards
 

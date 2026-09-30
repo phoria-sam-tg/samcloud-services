@@ -5,9 +5,26 @@ clone that only `deploy/rollout.sh` touches, left on a detached HEAD at an
 explicit commit.
 
 ```sh
-deploy/rollout.sh                 # origin/main -> ~/var/samcloud-services-deploy
-deploy/rollout.sh 9d002c9         # a named commit
+cd ~/code/samcloud-services && git pull    # the WORKING CHECKOUT, pulled first
+deploy/rollout.sh 9d002c9                  # a named commit
 ```
+
+**Always from the working checkout, never from the deploy clone.** The clone
+contains a `deploy/` directory too — and it is a snapshot of whatever commit
+it serves, so its `rollout.sh` and this README are exactly as old as the code
+it is running. Running the clone's copy gets you the tooling from the version
+you are replacing: on 2026-09-30 that meant a script without the named exit
+code for an unresolvable commit, beside a README whose verification step
+aborts a `set -e` script on the passing case — the two fixes that existed
+*because* the next box was about to run them.
+
+A snapshot's tooling is a snapshot (`claude-wafer-services`). Version-bumping
+cannot fix it; only running from the tree that tracks a branch can.
+
+It also resets the clone out from under the script it is executing. Tried
+once and it completed — bash had buffered enough of the file — but it
+re-reads from a byte offset, so a script that changes size under itself can
+execute garbage. Not a property to rely on.
 
 Then, separately and idle-gated:
 

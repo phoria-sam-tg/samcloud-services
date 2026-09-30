@@ -780,24 +780,37 @@ class ModelManager:
                 blocked.append({**entry, "reason": "insufficient_capacity",
                                 "short_by_mb": max(0, need - usable)})
 
-        # The pool tier, from the pool's own state rather than from our registry.
-        # `unknown` joins `loadable` because that is what it means here: we cannot
-        # say it is blocked, and the route is configured and real.
+        # The pool tier. It gets its own key AND, when the answer is definite, a
+        # place in the bucket that matches — so an operator reading `/warm` or
+        # `/models` sees it where they see everything else.
+        #
+        # IT NEVER JOINS `loadable`, and an earlier draft of this put `unknown`
+        # there, which was wrong twice over. `loadable` means "this box can start
+        # it right now" and every entry carries `need_mb`; the pool is never
+        # startable by us and has no `need_mb` to give. Two suites said so
+        # immediately — `test_elastic_offering` raised `KeyError: need_mb` reading
+        # the bucket, and `test_work_gate` asserts `loadable == []` while another
+        # tenant holds the device, which the tier has nothing to do with. Borrowing
+        # a bucket whose shape and meaning belong to a different question is how
+        # both happened.
+        #
+        # `unknown` therefore lands in NO bucket: we cannot call it blocked and it
+        # is not resident. `/v1/models` reads the `pool` key for its own decision,
+        # which is the one place that distinction matters.
         pool = self.pool_offer()
         if pool is not None:
-            state = pool.pop("state")
-            if state == "resident":
-                pool.pop("reason", None)
-                resident.append({**pool, "memory_mb": 0})
-            elif state == "blocked":
-                blocked.append(pool)
-            else:
-                loadable.append(pool)
+            if pool["state"] == "resident":
+                resident.append({k: v for k, v in pool.items()
+                                 if k not in ("state", "reason")} | {"memory_mb": 0})
+            elif pool["state"] == "blocked":
+                blocked.append({k: v for k, v in pool.items() if k != "state"})
 
         return {
             "resident": resident,
             "loadable": loadable,
             "blocked": blocked,
+            # The tier's own verdict, including the `unknown` that is in no bucket.
+            "pool": pool,
             "cooldown_seconds": config.COOLDOWN_SECONDS,
             # The reading the three lists were computed from, so a caller that
             # disagrees with the answer can see what produced it rather than

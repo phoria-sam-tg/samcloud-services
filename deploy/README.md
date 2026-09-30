@@ -186,18 +186,39 @@ restart-when-idle.sh --check gateway --resource <this box's resource> \
   --action '<the box's restart>'
 ```
 
-**4. Verify the cwd — this is the step that proves the cutover, not step 2.**
+**4. Verify — this is the step that proves the cutover, not step 2.** Three
+checks, and the third is the one people skip:
 
 ```sh
-lsof -p <gateway pid> | grep cwd
+PID=<gateway pid>
+lsof -p $PID | grep cwd                                    # 1. runs there
+lsof -p $PID | grep "$HOME/var/samcloud-services-deploy"   # 2. loads from there
+lsof -p $PID | grep -c "$HOME/code/samcloud-services"      # 3. and nowhere else -> 0
 ```
 
-It has to name the deploy clone. This is not a formality: wafer has **four**
-`samcloud-services` paths (`~/.config/…` env, `~/code/…` the working checkout,
-`~/var/…` logs, `~/work/845/…` an old task checkout), so *"the deploy clone"*
-and *"a samcloud-services directory"* are different claims and only `lsof`
-separates them. It is also how wafer's 57-commit drift was found in the first
-place.
+**Name the full path, never just `samcloud-services`.** On a box with several
+such directories the bare word also matches the log directory
+(`~/var/samcloud-services/logs/server.log`, open as fd 1 and 2), which is
+correctly neither checkout — so `grep -c samcloud-services` reads 4 and tells
+you nothing.
+
+**Check 2 needs an open file under `.venv`, not the cwd.** A launcher can
+`cd` into the deploy clone and still `exec` an interpreter from somewhere
+else, and check 1 would pass. What proves the venv is a loaded extension:
+
+```
+…/samcloud-services-deploy/.venv/lib/python3.14/site-packages/pydantic_core/….so
+```
+
+**`ps -o command=` cannot do this.** It shows the base interpreter
+(`/opt/homebrew/.../Python.app/.../Python`) rather than `.venv/bin/python`,
+because a venv's python resolves to the interpreter it was built from. Read
+as proof of the venv it is misleading.
+
+This is not a formality: wafer has four `samcloud-services` paths — env,
+working checkout, logs, and an old task checkout — so *"the deploy clone"* and
+*"a samcloud-services directory"* are different claims and only the full-path
+form separates them. It is also how wafer's 57-commit drift was found.
 
 **5. Leave the `CLAUDE.md` warning alone until the LAST box is over.** The
 condition is per machine and `CLAUDE.md` is one shared file, so it cannot be

@@ -81,7 +81,15 @@ free_gib() {
   # reports the sealed system snapshot and reads reassuringly while the volume
   # that matters is full (claude-wafer-services measured 13Gi vs 12Gi at 100%
   # on the same box).
-  df -g "$1" 2>/dev/null | awk 'NR==2 {print $4}'
+  #
+  # `df -g` is BSD-only. On Linux (ada) there is no -g flag: it prints
+  # nothing, free_gib returns empty, and the caller's `[ -z "${free:-}" ]`
+  # check reads that as "could not read free space" — REFUSING every rollout
+  # unconditionally (exit 4), not a wrong number but a hard block on the one
+  # Linux box (#861, claude-ada). `-Pk` is POSIX and correct on both; do the
+  # KiB-to-GiB arithmetic here instead of trusting a platform-specific unit
+  # flag.
+  df -Pk "$1" 2>/dev/null | awk 'NR==2 {print int($4/1024/1024)}'
 }
 
 free=$(free_gib "$(dirname "$DEPLOY_DIR")")

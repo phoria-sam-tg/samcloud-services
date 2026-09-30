@@ -193,8 +193,16 @@ checks, and the third is the one people skip:
 PID=<gateway pid>
 lsof -p $PID | grep cwd                                    # 1. runs there
 lsof -p $PID | grep "$HOME/var/samcloud-services-deploy"   # 2. loads from there
-lsof -p $PID | grep -c "$HOME/code/samcloud-services"      # 3. and nowhere else -> 0
+! lsof -p $PID | grep -q "$HOME/code/samcloud-services"    # 3. and nowhere else
 ```
+
+**Check 3 is written with `!` and `-q` on purpose.** The obvious form,
+`grep -c …`, prints `0` and **exits 1** when it matches nothing — so under
+`set -e` the *passing* case is the one that aborts the script, and by exit
+code alone a clean cutover is indistinguishable from a broken command. Read
+by hand it is fine; wrapped in anything it inverts. The `!` form exits 0 on
+success and 1 when the old path really is still open, which is the way round
+a caller expects.
 
 **Name the full path, never just `samcloud-services`.** On a box with several
 such directories the bare word also matches the log directory

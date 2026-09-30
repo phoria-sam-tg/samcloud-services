@@ -174,6 +174,29 @@ def main():
     check(offenders == [],
           f"no site releases and then re-requests (offending lines: {offenders})")
 
+    step(5, "how long a refused renewal's guarantee actually lasts")
+    # D2 keeps the old lease on a refusal, which is only worth anything if a
+    # retry lands before that lease expires. It does not, quite
+    # (claude-wafer-services): the loop sleeps the interval FIRST, and an
+    # unextended lease expires exactly when the next attempt fires.
+    ttl = config.LEASE_TTL
+    interval = int(ttl * config.LEASE_RENEW_AT)
+    attempts = [n * interval for n in range(1, 6) if n * interval < ttl]
+    print(f"  TTL {ttl}s, interval {interval}s -> attempts inside the lease: "
+          f"{attempts}, expiry at {ttl}")
+    check(interval < ttl,
+          f"a renewal is at least attempted before expiry ({interval} < {ttl})")
+    # The honest statement, asserted rather than described. If someone lowers
+    # LEASE_RENEW_AT to 0.25 this flips to three and the docstring's example
+    # needs updating with it — which is the point of pinning it here.
+    check(len(attempts) == 1,
+          f"at LEASE_RENEW_AT={config.LEASE_RENEW_AT} a refusal gets exactly "
+          f"{len(attempts)} attempt, and the retry races the expiry rather "
+          f"than preceding it")
+    doc = ModelManager._renew_leases.__doc__ or ""
+    check("ONE retry" in doc or "one retry" in doc.lower(),
+          "and the docstring says so rather than promising indefinitely")
+
     print(f"\n{'='*60}")
     print(f"  {checks} checks run")
     if failures:

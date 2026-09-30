@@ -2514,9 +2514,28 @@ class ModelManager:
         `_RECONCILE_RATIO`, this fires every `LEASE_TTL * LEASE_RENEW_AT` on
         every leased model, forever.
 
-        Refused now means KEEP THE OLD LEASE. It is still active, the registry
-        still accounts for the model at its real size, and the next tick tries
-        again.
+        Refused now means KEEP THE OLD LEASE. It is still active and the
+        registry still accounts for the model at its real size.
+
+        BUT SAY HOW LONG THAT LASTS, because "the next tick tries again" is
+        true and not sufficient (claude-wafer-services, reviewing D2). The loop
+        sleeps `LEASE_TTL * LEASE_RENEW_AT` and renews an unextended lease, so
+        at the current 0.5:
+
+            t=0     granted, expires t=3600
+            t=1800  renewal fires; refused -> keep the old lease
+            t=3600  the next attempt — and the old lease expires at t=3600
+
+        A refusal therefore gets ONE retry, and it races the expiry rather
+        than preceding it. This is still strictly better than release-first,
+        which dropped to zero at t=1800 with no retry at all; the guarantee is
+        just bounded at one interval instead of indefinite. `LEASE_RENEW_AT`
+        of 0.25 would give attempts at 900/1800/2700 inside 3600 — the same
+        arithmetic `EXO_LEASE_RENEW_PCT` already sets out for the pool lease,
+        where the rule is three attempts inside 80% of the TTL. Changing it is
+        a behaviour change on every box and is not this function's to make;
+        this docstring's job is to stop the reassurance above being read as
+        more than it is.
 
         THE COST, and it is larger here than on the reconcile. For the length
         of one request the registry counts this model TWICE at its full size,

@@ -296,11 +296,6 @@ class ManagedModel:
     # `check_cooldowns` both run there), so it needs no lock — a load runs in a
     # thread but never touches this.
     in_flight: int = 0
-    # Set when a renewal could not get the lease back and the model is STILL
-    # RESIDENT. Distinct from `lease_id is None`, which also covers a model
-    # that never got one. Residency is unaffected on purpose — see
-    # `own_device_mb`.
-    lease_lost: bool = False
     # Set only for Backend.EXO, where the dict key is the *tier* a caller asks
     # for ("think") while `name` is whatever model the pool currently holds.
     # Every other backend keys on the model name itself.
@@ -855,7 +850,7 @@ class ModelManager:
                     log.info(f"Actual VRAM for {model_name}: {actual_mb}MB (estimated {memory_mb}MB)")
                 break
 
-        lease_id, lease_lost = self._reconcile_lease(
+        lease_id = self._reconcile_lease(
             model_name, lease_id, memory_mb, actual_mb)
 
         now = time.time()
@@ -864,7 +859,6 @@ class ModelManager:
             backend=Backend.OLLAMA,
             memory_mb=actual_mb,
             lease_id=lease_id,
-            lease_lost=lease_lost,
             port=11434,
             loaded_at=now,
             last_used=now,
@@ -1553,10 +1547,12 @@ class ModelManager:
         lease_id: Optional[str],
         estimated_mb: int,
         actual_mb: int,
-    ) -> tuple[Optional[str], bool]:
+    ) -> Optional[str]:
         """Re-lease at the size the model actually turned out to be.
 
-        Returns `(lease_id, lease_lost)`.
+        Returns the lease the model should hold afterwards — the new one on
+        success, the one it already had on a refusal. Never None while it held
+        one going in.
 
         WHY IT MATTERS, and it is the whole of "make GPU usage legible to
         other tenants": the lease is requested from a disk-size estimate,
@@ -1586,17 +1582,13 @@ class ModelManager:
         `note_lease_contention`. On ada that reads as "someone is working" and
         the node stops accepting; on slice and wafer, where no idle floor is
         declared, it is a log line. The model keeps its estimate lease either
-        way, so `lease_lost` stays False on this path — it is leased, at the
-        wrong size, which is where it already was.
-
-        `lease_lost` is therefore reachable from `_renew_leases` and not from
-        here. That is not an oversight: a renewal has already released its
-        lease by the time it asks for a new one, and cannot take it back.
+        way. The model stays leased, at the wrong size, which is where it
+        already was.
 
         Residency is untouched on every path — see `_renew_leases`.
         """
         if not lease_id or actual_mb <= estimated_mb * self._RECONCILE_RATIO:
-            return lease_id, False
+            return lease_id
 
         # ACQUIRE BEFORE RELEASE. The order is the whole of the failure path.
         #
@@ -1636,7 +1628,7 @@ class ModelManager:
                 f"Lease for {model_name} reconciled to actual VRAM: "
                 f"{actual_mb}MB (was leased at {estimated_mb}MB)"
             )
-            return new_id, False
+            return new_id
 
         # Refused. We still hold the estimate's lease, so there is no third
         # state to name and nothing to mark lost: the model is leased, at the
@@ -1649,7 +1641,7 @@ class ModelManager:
             f"registry under-accounts it by {actual_mb - estimated_mb}MB, "
             f"which is where it was before the reconcile."
         )
-        return lease_id, False
+        return lease_id
 
     def _request_lease(self, model_name: str, memory_mb: int) -> Optional[str]:
         """Lease memory for a model on the shared GPU resource.
@@ -2501,23 +2493,77 @@ class ModelManager:
                 log.warning(f"Lease renewal error: {e}")
 
     def _renew_leases(self):
-        """Release and re-request MODEL leases to prevent expiry.
+        """Re-take MODEL leases to prevent expiry: ACQUIRE, then release.
 
-        NOT THE PATTERN FOR AN EXCLUSIVE LEASE, and deliberately left alone.
-        Releasing and then re-requesting opens a window in which the resource is
-        unheld; for the memory leases here that is survivable, because they are
-        shares of a pool rather than the pool itself. On the exclusive pool lease
-        the same two lines would let another caller in mid-generation — the exact
-        class of fault #827 exists to remove. `_renew_pool_leases` below renews in
-        place against POST /leases/<id>/renew and must stay that way.
+        WHY A SWAP AT ALL, rather than the in-place renewal the pool uses.
+        `POST /leases/<id>/renew` cannot extend past `granted_at + max_total_s`,
+        and a lease granted without an explicit ceiling gets `max(1800, ttl)` —
+        3600s for these, since `_request_lease` sends `ttl_seconds=LEASE_TTL`
+        and no `max_total_s`. So in-place renewal reaches `at_ceiling` one hour
+        after the load and stays there, and a model resident for longer than
+        that must be re-taken whatever we do. `_renew_pool_leases` renews in
+        place and must stay that way; the difference is the ceiling, not taste.
+
+        ACQUIRE BEFORE RELEASE, for the reason PR #29 established on
+        `_reconcile_lease` and which applies to every path that swaps a lease
+        (claude-wafer-services, reviewing it; #861 D2). Release-first means a
+        refused re-request leaves the model resident with `lease_id = None`, so
+        the registry accounts NOTHING for memory that is still held — the same
+        1296 -> 0 measured on the reconcile, reached by a different route and
+        with far wider exposure: the reconcile fires only past
+        `_RECONCILE_RATIO`, this fires every `LEASE_TTL * LEASE_RENEW_AT` on
+        every leased model, forever.
+
+        Refused now means KEEP THE OLD LEASE. It is still active and the
+        registry still accounts for the model at its real size.
+
+        AND A REFUSAL GETS RETRIED, which needs the loop's interval to be
+        short enough that more than one attempt fits inside the lease. It was
+        not (claude-wafer-services, reviewing D2). The loop sleeps
+        `LEASE_TTL * LEASE_RENEW_AT` and renews a lease it did not extend, so
+        at the old 0.5 a refusal at t=1800 was retried at t=3600 — exactly
+        when the unextended lease expired. One attempt racing the expiry is
+        not a retry, and the guarantee above was bounded at one interval.
+
+        `LEASE_RENEW_AT` is 0.25, so:
+
+            t=0     granted, expires t=3600
+            t=900   attempt 1; refused -> keep the old lease
+            t=1800  attempt 2
+            t=2700  attempt 3, with 900s still to spare
+            t=3600  expiry
+
+        Two renewals may be missed and a third still lands inside the lease —
+        the same arithmetic `EXO_LEASE_RENEW_PCT` sets out for the pool lease
+        (three attempts inside 80% of the TTL; 2700/3600 = 75%). `config.py`
+        carries the reasoning and the cost; `test_renew_ordering` step 5 pins
+        the count against the live constants so this example cannot drift
+        away from them.
+
+        THE COST, and it is larger here than on the reconcile. For the length
+        of one request the registry counts this model TWICE at its full size,
+        where the reconcile double-counted only the smaller estimate. On a
+        nearly-full resource that can refuse a renewal that release-first would
+        have been granted. It lands on the safe outcome — we keep a lease that
+        is still valid — and the alternative it replaces is holding none at
+        all, so the trade is an improvement that is refused more often rather
+        than a correct row lost.
+
+        The window this does NOT remove is the one the old docstring defended:
+        between the grant and the release the resource is over-counted rather
+        than un-held, which is the right direction. Un-held was never the
+        problem here — for a share lease that was survivable, as argued. The
+        problem was what a refusal left behind.
         """
         for name, mm in list(self.models.items()):
             if not mm.lease_id:
                 continue
             try:
-                self.sc.release_lease(mm.lease_id)
+                old_id = mm.lease_id
                 new_id = self._request_lease(name, mm.memory_mb)
-                mm.lease_id = new_id
+                if new_id:
+                    self._release_lease_quietly(old_id)
+                mm.lease_id = new_id or old_id
                 # LEASE STATE CHANGES, RESIDENCY DOES NOT (#861). The model is
                 # still on the GPU; all that has changed is that nothing in
                 # the registry accounts for it. Dropping it from
@@ -2527,15 +2573,16 @@ class ModelManager:
                 # would read its own resident model as another tenant — and
                 # step back from itself, permanently, looking conservative
                 # while doing it (claude-wafer-services, reviewing C1).
-                mm.lease_lost = new_id is None
                 if new_id is None:
                     log.warning(
-                        f"{name} is resident and UNLEASED: the renewal could "
-                        f"not get the lease back. Nothing in the registry "
-                        f"accounts for its {mm.memory_mb}MB. Still resident."
+                        f"Renewal for {name} was refused; keeping the existing "
+                        f"lease {old_id}, which is still active and still "
+                        f"accounts for its {mm.memory_mb}MB. Retrying next "
+                        f"tick. Note the lease now expires on its ORIGINAL "
+                        f"granted_at + {LEASE_TTL}s, not an extended one."
                     )
                 else:
-                    log.info(f"Renewed lease for {name}: {new_id}")
+                    log.info(f"Renewed lease for {name}: {new_id} (was {old_id})")
             except Exception as e:
                 log.warning(f"Failed to renew lease for {name}: {e}")
 

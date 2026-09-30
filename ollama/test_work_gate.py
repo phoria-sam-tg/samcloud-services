@@ -220,24 +220,32 @@ def main():
         a.mgr.refuse_if_device_in_use("qwen3:1.7b")
         check(True, "and refuse_if_device_in_use is a no-op")
 
-    step(9, "a lost lease changes lease state and NOT residency")
-    # If marking a model unleased ever dropped it from `self.models`,
-    # `own_device_mb()` would fall by its size while the memory is still
-    # held, `foreign_mb` would rise by the same amount in the same instant,
-    # and the gateway would read its own resident model as another tenant —
-    # stepping back from itself, permanently, looking conservative
+    step(9, "a refused renewal changes neither the lease nor residency")
+    # C1 wrote this step against a renewal that RELEASED first, so a refusal
+    # left the model resident and unleased, and the invariant under test was
+    # "residency survives losing the lease". D2 removed the losing: the
+    # renewal acquires first and a refusal keeps what it had. The invariant is
+    # unchanged and now has one fewer way to be violated, so the step asserts
+    # the stronger post-condition.
+    #
+    # What it protects is the same: if a refusal ever dropped the model from
+    # `self.models`, `own_device_mb()` would fall by its size while the memory
+    # is still held, `foreign_mb` would rise by the same amount in the same
+    # instant, and the gateway would read its own resident model as another
+    # tenant — stepping back from itself, permanently, looking conservative
     # (claude-wafer-services).
     with Ada() as a:
-        mm = resident(a.mgr, mb=20000)
-        a.mgr.sc.release_lease = lambda lid: None
-        a.mgr._request_lease = lambda name, mb: None      # renewal cannot get it back
+        mm = resident(a.mgr, mb=20000, lease="lease_held")
+        released = []
+        a.mgr.sc.release_lease = lambda lid: released.append(lid)
+        a.mgr._request_lease = lambda name, mb: None      # the renewal is refused
         own_before = a.mgr.own_device_mb()
         a.mgr._renew_leases()
         own_after = a.mgr.own_device_mb()
         print(f"  own_mb {own_before} -> {own_after}, lease_id={mm.lease_id!r}, "
-              f"lease_lost={mm.lease_lost}")
-        check(mm.lease_id is None, "the lease is gone")
-        check(mm.lease_lost is True, "and that is recorded as a LOSS, not absence")
+              f"released={released}")
+        check(mm.lease_id == "lease_held", f"the lease is kept ({mm.lease_id})")
+        check(released == [], f"and nothing was released ({released})")
         check("qwen3:1.7b" in a.mgr.models, "the model is still resident")
         check(own_after == own_before == 20000,
               f"and own_mb is unchanged ({own_before} -> {own_after})")

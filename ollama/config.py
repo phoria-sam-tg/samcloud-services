@@ -136,7 +136,27 @@ SERVICE_PORT = _env_int("SERVICE_PORT", 8800)
 # --- lease / lifecycle ---
 COOLDOWN_SECONDS = _env_int("COOLDOWN_SECONDS", 300)
 LEASE_TTL = _env_int("LEASE_TTL", 3600)
-LEASE_RENEW_AT = float(_env("LEASE_RENEW_AT", "0.5"))
+# When a model lease is re-taken, as a fraction of its TTL. The loop sleeps
+# this before each attempt, so it is also how many attempts fall inside one
+# lease — and that count is the whole reason for the value.
+#
+# 0.5 gave exactly ONE: at TTL 3600 the renewal fires at 1800, and if it is
+# REFUSED the next attempt lands at 3600, which is when the unextended lease
+# expires. One attempt that races the expiry is not a retry, and D2's
+# guarantee — a refused renewal keeps a lease the registry still accounts for
+# — was therefore bounded at one interval rather than holding (#861 D2,
+# claude-wafer-services).
+#
+# 0.25 gives attempts at 900 / 1800 / 2700 inside 3600: two renewals may be
+# missed and a third still lands, with 900s to spare. That is the same
+# arithmetic `EXO_LEASE_RENEW_PCT` sets out for the pool lease — three
+# attempts inside 80% of the TTL, 2700/3600 = 75% — and it is 25% there for
+# the same reason it is here rather than 33%.
+#
+# The cost is one extra swap per model every 15 minutes instead of 30, each
+# briefly double-counting that model in the registry while the new lease is
+# granted and the old one released. Negligible against the failure it removes.
+LEASE_RENEW_AT = float(_env("LEASE_RENEW_AT", "0.25"))
 OLLAMA_KEEP_ALIVE = _env_int("OLLAMA_KEEP_ALIVE", -1)
 
 # --- Stage-1 capacity offering (doc #8) ---

@@ -124,7 +124,6 @@ def main():
                            ("release", "lease_1")],
               "the new lease was acquired BEFORE the old one was released")
         check(mm.lease_id == "lease_2", f"the model holds the new one ({mm.lease_id})")
-        check(mm.lease_lost is False, "and is not marked unleased")
         check(mm.memory_mb == ACTUAL, f"manager records the real size ({mm.memory_mb})")
 
     step(2, "a small discrepancy is not worth the window")
@@ -152,8 +151,8 @@ def main():
               f"the estimate's lease was NOT released ({b.released})")
         check(mm.lease_id == "lease_1",
               f"the model still holds it ({mm.lease_id})")
-        check(mm.lease_lost is False,
-              "and is not marked lost — it is leased, at the wrong size")
+        check(mm.lease_id is not None,
+              "it is leased — at the wrong size, which is where it started")
         check(("release", "lease_1") not in b.events,
               "the registry never passes through 0 for this model")
 

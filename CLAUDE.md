@@ -66,6 +66,22 @@ Staging (legacy) used `slice-test/*` identities pointing at `stg.samtg.xyz:9443`
 
 ## Run / Test
 
+**Until THIS BOX's launcher runs from `~/var/samcloud-services-deploy` —
+check it, do not assume: `lsof -p <gateway pid> | grep cwd` —
+`~/code/samcloud-services` is the path the gateway actually runs from** (`cd "$HOME/code/samcloud-services"`,
+hardcoded in each box's launcher under `~/.local/bin`). Your branch and your
+uncommitted changes are what the next restart serves, and nothing warns you —
+three times in two days someone was three hours into a task before finding out
+(#861). Work in a `git worktree`, not here.
+
+The trigger is the **launcher**, not the merge. `deploy/rollout.sh` landing
+changes nothing about what runs; each box is cut over separately
+(`deploy/README.md`), so this warning goes stale per box and at different
+times. Delete the paragraph above once `lsof` on this box names the deploy
+clone — a warning that has stopped being true is worse than none, because the
+next reader acts on it.
+
+
 ```bash
 SC_TOKEN=<token> python -m uvicorn ollama.server:app --host 0.0.0.0 --port 8800
 
@@ -116,6 +132,28 @@ it is a live check of the gate and not only of the shape. It self-skips if the
 box genuinely has room for a 40GB model — note that the skip returns success
 having run step 1 only, so a green result on a very large box has not exercised
 the 503 path the test exists for.
+
+## Deploying
+
+**The service runs from a deploy clone, not from a working checkout.**
+`deploy/rollout.sh` puts a named commit into `~/var/samcloud-services-deploy`
+on a detached HEAD, with `.venv` synced from that commit's
+`requirements.txt`; restarting is `restart-when-idle`'s separate, idle-gated
+step. See `deploy/README.md`.
+
+Three times in two days a live deploy checkout held somebody's in-progress
+work (#861) and **the collision is undetectable from either side** — the
+person editing has no signal a service runs from the tree, the service has no
+signal its tree is being edited, and `git status` is content. One instance ran
+a week through several restarts and was found by `lsof` on the gateway's pid.
+A deploy that resets to a commit cannot silently serve a working tree, because
+there is no working tree to serve.
+
+One consequence worth knowing: **your checkout's venv is not production's.**
+A suite that passes in your checkout can fail in the deploy clone — that is
+#862, where `jinja2` was undeclared and one box's venv happened to have it.
+Verify against `~/var/samcloud-services-deploy/.venv/bin/python` before
+restarting.
 
 ## Conventions
 

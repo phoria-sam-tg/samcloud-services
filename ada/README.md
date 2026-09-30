@@ -21,6 +21,16 @@ things to know before changing any of them:
 
 ## Deploying
 
+The gateway runs from the **deploy clone**, not from a working checkout — see
+`deploy/README.md` for why and for ada's one-time setup. The rollout is two
+steps and they are deliberately separate:
+
+```sh
+deploy/rollout.sh <commit>        # put the code in place; restarts nothing
+# then the idle-gated restart below
+```
+
+
 `restart-when-idle --check lease` takes an **exclusive** lease on
 `--resource`, and on a `shared` resource an exclusive take is refused while
 *any* share is held — including the gateway's own, for every model it has

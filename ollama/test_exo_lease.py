@@ -1593,6 +1593,45 @@ def test_a_down_pool_is_never_reported_resident():
     check("...and nothing blocked", off["blocked"], [])
 
 
+def test_the_tier_never_lands_in_loadable():
+    """`loadable` means "this box can start it right now", and the pool is never that.
+
+    A draft of this work put the `unknown` tier entry in `loadable` and two suites
+    caught it at once: `test_elastic_offering` raised `KeyError: need_mb` reading
+    the bucket, because every other entry carries one and the pool has none to
+    give, and `test_work_gate` asserts `loadable == []` while another tenant holds
+    the device — a thing the pool is unaffected by, since we neither start nor size
+    it. Asserted here in its own right so the bucket cannot be borrowed again.
+    """
+    import time as _t
+    m = mgr()
+    m.catalogue_mb = lambda: {}
+    m.llama = type("L", (), {"available_models": lambda self: []})()
+
+    for label, view in (("blocked", _view()),
+                        ("resident", _view(ready=True, ring_short=False,
+                                           resident_model="m", nodes_live=2,
+                                           unavailable_reason=None)),
+                        ("unknown", None)):
+        m._pool_view = None if view is None else (_t.monotonic(), view)
+        off = m.offering()
+        check(f"{label}: tier absent from loadable",
+              [e for e in off["loadable"] if e.get("backend") == "exo"], [])
+        check(f"{label}: every loadable entry still carries need_mb",
+              all("need_mb" in e for e in off["loadable"]), True)
+        check(f"{label}: the verdict is on the pool key",
+              off["pool"]["state"], "unknown" if view is None
+              else view["unavailable_reason"] and "blocked" or "resident")
+
+    # And `unknown` is in NO bucket: not blocked, because we cannot say that, and
+    # not resident. It is still discoverable, which is `/v1/models`'s business.
+    m._pool_view = None
+    off = m.offering()
+    check("unknown: in neither bucket",
+          ([e for e in off["resident"] if e.get("backend") == "exo"],
+           [e for e in off["blocked"] if e.get("backend") == "exo"]), ([], []))
+
+
 def test_a_stale_pool_view_lists_the_tier_rather_than_hiding_it():
     """Not having looked is a fact about us, not about the pool.
 

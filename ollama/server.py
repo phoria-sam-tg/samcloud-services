@@ -610,24 +610,26 @@ async def list_models_openai():
             data.append(entry)
 
     offering = (await asyncio.to_thread(mgr.offering) if mgr
-                else {"resident": [], "loadable": []})
-    # The tier arrives through the buckets now, like everything else, so it is
-    # listed exactly when the offer says it can serve. `status` stays `tier` for
-    # it rather than `resident`/`loadable`: a caller asking by tier is asking for
-    # whatever the pool holds, and naming the resident model id here would invite
-    # a request for a model we cannot promise to still hold.
+                else {"resident": [], "loadable": [], "pool": None})
+    # The tier comes from the offer's `pool` key, not from a bucket. It is listed
+    # unless the offer says definitely-not: `resident` serves now, and `unknown`
+    # means the snapshot is too stale to judge, which must not delete a configured
+    # route (see config.EXO_POOL_VIEW_MAX_AGE_S). Only `blocked` omits it, the same
+    # convention as a model blocked for capacity.
+    #
+    # `status` stays `tier` rather than `resident`: a caller asking by tier is
+    # asking for whatever the pool holds, and naming the resident model id here
+    # would invite a request for a model we cannot promise to still hold.
+    pool = offering.get("pool")
+    if pool is not None and pool["state"] != "blocked":
+        add(pool["name"], "exo", "tier")
     for m in offering["resident"]:
-        if m["backend"] == Backend.EXO.value:
-            add(m["name"], "exo", "tier")
-        else:
+        if m["backend"] != Backend.EXO.value:   # the tier is handled above
             add(m["name"], m["backend"], "resident", m.get("memory_mb"),
                 m.get("context_length"))
     for m in offering["loadable"]:
-        if m["backend"] == Backend.EXO.value:
-            add(m["name"], "exo", "tier")
-        else:
-            add(m["name"], m["backend"], "loadable", m.get("need_mb"),
-                m.get("context_length"))
+        add(m["name"], m["backend"], "loadable", m.get("need_mb"),
+            m.get("context_length"))
 
     return {"object": "list", "data": data}
 

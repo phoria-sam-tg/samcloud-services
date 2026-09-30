@@ -52,7 +52,51 @@ DEPLOY_DIR=${DEPLOY_DIR:-$HOME/var/samcloud-services-deploy}
 REMOTE=${DEPLOY_REMOTE:-https://github.com/phoria-sam-tg/samcloud-services.git}
 TARGET=${1:-origin/main}
 
+# Floor, in GiB, below which this refuses to do anything at all. Borrowed from
+# the sibling on the same boxes: `exo-run.sh`'s `require_space` refuses to
+# start below FLOOR_GIB and says why, and on 2026-09-30 it was firing on wafer
+# — `com.samcloud.exo runs = 19`, four of them "under 5G free — refusing to
+# start into the wall", while a staged macOS update drained the volume at
+# ~2 MB/s behind APFS snapshots that `du` cannot see
+# (claude-wafer-services, reviewing this PR).
+#
+# So one script on that box treats <5 GiB as "refuse and say so" and this one
+# treated it as "proceed". The asymmetry is the defect rather than the byte
+# count: the venv is only ~62 MB and is not what fills a disk.
+#
+# THE CHECK IS BEFORE EVERYTHING, not just before the venv, which is further
+# than the review asked. A rollout that resets the code and then fails
+# installing its dependencies leaves the clone at the new commit with the old
+# or a partial environment — a state that is neither the version you left nor
+# the one you asked for, and the gateway would start into it. Refusing the
+# whole rollout leaves the box exactly where it was, which is always a
+# recoverable place.
+FLOOR_GIB=${ROLLOUT_FLOOR_GIB:-5}
+
 say() { printf 'rollout: %s\n' "$*" >&2; }
+
+free_gib() {
+  # The DATA volume, via the deploy path itself — not `df /`, which on macOS
+  # reports the sealed system snapshot and reads reassuringly while the volume
+  # that matters is full (claude-wafer-services measured 13Gi vs 12Gi at 100%
+  # on the same box).
+  df -g "$1" 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
+free=$(free_gib "$(dirname "$DEPLOY_DIR")")
+if [ -z "${free:-}" ]; then
+  say "REFUSING: could not read free space for $(dirname "$DEPLOY_DIR")"
+  exit 4
+fi
+if [ "$free" -lt "$FLOOR_GIB" ]; then
+  say "REFUSING: ${free} GiB free, floor is ${FLOOR_GIB} GiB."
+  say "Nothing has been changed — the clone is still on whatever it was."
+  say "A rollout that resets the code and then cannot install its dependencies"
+  say "leaves a state that is neither the old version nor the new one, and the"
+  say "gateway would start into it. Free space and re-run."
+  exit 4
+fi
+say "preflight: ${free} GiB free, floor ${FLOOR_GIB}"
 
 if [ ! -d "$DEPLOY_DIR/.git" ]; then
   say "no deploy clone at $DEPLOY_DIR — creating one"

@@ -47,15 +47,30 @@ rather than detecting it.
 
 ## What the script refuses to do
 
+```
+free space < ROLLOUT_FLOOR_GIB (5)   REFUSES, exit 4, before anything
+on a branch AND dirty                REFUSES, exit 3, touches nothing
+on a branch AND clean                detaches, with a note
+detached                             resets, as intended
+```
+
+The disk check runs **before** the reset, not just before the venv. A rollout
+that updates the code and then cannot install its dependencies leaves the
+clone at the new commit with a partial environment — neither the version you
+left nor the one you asked for — and the gateway would start into it.
+
+`free_gib` reads the **data volume via the deploy path**, not `df /`: on macOS
+that reports the sealed system snapshot and reads reassuringly while the
+volume that matters is full (13Gi vs 12Gi at 100% capacity on the same box).
+
+The floor matches `exo-run.sh`'s, which refuses below 5 GiB on these same
+boxes and was firing on wafer while this PR was in review.
+
+
+
 It `reset --hard`s and `clean -fd`s, so anything in the deploy clone that is
 not in the commit is discarded. That is safe only because nobody works there —
 so it checks:
-
-```
-on a branch AND dirty   -> REFUSES, exit 3, touches nothing
-on a branch AND clean   -> detaches, with a note
-detached                -> resets, as intended
-```
 
 A detached HEAD is deliberate and is the signal: if you find yourself on one,
 you are in the deploy clone and should not be editing.

@@ -170,9 +170,14 @@ on each box.** Find the `cd` *and the variable that feeds it*:
 
 | box | launcher | what to change |
 |---|---|---|
-| slice | `~/.local/bin/cs-model-service-run.sh` | `cd "$HOME/code/samcloud-services"` |
-| wafer | `~/.local/bin/start-model-service.sh` | `REPO=…` (:6) **and** `cd "$REPO"` (:25) — two lines |
+| slice | `~/.local/bin/cs-model-service-run.sh` | the `cd`, which names the path directly |
+| wafer | `~/.local/bin/start-model-service.sh` | the `REPO=` assignment; the `cd "$REPO"` below it then follows — **change the variable, check the `cd` uses it, do not edit both** |
 | ada | systemd unit | `ExecStart` → the deploy clone's `ada/run.sh`; the script itself needs no edit, it derives the repo from its own location |
+
+**No line numbers here on purpose.** An earlier draft cited wafer's as `:6`
+and `:25`; adding the explanatory comment moved them to `:11` and `:30` before
+anyone else read it. A coordinate into a file someone is about to edit is
+stale by the time it is used — describe the thing, not where it sat.
 
 **3. Restart through the gate**, never by hand:
 

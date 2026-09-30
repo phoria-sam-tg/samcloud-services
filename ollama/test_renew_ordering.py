@@ -174,28 +174,48 @@ def main():
     check(offenders == [],
           f"no site releases and then re-requests (offending lines: {offenders})")
 
-    step(5, "how long a refused renewal's guarantee actually lasts")
-    # D2 keeps the old lease on a refusal, which is only worth anything if a
-    # retry lands before that lease expires. It does not, quite
-    # (claude-wafer-services): the loop sleeps the interval FIRST, and an
-    # unextended lease expires exactly when the next attempt fires.
+    step(5, "a refused renewal is actually retried, more than once")
+    # D2 keeps the old lease on a refusal, which is worth nothing unless a
+    # retry lands before that lease expires. At LEASE_RENEW_AT 0.5 it did not
+    # (claude-wafer-services): the loop sleeps the interval FIRST and renews a
+    # lease it did not extend, so the single retry landed exactly at expiry.
+    # 0.25 is the value that makes the guarantee hold, and it is the same
+    # arithmetic EXO_LEASE_RENEW_PCT already uses for the pool lease.
     ttl = config.LEASE_TTL
     interval = int(ttl * config.LEASE_RENEW_AT)
-    attempts = [n * interval for n in range(1, 6) if n * interval < ttl]
+    attempts = [n * interval for n in range(1, 10) if n * interval < ttl]
     print(f"  TTL {ttl}s, interval {interval}s -> attempts inside the lease: "
           f"{attempts}, expiry at {ttl}")
     check(interval < ttl,
-          f"a renewal is at least attempted before expiry ({interval} < {ttl})")
-    # The honest statement, asserted rather than described. If someone lowers
-    # LEASE_RENEW_AT to 0.25 this flips to three and the docstring's example
-    # needs updating with it — which is the point of pinning it here.
-    check(len(attempts) == 1,
-          f"at LEASE_RENEW_AT={config.LEASE_RENEW_AT} a refusal gets exactly "
-          f"{len(attempts)} attempt, and the retry races the expiry rather "
-          f"than preceding it")
+          f"a renewal is attempted before expiry ({interval} < {ttl})")
+    n = len(attempts)
+    check(n >= 3,
+          f"two renewals can be missed and a third still lands "
+          f"({n} attempt{'' if n == 1 else 's'} at "
+          f"LEASE_RENEW_AT={config.LEASE_RENEW_AT})")
+    # Guarded, because this step exists to FAIL on a bad constant and an
+    # IndexError is not a failure report: at LEASE_RENEW_AT=0.5 `attempts` has
+    # one entry, `attempts[2]` raised, and the run ended with a traceback —
+    # no summary line, and the docstring check below never ran. A test whose
+    # regression path crashes tells you less than one that prints FAIL.
+    third = attempts[2] if n >= 3 else None
+    check(third is not None and third <= ttl * 0.8,
+          f"the third lands inside 80% of the TTL ({third} <= {ttl * 0.8}) "
+          f"— EXO_LEASE_RENEW_PCT's rule, applied here"
+          if third is not None else
+          f"there is no third attempt to place inside 80% of the TTL "
+          f"({n} inside {ttl}s)")
+    # The docstring works the timeline through in seconds. Pin it against the
+    # live constants so the example cannot drift away from them: a changed TTL
+    # or fraction fails here rather than leaving a plausible, wrong worked
+    # example in the file.
     doc = ModelManager._renew_leases.__doc__ or ""
-    check("ONE retry" in doc or "one retry" in doc.lower(),
-          "and the docstring says so rather than promising indefinitely")
+    missing = [t for t in attempts[:3] + [ttl] if f"t={t}" not in doc]
+    # attempts[:3] is short when the constant is wrong; the check below then
+    # verifies less than it does normally, so say how much it verified.
+    check(not missing,
+          f"and the docstring's worked timeline names all {len(attempts[:3]) + 1} "
+          f"of {attempts[:3] + [ttl]} (missing: {missing})")
 
     print(f"\n{'='*60}")
     print(f"  {checks} checks run")

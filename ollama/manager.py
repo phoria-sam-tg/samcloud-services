@@ -2517,25 +2517,28 @@ class ModelManager:
         Refused now means KEEP THE OLD LEASE. It is still active and the
         registry still accounts for the model at its real size.
 
-        BUT SAY HOW LONG THAT LASTS, because "the next tick tries again" is
-        true and not sufficient (claude-wafer-services, reviewing D2). The loop
-        sleeps `LEASE_TTL * LEASE_RENEW_AT` and renews an unextended lease, so
-        at the current 0.5:
+        AND A REFUSAL GETS RETRIED, which needs the loop's interval to be
+        short enough that more than one attempt fits inside the lease. It was
+        not (claude-wafer-services, reviewing D2). The loop sleeps
+        `LEASE_TTL * LEASE_RENEW_AT` and renews a lease it did not extend, so
+        at the old 0.5 a refusal at t=1800 was retried at t=3600 — exactly
+        when the unextended lease expired. One attempt racing the expiry is
+        not a retry, and the guarantee above was bounded at one interval.
+
+        `LEASE_RENEW_AT` is 0.25, so:
 
             t=0     granted, expires t=3600
-            t=1800  renewal fires; refused -> keep the old lease
-            t=3600  the next attempt — and the old lease expires at t=3600
+            t=900   attempt 1; refused -> keep the old lease
+            t=1800  attempt 2
+            t=2700  attempt 3, with 900s still to spare
+            t=3600  expiry
 
-        A refusal therefore gets ONE retry, and it races the expiry rather
-        than preceding it. This is still strictly better than release-first,
-        which dropped to zero at t=1800 with no retry at all; the guarantee is
-        just bounded at one interval instead of indefinite. `LEASE_RENEW_AT`
-        of 0.25 would give attempts at 900/1800/2700 inside 3600 — the same
-        arithmetic `EXO_LEASE_RENEW_PCT` already sets out for the pool lease,
-        where the rule is three attempts inside 80% of the TTL. Changing it is
-        a behaviour change on every box and is not this function's to make;
-        this docstring's job is to stop the reassurance above being read as
-        more than it is.
+        Two renewals may be missed and a third still lands inside the lease —
+        the same arithmetic `EXO_LEASE_RENEW_PCT` sets out for the pool lease
+        (three attempts inside 80% of the TTL; 2700/3600 = 75%). `config.py`
+        carries the reasoning and the cost; `test_renew_ordering` step 5 pins
+        the count against the live constants so this example cannot drift
+        away from them.
 
         THE COST, and it is larger here than on the reconcile. For the length
         of one request the registry counts this model TWICE at its full size,

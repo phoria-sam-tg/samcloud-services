@@ -341,6 +341,12 @@ class ModelManager:
     _pool_renewal_task: Optional[asyncio.Task] = field(default=None, repr=False)
     _offering_task: Optional[asyncio.Task] = field(default=None, repr=False)
     _offering_tier: Optional[str] = field(default=None, repr=False)
+    # The pool's state as the OFFER sees it: `(monotonic_ts, pool_status_dict)`,
+    # or None before the first poll. Written only by `pool_watch_loop`, read only
+    # by `pool_offer`. A plain tuple assignment, so no lock: one writer, and a
+    # reader either gets the old tuple or the new one, never half of either.
+    _pool_view: Optional[tuple] = field(default=None, repr=False)
+    _pool_watch_task: Optional[asyncio.Task] = field(default=None, repr=False)
     # Trailing window of capacity readings, `(monotonic_ts, reading)`, oldest
     # first. The offer is computed over this rather than over one sample — see
     # `offer_reading`. Appended by every read, so it fills from ordinary
@@ -704,6 +710,14 @@ class ModelManager:
         working = self.work_in_progress(foreign)
 
         now = time.time()
+        # EXO is excluded here and added from the pool's own state below (#870).
+        # `self.models` is the wrong authority for the tier: `resolve_exo_tier`
+        # registers it on first use with `managed=False` and nothing ever removes
+        # it, so it read as "resident" for as long as the process lived. Measured
+        # on slice 2026-09-30 with the ring short and nothing placed, `/models`
+        # advertised `think` resident with `idle_seconds: 80238` — a tier that
+        # could not have served a request for 22 hours, listed as available. For
+        # every other backend residency IS ours to know, because we started it.
         resident = [
             {
                 "name": name,
@@ -713,7 +727,11 @@ class ModelManager:
                 "request_count": mm.request_count,
             }
             for name, mm in self.models.items()
+            if mm.backend != Backend.EXO
         ]
+        # Still every key in self.models, tier included: this set exists to stop
+        # a resident model being offered a second time as loadable, and dropping
+        # the tier from it would be a different question from who reports it.
         resident_names = {name for name in self.models}
 
         candidates: dict = {}
@@ -757,10 +775,37 @@ class ModelManager:
                 blocked.append({**entry, "reason": "insufficient_capacity",
                                 "short_by_mb": max(0, need - usable)})
 
+        # The pool tier. It gets its own key AND, when the answer is definite, a
+        # place in the bucket that matches — so an operator reading `/warm` or
+        # `/models` sees it where they see everything else.
+        #
+        # IT NEVER JOINS `loadable`, and an earlier draft of this put `unknown`
+        # there, which was wrong twice over. `loadable` means "this box can start
+        # it right now" and every entry carries `need_mb`; the pool is never
+        # startable by us and has no `need_mb` to give. Two suites said so
+        # immediately — `test_elastic_offering` raised `KeyError: need_mb` reading
+        # the bucket, and `test_work_gate` asserts `loadable == []` while another
+        # tenant holds the device, which the tier has nothing to do with. Borrowing
+        # a bucket whose shape and meaning belong to a different question is how
+        # both happened.
+        #
+        # `unknown` therefore lands in NO bucket: we cannot call it blocked and it
+        # is not resident. `/v1/models` reads the `pool` key for its own decision,
+        # which is the one place that distinction matters.
+        pool = self.pool_offer()
+        if pool is not None:
+            if pool["state"] == "resident":
+                resident.append({k: v for k, v in pool.items()
+                                 if k not in ("state", "reason")} | {"memory_mb": 0})
+            elif pool["state"] == "blocked":
+                blocked.append({k: v for k, v in pool.items() if k != "state"})
+
         return {
             "resident": resident,
             "loadable": loadable,
             "blocked": blocked,
+            # The tier's own verdict, including the `unknown` that is in no bucket.
+            "pool": pool,
             "cooldown_seconds": config.COOLDOWN_SECONDS,
             # The reading the three lists were computed from, so a caller that
             # disagrees with the answer can see what produced it rather than
@@ -780,6 +825,125 @@ class ModelManager:
                 "window_s": r["window_s"],
             },
         }
+
+    async def pool_watch_loop(self):
+        """Keep the offer's view of the pool current, off the request path (#870).
+
+        `offering()` feeds `/warm`, `/v1/models` and `/status`, and `/v1/models`
+        was built to do **no pool read at all** so that a wedged pool could not
+        make discovery hang. Showing `think` as not-offerable there needs the
+        pool's state, so the state is brought here instead: this loop reads, the
+        offer reads a dict.
+
+        Every exception is swallowed on purpose. The pool being unreachable is
+        one of the things this loop exists to observe, so it must not be the
+        thing that stops it observing — and a loop that dies takes `think` out of
+        discovery, which `EXO_POOL_VIEW_MAX_AGE_S` is written to prevent.
+        """
+        while True:
+            try:
+                status = await asyncio.to_thread(self.exo.pool_status)
+                self._pool_view = (time.monotonic(), status)
+            except Exception as e:
+                # Reachability is data, not an error: record it as a view rather
+                # than leaving the last good one to go stale, or a pool that went
+                # away would keep being advertised for MAX_AGE seconds.
+                self._pool_view = (time.monotonic(), {
+                    "ready": False, "resident_model": None, "busy": False,
+                    "instances": [], "nodes_live": 0, "nodes_known": 0,
+                    "ring_short": False, "unavailable_reason": "unreachable",
+                    "error": f"{type(e).__name__}: {e}",
+                })
+            await asyncio.sleep(config.EXO_POOL_WATCH_S)
+
+    def pool_offer(self) -> Optional[dict]:
+        """How the pool tier appears in the offer, or None when EXO is off.
+
+        `{"name", "backend", "state", "reason", "detail"}` where `state` is
+        `resident` (it can serve now), `blocked` (it cannot) or `unknown` (the
+        snapshot is too old to say).
+
+        NO `need_mb`, and that is not an omission. Every other entry in the offer
+        carries what it would cost this box to start it, because this box would
+        start it. The pool is placed out of band, its pages are already wired and
+        already counted by this box's own capacity gate, and a figure here would
+        double-count them — the same reason `memory_mb` is 0 on the tier's
+        `ManagedModel` and `null` on its lease.
+        """
+        if not config.EXO_ENABLED:
+            return None
+        tier = config.EXO_TIERS[0] if config.EXO_TIERS else None
+        if not tier:
+            return None
+        entry = {"name": tier, "backend": Backend.EXO.value}
+        view = self._pool_view
+        age = None if view is None else time.monotonic() - view[0]
+        if view is None or age > config.EXO_POOL_VIEW_MAX_AGE_S:
+            # Listed, not hidden. See EXO_POOL_VIEW_MAX_AGE_S: not having looked
+            # is a fact about us, and a caller is better served by a route that
+            # declines with a reason than by a route that vanished.
+            return {**entry, "state": "unknown", "reason": "pool_view_stale",
+                    "detail": ("the pool's state has not been read recently "
+                               f"({'never' if view is None else f'{int(age)}s ago'}); "
+                               "the tier is still a configured route and a request "
+                               "for it will get a reason rather than a guess")}
+        status = view[1]
+        if status.get("ready"):
+            return {**entry, "state": "resident", "reason": None,
+                    "model": status.get("resident_model"),
+                    "busy": bool(status.get("busy")),
+                    "detail": f"the pool is holding {status.get('resident_model')}"}
+        reason = status.get("unavailable_reason") or "not_ready"
+        return {**entry, "state": "blocked", "reason": f"pool_{reason}",
+                "detail": self._pool_block_detail(reason, status)}
+
+    def _pool_block_detail(self, reason: str, status: dict) -> str:
+        """Why the tier cannot serve, in a sentence a caller can act on.
+
+        The ring-short text is the one that matters and it says the thing Sam
+        settled on #870: the tier exists to be a multi-device model, so it is
+        unavailable the way any model is unavailable while the capacity it needs
+        is taken, and it returns when the capacity does. It must NOT read as an
+        outage or as something the caller should report.
+        """
+        live = status.get("nodes_live", 0)
+        expected = status.get("nodes_expected") or status.get("nodes_known", 0)
+        if reason == "ring_short":
+            return (
+                f"the pool is a {expected}-node ring and {live} of those nodes "
+                f"{'is' if live == 1 else 'are'} in it, so this tier cannot be "
+                f"placed. One of its nodes is a laptop that comes and goes: this "
+                f"is the tier being unavailable while the capacity it needs is "
+                f"absent, exactly as a model is unavailable while its memory is "
+                f"taken, and it returns on its own when the node does. Nothing to "
+                f"report and nothing to do."
+            )
+        if reason == "unreachable":
+            return (f"the pool's API could not be read from this box "
+                    f"({status.get('error', 'no detail')})")
+        if reason == "not_ready":
+            runners = "; ".join(
+                f"{i.get('model')}: {', '.join((i.get('runners') or {}).values())}"
+                for i in status.get("instances") or []
+            )
+            return (f"an instance is placed but no runner can serve it — most "
+                    f"likely mid-swap or still loading. Runners: {runners or 'none'}")
+        # "No model is placed" is all this branch actually knows. Whether the ring
+        # is WHOLE is a separate claim, and on the `identities` basis we cannot
+        # make it: slice read one node known and one live, 17 minutes after its own
+        # restart, with wafer away. Saying "the ring is whole" there sent a reader
+        # looking for an operator to place a model when the answer was a laptop
+        # somewhere else -- the same confidently-wrong shape #870 is about.
+        if status.get("ring_basis") == "configured":
+            return (f"the ring is whole ({live} of {expected} nodes) and no model "
+                    f"is placed on it. Placing one is out of band: this gateway "
+                    f"does not place the pool's model.")
+        return (f"no model is placed on the pool. {live} node"
+                f"{'' if live == 1 else 's'} in the ring, and whether that is the "
+                f"whole ring is NOT established on this box — set "
+                f"EXO_RING_MIN_NODES to the ring's size and this will say which of "
+                f"'a node is away' and 'nothing is placed' it is. Placing a model "
+                f"is out of band either way.")
 
     def load_ollama_model(self, model_name: str) -> ManagedModel:
         """Load an Ollama model with lease management."""
@@ -2857,7 +3021,9 @@ class ModelManager:
             self._stats_task = asyncio.create_task(self.stats_loop())
         if config.OFFERING_ENABLED and (self._offering_task is None or self._offering_task.done()):
             self._offering_task = asyncio.create_task(self.offering_loop())
-        log.info("Background tasks started (cooldown, health, lease renewal, POOL lease renewal, stats, offering)")
+        if config.EXO_ENABLED and (self._pool_watch_task is None or self._pool_watch_task.done()):
+            self._pool_watch_task = asyncio.create_task(self.pool_watch_loop())
+        log.info("Background tasks started (cooldown, health, lease renewal, POOL lease renewal, stats, offering, pool watch)")
 
     def shutdown(self) -> list[dict]:
         """Release all leases. Only stop processes we started (managed=True)."""

@@ -747,6 +747,56 @@ EXO_CHARS_PER_TOKEN = float(_env("EXO_CHARS_PER_TOKEN", "1.5"))
 # resident model.
 EXO_STATUS_CACHE_S = _env_int("EXO_STATUS_CACHE_S", 5)
 
+# How many nodes this pool's ring is supposed to have. NO DEFAULT, and setting it
+# is what lets a decline say `pool_ring_short` rather than `pool_no_instance`.
+#
+# WHY IT CANNOT BE INFERRED, measured rather than argued. The obvious inference is
+# `nodeIdentities` — every node ever seen, and the one per-node map
+# `apply_node_timed_out` does not filter, so it remembers a departed node. It is
+# also emptied by an API-state reset plus an event-log rotation, which every exo
+# restart performs. Read live on slice 2026-09-30 at 00:24Z, 17 minutes after
+# slice's own node restarted, with wafer genuinely away:
+#
+#     topology.nodes   ['ffff…']        nodeIdentities   ['ffff…']
+#
+# So `nodeIdentities > topology.nodes` was False and the ring read as WHOLE while
+# a node was missing — and the decline then told a caller "the ring is whole and
+# no model is placed on it", which is the class of confidently wrong message
+# #870 exists to stop. The inference is right only until the surviving node
+# restarts, which is routine.
+#
+# Unset, `ring_short` falls back to that comparison and the unplaced message says
+# in terms that whether the ring is whole is NOT established. Same shape as
+# `FOREIGN_IDLE_MB`: no default, and configuring it is what arms the mechanism,
+# because a guessed value here produces a confident wrong answer rather than a
+# missing one.
+#
+# NOT read from the placement guard's `placement.conf`, which owns `MIN_NODES`:
+# that file is the guard's contract, lives on one box, and is absent on wafer's
+# gateway. This is env like every other identity value in this service.
+EXO_RING_MIN_NODES = _env_int("EXO_RING_MIN_NODES", 0) or None
+
+# --- the pool's state, for the OFFER rather than for serving (#870) ----------
+# How often the background watcher refreshes what the offer knows about the pool.
+#
+# WHY A LOOP AND NOT A CALL. `offering()` feeds `/warm`, `/v1/models` and
+# `/status`, and `/v1/models` deliberately did NO pool read at all: "a wedged pool
+# cannot make discovery hang" is a property that endpoint was built to have.
+# Showing `think` as not-offerable there needs the pool's state, so the state
+# comes to the offer instead of the offer going to the pool — the same shape as
+# `stats_loop` and `offering_loop`. Discovery reads a dict.
+EXO_POOL_WATCH_S = _env_int("EXO_POOL_WATCH_S", 15)
+
+# How stale that snapshot may be before the offer stops trusting it.
+#
+# PAST THIS THE TIER IS LISTED, NOT HIDDEN, and the direction is the whole point.
+# "We have not been able to look" is not "it cannot serve": the watcher failing
+# is a fact about the watcher. Hiding a configured route on it would take `think`
+# out of discovery because a loop died, which is a worse answer than advertising
+# a tier that then declines — the decline at least says why. Four missed polls at
+# the default.
+EXO_POOL_VIEW_MAX_AGE_S = _env_int("EXO_POOL_VIEW_MAX_AGE_S", 60)
+
 # Gap between the two `busy` samples the wedge guard takes before it declines.
 # One sample is an observation of a moving state; two a short interval apart
 # distinguish "a generation just finished" from "the slot is occupied and is

@@ -128,32 +128,63 @@ is a deploy path today — so if the service is ever installed there, "the
 obvious place to work" is ambiguous four ways before anyone starts, and the
 collision is available without anyone doing anything unusual.
 
-## Per-box setup, once
+## Cutting a box over
 
-The env file stays where it is — `~/.config/samcloud-services/env`, outside the
-clone — so no identity or token changes.
+**Merging this changes nothing about what runs.** `rollout.sh` fills the deploy
+clone; each box's launcher still `cd`s into its working checkout until you
+change it. The cutover is per box and in this order: **slice, then wafer, then
+ada — and ada only in `claude-ada`'s quiet window, never during a render.**
 
-**slice** — `~/.local/bin/cs-model-service-run.sh`:
+The env file stays where it is (`~/.config/samcloud-services/env`, outside the
+clone), so no identity or token changes.
 
-```diff
--cd "$HOME/code/samcloud-services" || exit 1
-+cd "$HOME/var/samcloud-services-deploy" || exit 1
+**1. Fill the clone.**
+
+```sh
+deploy/rollout.sh <the commit this box should run>
 ```
 
-**wafer** — `~/.local/bin/start-model-service.sh`, the same line.
+Expect `exit 4` sometimes and **retry rather than debug it.** wafer's free
+space oscillates across the 5 GiB floor — 4, 14, 5.70, 6.43, 6.78 GiB within
+one hour — so a refusal there after a clean run on slice is the guard working,
+not the script breaking (`claude-wafer-services`).
 
-**ada** — `ada/run.sh` already derives the repo from its own location
-(`HERE/..`), so it needs no edit; point the systemd unit's `ExecStart` at the
-deploy clone's copy:
+**2. Point the launcher at it.** This is **not one line, and not the same file
+on each box.** Find the `cd` *and the variable that feeds it*:
 
-```diff
--ExecStart=/home/phoria/samcloud/services/ada/run.sh
-+ExecStart=/home/phoria/var/samcloud-services-deploy/ada/run.sh
+| box | launcher | what to change |
+|---|---|---|
+| slice | `~/.local/bin/cs-model-service-run.sh` | `cd "$HOME/code/samcloud-services"` |
+| wafer | `~/.local/bin/start-model-service.sh` | `REPO=…` (:6) **and** `cd "$REPO"` (:25) — two lines |
+| ada | systemd unit | `ExecStart` → the deploy clone's `ada/run.sh`; the script itself needs no edit, it derives the repo from its own location |
+
+**3. Restart through the gate**, never by hand:
+
+```sh
+restart-when-idle.sh --check gateway --resource <this box's resource> \
+  --action '<the box's restart>'
 ```
 
-Then, on each box: `deploy/rollout.sh <the commit currently running>`, confirm
-the suites against the deploy clone's venv, and restart through
-`restart-when-idle`. Do the boxes one at a time.
+**4. Verify the cwd — this is the step that proves the cutover, not step 2.**
+
+```sh
+lsof -p <gateway pid> | grep cwd
+```
+
+It has to name the deploy clone. This is not a formality: wafer has **four**
+`samcloud-services` paths (`~/.config/…` env, `~/code/…` the working checkout,
+`~/var/…` logs, `~/work/845/…` an old task checkout), so *"the deploy clone"*
+and *"a samcloud-services directory"* are different claims and only `lsof`
+separates them. It is also how wafer's 57-commit drift was found in the first
+place.
+
+**5. Then delete the Run/Test warning** in `CLAUDE.md` for that box — see the
+note there. A warning that has stopped being true is worse than none.
+
+## Per-box setup afterwards
+
+Nothing. The working checkout goes back to being only a working checkout, and
+`rollout.sh` is the only thing that writes to the deploy clone.
 
 ## What this does not fix
 

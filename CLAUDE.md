@@ -66,17 +66,20 @@ Staging (legacy) used `slice-test/*` identities pointing at `stg.samtg.xyz:9443`
 
 ## Run / Test
 
-**Until PR #32 lands: `~/code/samcloud-services` is the path slice's and
-wafer's gateways actually run from** (`cd "$HOME/code/samcloud-services"`,
+**Until THIS BOX's launcher runs from `~/var/samcloud-services-deploy` —
+check it, do not assume: `lsof -p <gateway pid> | grep cwd` —
+`~/code/samcloud-services` is the path the gateway actually runs from** (`cd "$HOME/code/samcloud-services"`,
 hardcoded in each box's launcher under `~/.local/bin`). Your branch and your
 uncommitted changes are what the next restart serves, and nothing warns you —
 three times in two days someone was three hours into a task before finding out
 (#861). Work in a `git worktree`, not here.
 
-**Once #32 lands, that line is spent:** the service runs from
-`~/var/samcloud-services-deploy` and this checkout is only a checkout again.
-Delete the paragraph above when it does — a warning that has stopped being
-true is worse than none, because the next reader will act on it.
+The trigger is the **launcher**, not the merge. `deploy/rollout.sh` landing
+changes nothing about what runs; each box is cut over separately
+(`deploy/README.md`), so this warning goes stale per box and at different
+times. Delete the paragraph above once `lsof` on this box names the deploy
+clone — a warning that has stopped being true is worse than none, because the
+next reader acts on it.
 
 
 ```bash

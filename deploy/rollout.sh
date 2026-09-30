@@ -121,6 +121,21 @@ fi
 
 git -C "$DEPLOY_DIR" fetch --quiet --prune origin
 SHA=$(git -C "$DEPLOY_DIR" rev-parse --verify "${TARGET}^{commit}")
+PREV=$(git -C "$DEPLOY_DIR" rev-parse --verify HEAD 2>/dev/null || true)
+
+# SAY WHAT IS BEING THROWN AWAY. `reset --hard` + `clean -fd` on a detached
+# clone is correct by design — nobody works here — but discarding silently is
+# how wafer's hand-edited `manager.py` would have vanished without anyone ever
+# learning it had existed (samclaude-admin, reviewing this PR). The listing is
+# cheap and it is the only record.
+# `status --porcelain` alone: it already lists untracked entries as `??`,
+# including directories, so adding `clean -nd` printed every stray file twice.
+doomed=$(git -C "$DEPLOY_DIR" status --porcelain)
+if [ -n "$doomed" ]; then
+  say "discarding:"
+  printf '%s\n' "$doomed" | sed 's/^/rollout:   /' >&2
+fi
+
 git -C "$DEPLOY_DIR" checkout --quiet --detach "$SHA"
 git -C "$DEPLOY_DIR" reset --hard --quiet "$SHA"
 git -C "$DEPLOY_DIR" clean -qfd
@@ -134,7 +149,24 @@ if [ ! -x "$DEPLOY_DIR/.venv/bin/python" ]; then
   say "creating $DEPLOY_DIR/.venv"
   "${DEPLOY_PYTHON:-python3}" -m venv "$DEPLOY_DIR/.venv"
 fi
-"$DEPLOY_DIR/.venv/bin/pip" install --quiet --upgrade -r "$DEPLOY_DIR/requirements.txt"
+if ! "$DEPLOY_DIR/.venv/bin/pip" install --quiet --upgrade -r "$DEPLOY_DIR/requirements.txt"; then
+  # The code is already at the new commit and its dependencies are not. The
+  # next restart would serve that. The disk floor makes this less likely and
+  # does not close it — and wafer, which sits nearest the floor, is the box
+  # where it is most reachable (claude-wafer-services).
+  say "pip install FAILED at $SHA"
+  if [ -n "${PREV:-}" ] && [ "$PREV" != "$SHA" ]; then
+    git -C "$DEPLOY_DIR" checkout --quiet --detach "$PREV"
+    git -C "$DEPLOY_DIR" reset --hard --quiet "$PREV"
+    say "code restored to $(git -C "$DEPLOY_DIR" rev-parse --short HEAD) (where it was)"
+  else
+    say "code left at $SHA — there was no earlier commit to restore"
+  fi
+  say "THE VENV MAY STILL BE PARTIAL. Restoring the code cannot undo a"
+  say "half-finished install, so verify before any restart:"
+  say "  $DEPLOY_DIR/.venv/bin/python -c 'import ollama.server'"
+  exit 5
+fi
 
 say "$DEPLOY_DIR is at $(git -C "$DEPLOY_DIR" rev-parse --short HEAD) (detached), venv synced"
 say "nothing restarted — that is restart-when-idle's step"

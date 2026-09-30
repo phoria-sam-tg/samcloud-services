@@ -40,7 +40,8 @@
 # (`~/.local/samcloud/wake-repo`, rail-owned, hook-synced, never the place
 # anyone edits).
 #
-#   deploy/rollout.sh                      # origin/main into the default path
+#   deploy/rollout.sh 9d002c9              # what a cutover should use: a NAMED commit
+#   deploy/rollout.sh                      # origin/main as of now — warns, for scratch use
 #   deploy/rollout.sh 9d002c9              # a named commit
 #   DEPLOY_DIR=/tmp/x deploy/rollout.sh    # somewhere else, for a dry run
 #
@@ -120,8 +121,29 @@ fi
 [ -n "$branch" ] && say "note: was on branch '$branch' (clean) — detaching"
 
 git -C "$DEPLOY_DIR" fetch --quiet --prune origin
-SHA=$(git -C "$DEPLOY_DIR" rev-parse --verify "${TARGET}^{commit}")
+
+# Resolve BEFORE anything is touched, and fail with a code of our own. Left to
+# `set -e`, a typo'd SHA exits 128 — git's raw code — so the caller gets a git
+# error where it expected a rollout one, and has to know that 128 means "could
+# not resolve" (claude-wafer-services, reviewing this PR).
+if ! SHA=$(git -C "$DEPLOY_DIR" rev-parse --verify --quiet "${TARGET}^{commit}"); then
+  say "REFUSING: cannot resolve '${TARGET}' to a commit."
+  say "Nothing has been changed. Check the SHA, or fetch a branch that has it."
+  exit 6
+fi
 PREV=$(git -C "$DEPLOY_DIR" rev-parse --verify HEAD 2>/dev/null || true)
+
+# A no-argument run is convenient and is not what a cutover should use. The
+# design is "reset to a NAMED commit"; `origin/main` is whatever it happens to
+# be at this moment, so two no-argument runs a week apart deploy different code
+# and both report success — and the command history stops answering "what is
+# this box running?" (claude-wafer-services). Warn rather than refuse: the
+# convenience is real for a scratch clone, the ambiguity only matters for the
+# record.
+if [ $# -eq 0 ]; then
+  say "note: no commit named, so this is origin/main as of now ($(git -C "$DEPLOY_DIR" rev-parse --short "$SHA"))."
+  say "      For a cutover, pass the SHA — it is what the audit trail rests on."
+fi
 
 # SAY WHAT IS BEING THROWN AWAY. `reset --hard` + `clean -fd` on a detached
 # clone is correct by design — nobody works here — but discarding silently is

@@ -141,7 +141,23 @@ clone), so no identity or token changes.
 **1. Fill the clone.**
 
 ```sh
-deploy/rollout.sh <the commit this box should run>
+deploy/rollout.sh 9d002c9        # name the SHA — see below
+```
+
+**Name the commit.** `deploy/rollout.sh` with no argument takes `origin/main`
+as of that moment, which is convenient for a scratch clone and wrong for a
+cutover: two no-argument runs a week apart deploy different code and both
+report success, so the command history stops answering *"what is this box
+running?"*. The script warns when you omit it.
+
+Exit codes, so a refusal is not mistaken for a broken script:
+
+```
+0    done
+3    the clone is a working checkout (branch + uncommitted changes)
+4    below the disk floor — nothing touched
+5    pip install failed; code rolled back, venv may be partial
+6    the commit could not be resolved — nothing touched
 ```
 
 Expect `exit 4` sometimes and **retry rather than debug it.** wafer's free

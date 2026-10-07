@@ -138,12 +138,20 @@ Project history and current state. This is a living document.
   broken answer.
 - **And ours was not even the first cap for most of the window.** Five of the
   500s sit at ~3m0s and match `Client disconnected during stream` to the
-  second — eight such disconnects between 00:02 and 00:24, ~3 minutes apart, a
-  caller giving up at ~180s and retrying. They stop at 00:24; our first 5m0s
-  cut-off is at 01:03. **The caller's bound moved at ~00:30, and that is the
-  only reason ours became the visible one.** `min(caller, ours)` is what
-  actually bounds a generation, so this change hands the cap back rather than
-  removing it.
+  second — eight such disconnects between 00:02 and 00:24, ~3 minutes apart.
+  They stop at 00:24; our first 5m0s cut-off is at 01:03. **The caller's bound
+  moved at ~00:30, and that is the only reason ours became the visible one.**
+  `min(caller, ours)` is what actually bounds a generation, so this change hands
+  the cap back rather than removing it.
+- **And "client disconnected" was not the caller giving up — it was their read
+  timeout**, which `claude-containers` traced and `samclaude-admin` relayed
+  (#903): Hermes' `_stream_timeouts()` sets httpx's **read** bound from its
+  stale timeout for a non-local URL, and that was **180s** before 2026-10-08.
+  So one knob plays two roles on their side, and our log recorded their timeout
+  firing as the client's choice to leave. Worth stating because
+  `Client disconnected during stream` reads as the caller's fault and some of
+  that count was not. Together with the queue residue, two separate terms
+  inflate what looks like gateway trouble.
 - **Three bounds, not two.** The structure is `exo_client`'s, which was bitten
   by exactly this on #830, and the constants in `config.py` are the design doc:
 

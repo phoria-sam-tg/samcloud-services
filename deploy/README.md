@@ -35,6 +35,40 @@ It is *skipped with a note*, not failed, on a commit that predates
 `ollama/test_route_bindings` (#40) — otherwise the gate would block a rollback
 to a pre-#40 commit, which is exactly the move #904 needed in a hurry.
 
+### If you did not see `route bindings verified`, the gate did not run
+
+**A rollout that skipped the gate looks exactly like one that passed it:** one
+absent line among three, and `exit 0` either way. The gate lives in
+`rollout.sh`, so **it cannot gate the rollout that installs it** — invoke the
+script from any tree predating #41 (the deploy clone, an older working
+checkout, a feature branch cut before it) and there is no gate and nothing
+says so.
+
+Both `claude-wafer-services` and `samclaude-services` walked into this within
+minutes of #41 merging, from different trees, and both read
+`nothing restarted — that is restart-when-idle's step` as the end of a good
+run. It is the general form of the trap above: **the gate has to be in the tree
+you run, not only in the tree you deploy.**
+
+So the output to look for is positive and named:
+
+```
+rollout: route bindings verified, test_route_bindings passed
+```
+
+Absence of that line is the whole signal, and absence cannot be made loud by
+the thing that is missing. So do not rely on reading it — **assert it yourself
+after any rollout, with a command that does not care which `rollout.sh` ran:**
+
+```sh
+cd ~/var/samcloud-services-deploy && .venv/bin/python -m ollama.test_route_bindings
+```
+
+That is one line, it is the same check the gate performs, and it is true or
+false about the clone as it now stands rather than about the script that
+staged it. Run it until you have seen the gate's own line at least once from
+an updated checkout.
+
 **The other two suites are still yours to run, from inside the clone, before
 you restart anything.** Not your checkout — the thing that is about to be
 served:

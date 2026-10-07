@@ -270,9 +270,11 @@ ROUTECHECK
   else
     say "code left at $SHA — there was no earlier commit to restore"
   fi
+  # ONE LINE, pasteable. Split across three `say` calls it reads fine and
+  # cannot be copied into a shell, which is the only thing the reader wants to
+  # do with it (samclaude-admin, reviewing #41).
   say "DO NOT RESTART. See which path resolves where with:"
-  say "  (cd $DEPLOY_DIR && .venv/bin/python -c 'from ollama.server import app;"
-  say "   print({r.path: r.endpoint.__name__ for r in app.routes})')"
+  say "  (cd $DEPLOY_DIR && .venv/bin/python -c 'from ollama.server import app; print({r.path: r.endpoint.__name__ for r in app.routes})')"
   exit 7
 fi
 verified="route bindings verified"

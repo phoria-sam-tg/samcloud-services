@@ -467,6 +467,57 @@ def main():
     check("our count" in fn,
           "our token count is logged beside ollama's own, turning the "
           "chars/token estimate into a checkable number")
+
+    # A quotient under a token floor is not a rate — it is fixed overhead
+    # wearing a rate's units. Driven, not read: these are real samples.
+    from .server import _log_ollama_timings, _MIN_TOKENS_FOR_RATE
+    import logging as _lg
+    lines = []
+    _h = type("H", (_lg.Handler,), {"emit": lambda _s, r: lines.append(r.getMessage())})()
+    _log = _lg.getLogger("model-service")
+    _log.addHandler(_h)
+    # slice, measured: a 15-token prompt and a 1-token generation. Used to
+    # claim 10 tok/s prefill and 4.3 tok/s decode.
+    _log_ollama_timings("m", {"prompt_eval_count": 15,
+                              "prompt_eval_duration": 1561665666,
+                              "eval_count": 1, "eval_duration": 230414084,
+                              "total_duration": 73825340875}, 18)
+    # wafer, measured cold: 2,676 tokens at 74.7 tok/s, num_predict:1.
+    _log_ollama_timings("m", {"prompt_eval_count": 2676,
+                              "prompt_eval_duration": 35830000000,
+                              "eval_count": 1, "eval_duration": 310000000,
+                              "total_duration": 60900000000}, 2700)
+    # a real generation: both columns earn a rate.
+    _log_ollama_timings("m", {"prompt_eval_count": 2000,
+                              "prompt_eval_duration": 20000000000,
+                              "eval_count": 300, "eval_duration": 12000000000,
+                              "total_duration": 32100000000}, 1950)
+    _log.removeHandler(_h)
+    check(len(lines) == 3, f"three samples logged (got {len(lines)})")
+    tiny, cold, real = lines
+    check("10 tok/s" not in tiny and "no rate" in tiny,
+          "a 15-token prompt does NOT claim 10 tok/s — under the floor it "
+          "logs the duration and refuses the quotient")
+    check("4.3 tok/s" not in tiny and "first_token 0.23s" in tiny,
+          "a 1-token generation is reported as first_token latency, not as a "
+          "decode rate (claude-wafer-services, #904: `eval_count/eval_duration`"
+          " at ec=1 is the total_duration trap one column over)")
+    check("1 token, not a rate" in cold,
+          "...including on a long prompt swept with num_predict:1, which is "
+          "the exact shape that produced the finding")
+    check("74.7 tok/s" in cold,
+          f"but the PREFILL on that row does earn its rate — reproduces "
+          f"wafer's measured 74.7 tok/s from their own numbers")
+    check("queued ~24.8s" in cold,
+          "and `queued` independently agrees with their 24.7s weight-load "
+          "figure, from the same row")
+    check("= 100.0 tok/s" in real and "decode 300 tok" in real
+          and "= 25.0 tok/s" in real,
+          "a real generation rates both columns")
+    check("queued" not in real,
+          "...and carries no queued term, because there was none")
+    check(_MIN_TOKENS_FOR_RATE >= 32,
+          f"the floor is at least 32 tokens ({_MIN_TOKENS_FOR_RATE})")
     check("queued ~" in fn,
           "the queue residue is stated, not left as arithmetic — it is the "
           "field the #904 correlation gets sorted on, and a correlation that "

@@ -2,6 +2,36 @@
 
 Project history and current state. This is a living document.
 
+## 2026-10-08 — A quotient under a token floor is not a rate (#904)
+
+- **Found by `claude-wafer-services` while sweeping with `num_predict:1`**, and
+  it is the `total_duration` trap one column over. `_log_ollama_timings`
+  computed `eval_count / eval_duration` unconditionally, so a one-token
+  generation reported **time-to-first-token wearing a rate's units**. It would
+  have read correctly on real traffic and wildly wrong on every short
+  generation — the ones that look harmless.
+- **My own first sample proves it twice.** `prefill 15 tok in 1.56s = 10 tok/s`
+  and `decode 1 tok in 0.23s = 4.3 tok/s`, against ~75 tok/s prefill on a
+  2,676-token prompt. Two orders of magnitude of nonsense, in the field whose
+  entire purpose is to be read as a rate and used to size a deadline. So the
+  floor applies to **both** columns, not just decode.
+- `_MIN_TOKENS_FOR_RATE = 32`. Under it, the duration is logged and the
+  quotient refused: `prefill 15 tok in 1.56s (under 32 tok: no rate)`. At
+  `eval_count == 1` specifically, `first_token 0.23s (1 token, not a rate)`,
+  because that number is a latency and is worth having under its own name. Not
+  a filter — the row still appears, it just cannot assert a rate it does not
+  support.
+- **The window is not the usable prompt.** Applying wafer's 74.7 tok/s: a
+  70,000-token prefill is ~937s, which is 52% of the 1800s ceiling, and a full
+  262,144-token prefill is ~3509s and **cannot complete**. So the published
+  window is a memory bound and there is a second, tighter bound made of time —
+  the time-usable prompt is ~125,000 tokens. Recorded in the README beside the
+  published window, because a consumer sizing against `context_length` alone
+  will be cut by the ceiling.
+- **And retrospectively: under the 300s cap, any prompt over ~22,000 tokens
+  could not complete at all.** Prefill alone exceeded the wall. The 65,536
+  `hermes-assistant` believed it had was never usable; neither was 32,000.
+
 ## 2026-10-08 — A route is bound to a handler, and nothing asserted which (#904)
 
 - **`_log_ollama_timings` was inserted between `@app.post("/v1/chat/completions")`

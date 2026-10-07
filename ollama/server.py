@@ -1301,6 +1301,26 @@ def _openai_shape_vlm(data: dict) -> dict:
     return data
 
 
+# Below this many tokens, duration is dominated by fixed per-generation
+# overhead and the quotient is not a rate (#904). Measured on slice: a 15-token
+# prompt "prefilled" at 10 tok/s and a 1-token generation "decoded" at
+# 4.3 tok/s, against ~75 tok/s prefill on a 2,676-token prompt on wafer. Two
+# orders of magnitude of nonsense, in a field whose whole purpose is to be read
+# as a rate and used to size a deadline.
+#
+# So a count under the floor logs the DURATION and no quotient. Not a filter —
+# the row still appears, because a short request is still evidence of
+# something; it just does not get to assert a rate it cannot support.
+_MIN_TOKENS_FOR_RATE = 32
+
+
+def _rate(count: int, duration_ns: int, unit: str) -> str:
+    """` = N tok/s`, or an explicit refusal to divide. Never a bare quotient."""
+    if count < _MIN_TOKENS_FOR_RATE:
+        return f" (under {_MIN_TOKENS_FOR_RATE} tok: no rate)"
+    return f" = {count / (duration_ns / 1e9):.1f} {unit}"
+
+
 def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):
     """Log prefill and decode rates off the `done` chunk (#904).
 
@@ -1334,11 +1354,20 @@ def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):
     ed = chunk.get("eval_duration")
     bits = []
     if pc and pd:
-        bits.append(f"prefill {pc} tok in {pd / 1e9:.2f}s "
-                    f"= {pc / (pd / 1e9):.0f} tok/s")
+        bits.append(f"prefill {pc} tok in {pd / 1e9:.2f}s"
+                    + _rate(pc, pd, "tok/s"))
     if ec and ed:
-        bits.append(f"decode {ec} tok in {ed / 1e9:.2f}s "
-                    f"= {ec / (ed / 1e9):.1f} tok/s")
+        if ec == 1:
+            # ONE token is not a rate, it is a latency. `eval_count/eval_duration`
+            # at ec=1 is time-to-first-token wearing a rate's units — the
+            # `total_duration` trap one column over, found by
+            # claude-wafer-services on #904 while sweeping with `num_predict:1`.
+            # It would read correctly on real traffic and wildly wrong on every
+            # short generation, which are the ones that look harmless.
+            bits.append(f"first_token {ed / 1e9:.2f}s (1 token, not a rate)")
+        else:
+            bits.append(f"decode {ec} tok in {ed / 1e9:.2f}s"
+                        + _rate(ec, ed, "tok/s"))
     total = chunk.get("total_duration")
     if total:
         # Includes queue wait, so it is NOT prefill + decode. Named `wall` so

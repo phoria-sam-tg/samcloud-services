@@ -435,11 +435,12 @@ def main():
     check(body.count('yield "data: [DONE]\\n\\n"') == 4,
           f"exactly 4 [DONE] emissions: finish, stall, timeout, error "
           f"(got {body.count('yield (data: [DONE]'.replace('(', chr(34)))})")
-    check(body.count('"finish_reason": "stalled"') == 1
-          and body.count('"finish_reason": "timeout"') == 1
-          and body.count('"finish_reason": "error"') == 1,
-          "each failure carries its own finish_reason, so a caller can tell "
-          "them apart without parsing prose")
+    check(body.count('"error_type": "model_stalled"') == 1
+          and body.count('"error_type": "request_timeout"') == 1
+          and body.count('"error_type": "stream_error"') == 1,
+          "each failure carries its own error_type at top level, so a caller "
+          "can tell them apart without parsing prose — and WITHOUT a "
+          "finish_reason, which step 16 forbids")
     # The EXACT line, not the substring: the comment above it in server.py
     # also contains `{e!r}`, so a presence check passed on the reverted code
     # when this was mutation-tested. "Assert a count, not a presence" —
@@ -450,6 +451,47 @@ def main():
           "logged as `Stream error for qwen3.8:27b-mlx:` and then nothing")
     check("prompt_tokens=n_prompt" in body,
           "the counted prompt is passed through, so the deadline is armed")
+
+    step(16, "a failure frame is DETECTABLE, not merely honest")
+    # The rule is "never stamp a finish_reason a client could read as
+    # SUCCESS", not "never stamp one". samclaude-admin read Hermes' source:
+    #   _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
+    #   if not text: return None            <- needs non-empty content
+    #   if reason not in that set: return None
+    # So "stalled"/"timeout" were invisible (not in the set) and `choices: []`
+    # — the first fix — is invisible for BOTH reasons. Asserting the exact
+    # JSON-key forms, not substrings: the comments here discuss these fields
+    # in prose and a presence check passes on reverted code
+    # (claude-wafer-services; and my own {e!r} trap one step down).
+    srv_s = open(os.path.join(os.path.dirname(__file__), "server.py")).read()
+    ob = srv_s.split("if mm.backend == Backend.OLLAMA:", 1)[1].split(
+        'return StreamingResponse(stream(), media_type="text/event-stream")', 1)[0]
+    for bad in ('"finish_reason": "stalled"', '"finish_reason": "timeout"'):
+        check(bad not in ob,
+              f'no {bad} — an unrecognised reason degrades to "assume '
+              f'normal" in most clients, which is the actual defect: those '
+              f'frames did not merely lie, they fell through to success')
+    check(ob.count('"choices": [],') == 0,
+          f'and NOT `choices: []` either ({ob.count(chr(34)+"choices"+chr(34)+": [],")})'
+          f' — it has neither text nor a reason, so it is invisible twice over')
+    check(ob.count('"finish_reason": _FAILURE_FINISH_REASON') == 3,
+          f'all three failure frames use the one conventional failure value '
+          f'({ob.count(chr(34)+"finish_reason"+chr(34)+": _FAILURE_FINISH_REASON")})')
+    check('_FAILURE_FINISH_REASON = "error"' in srv_s,
+          '...which is "error" — the one value no client reads as normal '
+          'completion')
+    check(ob.count('"delta": {"content":') == 3,
+          f'each carries NON-EMPTY content, because the guard needs text as '
+          f'well as a reason ({ob.count(chr(34)+"delta"+chr(34)+": {"+chr(34)+"content"+chr(34)+":")})')
+    check(ob.count('"error_type":') == 3 and ob.count('"error_message":') == 3,
+          "...and the cause at TOP level too, for a client that reads only "
+          "the canonical shape and never opens the nested object")
+    check(ob.count('"error": {') == 3,
+          "the nested object is KEPT beside them, so deadline_s / elapsed_s / "
+          "tokens_before_* survive for anything reading extras")
+    check('"finish_reason": finish' in ob,
+          "and the SUCCESS frame is untouched — the rule is about which "
+          "value, not about removing the field")
 
     step(15, "the armed/not-armed line reports the state it is actually in")
     # Caught in the live log a minute after the #904 restart: the branch keyed
@@ -545,31 +587,52 @@ def main():
     check(_MIN_TOKENS_FOR_RATE >= 32,
           f"the floor is at least 32 tokens ({_MIN_TOKENS_FOR_RATE})")
 
-    # The other end: a cache hit divides the WHOLE prompt count by only the
-    # uncached duration. Live row from slice, minutes after the #904 rollout.
-    from .server import _MAX_PLAUSIBLE_TOK_S
-    lines.clear()
-    _log.addHandler(_h)
-    _log_ollama_timings("m", {"prompt_eval_count": 76321,
-                              "prompt_eval_duration": 22730000000,
-                              "eval_count": 397, "eval_duration": 33800000000,
-                              "total_duration": 56600000000}, 201746)
+    # The trusted-rate ceiling, which is PER MODEL and unset by default. The
+    # two rows below are both real measurements and they sit inside 1.3x of
+    # each other, which is why no flat constant works.
+    HIT = {"prompt_eval_count": 76321, "prompt_eval_duration": 22730000000,
+           "eval_count": 397, "eval_duration": 33800000000,
+           "total_duration": 56600000000}                  # slice, 27b, cached
+    FAST = {"prompt_eval_count": 2677, "prompt_eval_duration": 1030000000,
+            "eval_count": 1, "eval_duration": 100000000,
+            "total_duration": 1200000000}                  # wafer, 1.7b, GENUINE
+
+    lines.clear(); _log.addHandler(_h)
+    _log_ollama_timings("qwen3.8:27b-mlx", HIT, 201746)
+    _log_ollama_timings("qwen3:1.7b", FAST, 2700)
     _log.removeHandler(_h)
-    hit = lines[0]
-    check("3,358 tok/s" in hit and "cache hit" in hit,
-          "76,321 tok in 22.73s is named a CACHE HIT, not reported as "
-          "3358 tok/s — the real cold figure on this box is ~100-104")
-    check("= 3358" not in hit,
-          "...and the bare `= N tok/s` form is NOT used for it, so a log "
-          "scraper cannot pick it up as a rate")
-    check("76321" in hit,
-          "the COUNT is kept — it is the useful half; only the quotient is "
-          "meaningless")
-    check("decode 397 tok" in hit and "11.7 tok/s" in hit,
-          "and decode on the same row still earns its rate at 397 tokens")
-    check(_MAX_PLAUSIBLE_TOK_S <= 400,
-          f"the ceiling is at most 400 tok/s ({_MAX_PLAUSIBLE_TOK_S}), well "
-          f"above the ~104 cold rate and far below a cache hit")
+    check(len(lines) == 2, f"two rows (got {len(lines)})")
+    check("= 3358" not in lines[0] and "= 2605" not in lines[1],
+          "UNSET by default: neither row asserts a rate, because the gateway "
+          "cannot tell reuse from a fast model and a flat constant cannot "
+          "either — 2,605 genuine vs 3,358 cached is 1.3x apart")
+    check("76321 tok in 22.73s" in lines[0]
+          and "2677 tok in 1.03s" in lines[1],
+          "...but both still log the count and the duration, which is "
+          "strictly more than before and all they can support")
+
+    os.environ["OLLAMA_MAX_TOK_S_MODELS"] = "qwen3.8:27b-mlx=400,qwen3:1.7b=6000"
+    cfg2 = importlib.reload(config)
+    import ollama.server as _srv
+    importlib.reload(_srv)
+    lines.clear()
+    _l2 = _lg.getLogger("model-service"); _l2.addHandler(_h)
+    _srv._log_ollama_timings("qwen3.8:27b-mlx", HIT, 201746)
+    _srv._log_ollama_timings("qwen3:1.7b", FAST, 2700)
+    _l2.removeHandler(_h)
+    check("rate not trusted" in lines[0] and "3,358" in lines[0],
+          "with a 400 ceiling the 27b cache row is `rate not trusted` and "
+          "states the implied figure without asserting it")
+    check("cache hit" not in lines[0],
+          "NOT labelled `cache hit` — at 961 tok/s a genuine 1.7b prefill and "
+          "a partially-cached 27b one are indistinguishable, so the label "
+          "must not name a cause the data cannot support")
+    check("tok/s" in lines[1] and "rate not trusted" not in lines[1],
+          f"...while the 1.7b row DOES earn its rate under a 6000 ceiling — "
+          f"a flat 400 would have deleted every prefill that model will ever "
+          f"log and blamed a cache that was not there. Row: {lines[1][:120]}")
+    os.environ.pop("OLLAMA_MAX_TOK_S_MODELS", None)
+    importlib.reload(config); importlib.reload(_srv)
     check("queued ~" in fn,
           "the queue residue is stated, not left as arithmetic — it is the "
           "field the #904 correlation gets sorted on, and a correlation that "

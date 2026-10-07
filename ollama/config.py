@@ -191,14 +191,19 @@ OLLAMA_KEEP_ALIVE = _env_int("OLLAMA_KEEP_ALIVE", -1)
 OLLAMA_NUM_CTX = max(0, _env_int("OLLAMA_NUM_CTX", 0))
 
 
-def _num_ctx_models() -> dict:
-    """Parse OLLAMA_NUM_CTX_MODELS — `name=tokens` pairs, comma separated.
+def _num_ctx_style_map(var: str) -> dict:
+    """Parse `name=number` pairs, comma separated, from one env var.
 
-    A malformed pair is dropped with a warning rather than taken as 0: 0 is
-    "let Ollama derive one", which is the behaviour this setting exists to
-    stop, so a typo must not quietly mean it.
+    Shared by OLLAMA_NUM_CTX_MODELS and OLLAMA_MAX_TOK_S_MODELS so the two
+    cannot drift in how they read a typo — which matters because in both cases
+    a dropped pair and a zero mean different things.
+
+    A malformed pair is dropped with a warning rather than taken as 0: for the
+    window, 0 is "let Ollama derive one", which is the behaviour the setting
+    exists to stop; for the rate ceiling, 0 is "do not divide". A typo must not
+    quietly select either.
     """
-    raw = os.environ.get("OLLAMA_NUM_CTX_MODELS", "").strip()
+    raw = os.environ.get(var, "").strip()
     out: dict[str, int] = {}
     if not raw:
         return out
@@ -211,16 +216,62 @@ def _num_ctx_models() -> dict:
         try:
             n = int(value.strip())
         except ValueError:
-            log.warning(f"OLLAMA_NUM_CTX_MODELS: not a number, ignoring: {pair!r}")
+            log.warning(f"{var}: not a number, ignoring: {pair!r}")
             continue
         if not name or n <= 0:
-            log.warning(f"OLLAMA_NUM_CTX_MODELS: unusable pair, ignoring: {pair!r}")
+            log.warning(f"{var}: unusable pair, ignoring: {pair!r}")
             continue
         out[name] = n
     return out
 
 
-OLLAMA_NUM_CTX_MODELS = _num_ctx_models()
+OLLAMA_NUM_CTX_MODELS = _num_ctx_style_map("OLLAMA_NUM_CTX_MODELS")
+
+
+# --- Which logged rates are trustworthy (ticket #904) ---------------------
+# A quotient of `prompt_eval_count / prompt_eval_duration` can be a prefill
+# rate or a KV-cache hit, and the gateway cannot tell which. UNSET BY DEFAULT,
+# and setting it per model is what enables the check — the same convention as
+# OLLAMA_FIRST_TOKEN_RATE_TPS and FOREIGN_IDLE_MB (#861).
+#
+# A FLAT DEFAULT CANNOT WORK, and this is measured rather than argued.
+# `claude-wafer-services` on #904, uncached, fresh random prompts:
+#
+#   genuine  qwen3:1.7b     2,677 tok in  1.03s  =  2,605 tok/s
+#   cache    qwen3.8:27b   76,321 tok in 22.73s  =  3,358 tok/s
+#
+# A real measurement and a cache hit inside 1.3x of each other — and partial
+# reuse (prefix reused, suffix genuinely prefilled) makes the implied rate a
+# CONTINUUM from the true rate upward rather than two clusters. There is no cut
+# point because there are no two populations to cut between.
+#
+# The asymmetry is what settles it: too high loses a few egregious rows; too
+# low silently DELETES an entire model's data and attributes it to a cause that
+# is not there. Those costs are not comparable, so there is no value at which
+# shipping a flat default beats not shipping one. A first version of this
+# shipped 400, which would have discarded every prefill `qwen3:1.7b` will ever
+# log — a constant measured on one model applied to all of them, in the same
+# commit that named that pattern.
+#
+#   OLLAMA_MAX_TOK_S_MODELS=qwen3.8:27b-mlx=400,qwen3:1.7b=6000
+#
+# Unset for a model means that model logs counts and durations and no rate,
+# which is strictly more than it logs today and nothing it cannot support.
+# The clean discriminator is structural and NOT available here: a genuine
+# prefill emits `Prompt processing progress` every 2,048 tokens and a cache hit
+# emits none, because nothing is processed. That is in ollama's server log, not
+# in the API response the gateway sees — so the gateway cannot defend the
+# division at all, and this ceiling is a gate on whether to additionally print
+# a rate, never a claim about why.
+OLLAMA_MAX_TOK_S_MODELS = _num_ctx_style_map("OLLAMA_MAX_TOK_S_MODELS")
+
+
+def ollama_max_tok_s(model: str) -> int:
+    """The trusted-rate ceiling for this model, or 0 for "do not divide"."""
+    if model in OLLAMA_MAX_TOK_S_MODELS:
+        return OLLAMA_MAX_TOK_S_MODELS[model]
+    base = model.split(":", 1)[0]
+    return OLLAMA_MAX_TOK_S_MODELS.get(base, 0)
 
 
 def ollama_num_ctx(model: str) -> int:

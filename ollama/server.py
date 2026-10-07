@@ -1313,39 +1313,49 @@ def _openai_shape_vlm(data: dict) -> dict:
 # something; it just does not get to assert a rate it cannot support.
 _MIN_TOKENS_FOR_RATE = 32
 
-# The other end of the same problem. Ollama reports `prompt_eval_count` as the
-# WHOLE prompt but `prompt_eval_duration` as only the part it actually
-# evaluated, so a KV-cache hit divides a big count by a tiny duration.
-# Measured live on slice 2026-10-08, minutes after the #904 rollout:
-#
-#   prefill 76321 tok in 22.73s = 3358.2 tok/s
-#
-# which is not a prefill rate, it is a cache hit wearing one. The real cold
-# figure on this box is ~100-104 tok/s, so anything past a few hundred is
-# arithmetic on a reused cache.
-#
-# `claude-wafer-services` established the reuse rule on #904: ollama reuses the
-# cache only when the new prompt is a strict token-prefix EXTENSION of the
-# cached one. Appending a turn qualifies; editing earlier content does not —
-# which is why a context-compression event guarantees a cold prefill on the
-# very next request, at the largest prompt size in the conversation. So the
-# rows that survive this ceiling are exactly the cold prefills, which are the
-# only rows a deadline can be sized from. It is a filter that loses nothing
-# anyone wanted.
-_MAX_PLAUSIBLE_TOK_S = 400
-
-
-def _rate(count: int, duration_ns: int, unit: str) -> str:
+def _rate(count: int, duration_ns: int, unit: str,
+          model: Optional[str] = None) -> str:
     """` = N tok/s`, or an explicit refusal to divide. Never a bare quotient."""
     if count < _MIN_TOKENS_FOR_RATE:
         return f" (under {_MIN_TOKENS_FOR_RATE} tok: no rate)"
     r = count / (duration_ns / 1e9)
-    if r > _MAX_PLAUSIBLE_TOK_S:
-        # Named for what it is, and the count kept — the count is the useful
-        # part, it is the quotient that is meaningless.
-        return (f" (cache hit: {r:,.0f} {unit} exceeds "
-                f"{_MAX_PLAUSIBLE_TOK_S}, so this is reuse and not a rate)")
+    ceiling = config.ollama_max_tok_s(model or "")
+    if ceiling > 0 and r > ceiling:
+        # NOT labelled "cache hit". At 961 tok/s you cannot tell a genuine
+        # qwen3:1.7b prefill from a partially-cached 27b one — the implied rate
+        # is a continuum from the true rate upward, not two clusters, because a
+        # partial reuse prefills the suffix for real. So the label says what is
+        # known (the rate is not trusted) and not what is guessed (why).
+        # Naming a cause we did not measure is the defect this whole ticket
+        # pair is made of.
+        return (f" ({count:,} tok in {duration_ns / 1e9:.2f}s implies "
+                f"{r:,.0f} {unit}, above the {ceiling:,} ceiling for this "
+                f"model — rate not trusted)")
     return f" = {r:.1f} {unit}"
+
+
+# NEVER STAMP A `finish_reason` ON A FAILURE (#904, samclaude-admin).
+#
+# The first version of #39's terminal frames carried
+# `choices: [{"delta": {}, "finish_reason": "stalled"|"timeout"|"error"}]`.
+# That is the *exact shape of a normal final chunk*: `finish_reason` is the
+# field every OpenAI client trusts to mean "completed normally", and a
+# plausible-looking value there is worse than sending no frame at all — the
+# caller stops, believes it has a complete answer, and the nested `error`
+# object is never opened because nothing told it to look.
+#
+# `claude-wafer-services` traced it precisely: the frame is not choiceless, so
+# Hermes' `_choiceless_chunk` never sees it. So "tell the caller" was satisfied
+# only from the gateway's side — the stream terminated, and a consumer read a
+# success. samclaude-admin reviewed those frames and called them correct on the
+# same half of the check.
+#
+# So: `choices: []`, the cause at top level where the OpenAI shape puts it, and
+# the rich nested object kept for anything that wants the detail. Asserted by
+# `test_stream_deadlines`.
+_FAILURE_FRAME_RULE = (
+    "choices must be empty and no finish_reason may appear on a failure frame"
+)
 
 
 def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):
@@ -1382,7 +1392,7 @@ def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):
     bits = []
     if pc and pd:
         bits.append(f"prefill {pc} tok in {pd / 1e9:.2f}s"
-                    + _rate(pc, pd, "tok/s"))
+                    + _rate(pc, pd, "tok/s", model))
     if ec and ed:
         if ec == 1:
             # ONE token is not a rate, it is a latency. `eval_count/eval_duration`
@@ -1394,7 +1404,7 @@ def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):
             bits.append(f"first_token {ed / 1e9:.2f}s (1 token, not a rate)")
         else:
             bits.append(f"decode {ec} tok in {ed / 1e9:.2f}s"
-                        + _rate(ec, ed, "tok/s"))
+                        + _rate(ec, ed, "tok/s", model))
     total = chunk.get("total_duration")
     if total:
         # Includes queue wait, so it is NOT prefill + decode. Named `wall` so
@@ -1540,7 +1550,12 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                                   "deadline_s": round(e.deadline, 1),
                                   "tokens_before_stall": e.tokens,
                                   "silent_for_s": round(e.silent_for, 1)},
-                        "choices": [{"delta": {}, "finish_reason": "stalled"}],
+                        # Top-level too, because a consumer that reads only the
+                        # OpenAI shape never opens the nested object.
+                        "error_type": "model_stalled",
+                        "error_message": e.detail,
+                        # EMPTY. See _FAILURE_FRAME_RULE.
+                        "choices": [],
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
                 except OllamaRequestTimeout as e:
@@ -1562,7 +1577,9 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                                   "deadline_s": round(e.deadline, 1),
                                   "elapsed_s": round(e.elapsed, 1),
                                   "tokens_before_timeout": e.tokens},
-                        "choices": [{"delta": {}, "finish_reason": "timeout"}],
+                        "error_type": "request_timeout",
+                        "error_message": e.detail,
+                        "choices": [],
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
                 except Exception as e:
@@ -1575,7 +1592,9 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                     yield "data: " + json.dumps({
                         "error": {"message": f"{type(e).__name__}: {e}",
                                   "type": "stream_error"},
-                        "choices": [{"delta": {}, "finish_reason": "error"}],
+                        "error_type": "stream_error",
+                        "error_message": f"{type(e).__name__}: {e}",
+                        "choices": [],
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
             return StreamingResponse(stream(), media_type="text/event-stream")

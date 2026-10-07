@@ -435,11 +435,37 @@ def main():
     check(body.count('yield "data: [DONE]\\n\\n"') == 4,
           f"exactly 4 [DONE] emissions: finish, stall, timeout, error "
           f"(got {body.count('yield (data: [DONE]'.replace('(', chr(34)))})")
-    check(body.count('"finish_reason": "stalled"') == 1
-          and body.count('"finish_reason": "timeout"') == 1
-          and body.count('"finish_reason": "error"') == 1,
-          "each failure carries its own finish_reason, so a caller can tell "
-          "them apart without parsing prose")
+    # A FAILURE FRAME IS CHOICELESS AND CARRIES A FLAT ERROR PAIR (#904).
+    #
+    # This replaces an assertion that each failure carried its own
+    # `finish_reason`. That was the defect, not the feature: a populated
+    # `choices` holding a `finish_reason` is byte-identical in shape to a
+    # normal successful final chunk, so the consumer's choiceless-chunk path
+    # never ran and the nested `error` was never read. Driven against the real
+    # consumer, both a prefill and a decode timeout came back as COMPLETED
+    # turns — the decode one presenting a truncated answer as whole.
+    #
+    # Counted, not merely present: three sites, and a presence check passes on
+    # two of three. See `_FAILURE_FRAME` in server.py.
+    choiceless = body.count('"choices": []')
+    check(choiceless == 3,
+          f"all 3 failure frames are choiceless, which is what makes a "
+          f"consumer look at the error fields at all (got {choiceless})")
+    check(body.count('"error_type"') == 3 and body.count('"error_message"') == 3,
+          "all 3 carry a FLAT error_type/error_message at the top level — "
+          "nested under `error` they are invisible to the consumer, and the "
+          "rich object is kept beside them rather than instead of them")
+    # The exact JSON-key forms, because the surrounding comments in server.py
+    # mention `finish_reason` in prose: a bare substring check would pass on
+    # the reverted code. Same trap as `{e!r}` one assertion below, which is
+    # the reason this file states the rule twice.
+    check(body.count('"finish_reason": "stalled"') == 0
+          and body.count('"finish_reason": "timeout"') == 0
+          and body.count('"finish_reason": "error"') == 0,
+          "NO failure stamps a finish_reason: it is the field every client "
+          "trusts to mean 'completed normally', `timeout` is not even a legal "
+          "value in the OpenAI schema, and any value at all disables the "
+          "consumer's three dropped-stream detectors")
     # The EXACT line, not the substring: the comment above it in server.py
     # also contains `{e!r}`, so a presence check passed on the reverted code
     # when this was mutation-tested. "Assert a count, not a presence" —

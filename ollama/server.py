@@ -1426,6 +1426,66 @@ def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):
         log.info(f"Ollama timings for {model}: " + "; ".join(bits))
 
 
+# THE SHAPE OF A FAILURE FRAME, and why it is not a `finish_reason` (#904).
+#
+# #904 asked the streaming path to "tell the caller" when a bound fires instead
+# of ending the stream silently. The first version did that by emitting a rich
+# nested `error` object alongside
+# `choices: [{"delta": {}, "finish_reason": "timeout"}]`, then `[DONE]`.
+#
+# ALL THE INFORMATION WAS THERE AND NO CALLER COULD SEE IT. Driven against the
+# real consumer by `claude-containers`, against a 1800s timeout:
+#
+#   prefill timeout, 0 tokens    -> raised=False  stub=False  finish='timeout'
+#   decode  timeout, 412 tokens  -> raised=False  stub=False  finish='timeout'
+#
+# Both returned to the turn loop as a COMPLETED turn — the second presenting a
+# truncated answer as a whole one. Two independent causes, and the second is
+# the one that makes this worse than the bug it replaced:
+#
+# 1. `choices` WAS NOT EMPTY. A populated `choices` carrying a `finish_reason`
+#    is byte-identical in shape to a normal successful final chunk, so the
+#    consumer's choiceless-chunk path — the one that raises on error fields —
+#    never ran, and the nested `error` was never looked at.
+#
+# 2. The consumer's three dropped-stream detectors are all gated on
+#    `finish_reason is None`. Supplying ANY value turns all three off. Today a
+#    mid-decode cut is caught as a `length`-stamped partial stub and handled as
+#    truncation; a frame with a `finish_reason` removes that, which converts a
+#    DETECTED truncation into an undetected one. #904's own defect, one layer
+#    up, and undetectable in principle because the stream terminated cleanly.
+#
+# And `"timeout"` was never a legal value anyway. The OpenAI schema allows
+# exactly `stop`, `length`, `tool_calls`, `content_filter`, `function_call`;
+# strict validation raises on `"timeout"` and it survived only because the
+# streaming SDK path constructs leniently without validating. So it was
+# simultaneously the field that suppressed detection and out of spec.
+#
+# THE RULE: never stamp a `finish_reason` on a failure (samclaude-admin). It is
+# the field every client trusts to mean "completed normally", and a
+# plausible-looking value in it is worse than emitting no frame at all.
+#
+# So a failure frame is:
+#   choices: []                  <- the load-bearing one; makes it choiceless
+#   error_type / error_message   <- FLAT, top level; what a consumer reads
+#   error: {...}                 <- the rich object, kept beside them
+#   no finish_reason             <- absent, not "timeout", not "error"
+#
+# The flat pair is what raises; the nested object survives on the model's
+# extras for anyone who wants the deadline, the elapsed time and the token
+# count. Verified to produce, verbatim, through the consumer:
+#
+#   Provider stream returned an error event - upstream_timeout:
+#   generation exceeded OLLAMA_GENERATE_TIMEOUT=1800s after 1803s
+#
+# which is "the caller is told", and is not retried — a size fault retried is
+# three attempts dying at the same bound.
+#
+# Asserted by `test_stream_deadlines`: empty choices at all three sites, the
+# flat pair at all three, and ZERO `finish_reason` among them.
+_FAILURE_FRAME = "choices: [], flat error_type/error_message, no finish_reason"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest, http_request: Request = None):
     mm = await _resolve_model(req.model)
@@ -1540,7 +1600,11 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                                   "deadline_s": round(e.deadline, 1),
                                   "tokens_before_stall": e.tokens,
                                   "silent_for_s": round(e.silent_for, 1)},
-                        "choices": [{"delta": {}, "finish_reason": "stalled"}],
+                        # Failure frame — see _FAILURE_FRAME above for why
+                        # this shape and not a normal-looking final chunk.
+                        "error_type": "model_stalled",
+                        "error_message": e.detail,
+                        "choices": [],
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
                 except OllamaRequestTimeout as e:
@@ -1562,7 +1626,11 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                                   "deadline_s": round(e.deadline, 1),
                                   "elapsed_s": round(e.elapsed, 1),
                                   "tokens_before_timeout": e.tokens},
-                        "choices": [{"delta": {}, "finish_reason": "timeout"}],
+                        # Failure frame — see _FAILURE_FRAME above for why
+                        # this shape and not a normal-looking final chunk.
+                        "error_type": "request_timeout",
+                        "error_message": e.detail,
+                        "choices": [],
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
                 except Exception as e:
@@ -1575,7 +1643,11 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                     yield "data: " + json.dumps({
                         "error": {"message": f"{type(e).__name__}: {e}",
                                   "type": "stream_error"},
-                        "choices": [{"delta": {}, "finish_reason": "error"}],
+                        # Failure frame — see _FAILURE_FRAME above for why
+                        # this shape and not a normal-looking final chunk.
+                        "error_type": "stream_error",
+                        "error_message": f"{type(e).__name__}: {e}",
+                        "choices": [],
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
             return StreamingResponse(stream(), media_type="text/event-stream")

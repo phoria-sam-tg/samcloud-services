@@ -177,6 +177,7 @@ def main():
     config.OLLAMA_FIRST_TOKEN_RATE_TPS = 60
     config.OLLAMA_FIRST_TOKEN_MARGIN_S = 90
     config.OLLAMA_FIRST_TOKEN_MIN_S = 300
+    config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = 0
     d8 = config.ollama_first_token_deadline(8000)
     d70 = config.ollama_first_token_deadline(70000)
     check(8000 / 60 + 90 < 300,
@@ -264,6 +265,68 @@ def main():
     step(7, "the session is closed on every path")
     check(all(s.closed for s in SESSIONS),
           f"all {len(SESSIONS)} fake sessions closed in the finally")
+
+    step(13, "queue and prefill are separate terms, because they have "
+             "different shapes")
+    config.OLLAMA_GENERATE_TIMEOUT = 1800
+    config.OLLAMA_FIRST_TOKEN_MIN_S = 0       # isolate the arithmetic
+    config.OLLAMA_FIRST_TOKEN_RATE_TPS = 100
+    config.OLLAMA_FIRST_TOKEN_MARGIN_S = 0
+    config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = 0
+    bare_small = config.ollama_first_token_deadline(100)
+    bare_big = config.ollama_first_token_deadline(70000)
+    config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = 120
+    q_small = config.ollama_first_token_deadline(100)
+    q_big = config.ollama_first_token_deadline(70000)
+    check(q_small - bare_small == 120 and q_big - bare_big == 120,
+          "the queue term is ABSOLUTE — it adds the same 120s to a 100-token "
+          "prompt as to a 70,000-token one, because a 15-token prompt waited "
+          "72s for the slot and waiting does not scale with the prompt")
+    check(bare_big - bare_small == (70000 - 100) / 100,
+          "the prefill term SCALES — that is the part "
+          "`prompt_eval_duration` measures, and the only part it measures")
+    # If the queue term were folded into the rate instead, it would have to be
+    # a much slower rate, which would over-allow long prompts by the same
+    # factor it under-allows short ones. Show that the two models diverge.
+    config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = 0
+    config.OLLAMA_FIRST_TOKEN_RATE_TPS = 50   # "absorb" queueing by halving it
+    folded_small = config.ollama_first_token_deadline(100)
+    folded_big = config.ollama_first_token_deadline(70000)
+    check(folded_small < 120,
+          f"folding queueing into the rate CANNOT cover a short prompt's "
+          f"72s wait ({folded_small:.0f}s for 100 tokens) — the absolute "
+          f"term is not expressible as a rate")
+    check(folded_big > q_big,
+          f"...while over-allowing a long one ({folded_big:.0f}s vs "
+          f"{q_big:.0f}s), so the deadline stops firing when it should")
+
+    step(14, "arming the rate without a queue allowance is called out")
+    import logging as _l
+    seen = []
+    h = type("H", (_l.Handler,), {"emit": lambda _s, r: seen.append(r.getMessage())})()
+    config.OLLAMA_FIRST_TOKEN_RATE_TPS = 100
+    config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = 0
+    config.log.addHandler(h)
+    config._warn_if_rate_armed_without_queue_allowance()
+    config.log.removeHandler(h)
+    check(len(seen) == 1 and "reported as a stalled prefill" in seen[0],
+          "a rate with no queue term warns: the rate measures compute, the "
+          "deadline bounds queue+prefill, and the difference was ~40x here")
+    seen.clear()
+    config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = 120
+    config.log.addHandler(h)
+    config._warn_if_rate_armed_without_queue_allowance()
+    config.log.removeHandler(h)
+    check(not seen, "both set: silent")
+    seen.clear()
+    config.OLLAMA_FIRST_TOKEN_RATE_TPS = 0
+    config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = 0
+    config.log.addHandler(h)
+    config._warn_if_rate_armed_without_queue_allowance()
+    config.log.removeHandler(h)
+    check(not seen,
+          "and UNARMED is silent too — the shipped default must not warn, or "
+          "every box logs it forever and nobody reads it")
 
     step(11, "shipped default: the deadline is NOT armed, because nothing "
              "measures prefill on this backend yet")

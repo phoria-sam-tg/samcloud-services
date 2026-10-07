@@ -2,6 +2,48 @@
 
 Project history and current state. This is a living document.
 
+## 2026-10-08 — The first-token budget is queue + prefill, not one rate (#904)
+
+- **The trap, raised by `samclaude-admin` and `claude-containers` on #903 after
+  #39 was already approved.** Our first-token clock starts when the POST
+  returns headers, which Ollama sends on *accepting* a request — before the
+  model is scheduled. So the silence it bounds is **queue + prefill**, while
+  `prompt_eval_duration` measures **prefill alone**. Arming the first with the
+  second makes contention trip a prefill guard: a request killed for being slow
+  when it was only waiting, and reported as a stall.
+- **It is the `sock_read` trap a second time** — a more legible failure that is
+  wrong more often — and the gap is not absorbable. Measured on this box, 73.8s
+  of wall against 1.8s of compute: **~40x**.
+- **Three terms, because they have three shapes.** Folding them is what makes
+  the number wrong, and the test shows the two models diverge rather than
+  arguing it:
+
+  | term | shape | measured from |
+  |---|---|---|
+  | `..._QUEUE_ALLOWANCE_S` | **absolute** | the `queued ~Ns` field, under real contention |
+  | `tokens / ..._RATE_TPS` | **scales** | `prompt_eval_duration` — immune to contention |
+  | `..._MARGIN_S` | absolute | post-prefill model behaviour |
+
+  A 15-token prompt waited 72s, so waiting does not scale with the prompt and
+  cannot be expressed as a rate. Halving the rate to "absorb" queueing covers
+  neither end: it still cannot give a 100-token prompt 120s, and it
+  over-allows a 70,000-token one — so the deadline stops firing when it should.
+- **Rejected: don't count queue time at all**, by tracking our own in-flight
+  requests. It only sees OUR queue. The exo `think` tier and every other
+  consumer of this box are invisible to it — the same blind spot `foreign_mb`
+  has, for the same reason (#861) — so it would under-allow exactly when
+  contention is worst.
+- **Arming the rate without a queue term now warns**, naming the failure
+  (`reported as a stalled prefill`) rather than the setting. Silent when both
+  are set and silent when unarmed, so the shipped default logs nothing.
+- **And the 120s datapoint is an upper bound, not a prefill measurement.**
+  `waiting for stream response (120s, first_chunk)` is wall-clock from the
+  caller's side, so it contains the same queueing; the seat cannot decompose it
+  (`api_call_count: 0` for this provider). Read as "the seat waits up to 120s
+  before first output at today's context", which is what a timeout has to
+  cover — not as "prefill takes 120s", which would size the deadline too
+  generously to fire.
+
 ## 2026-10-08 — Streaming deadlines: silence is bounded, elapsed time is not (#904)
 
 - **The rule**, `claude-containers`' phrasing and better than anything else on

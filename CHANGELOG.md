@@ -2,6 +2,43 @@
 
 Project history and current state. This is a living document.
 
+## 2026-10-08 — A route is bound to a handler, and nothing asserted which (#904)
+
+- **`_log_ollama_timings` was inserted between `@app.post("/v1/chat/completions")`
+  and `async def chat_completions`, so the decorator bound the HELPER.** The path
+  still existed; `chat_completions` became unreachable. `model: str` turned into
+  a required **query** parameter and `chunk: dict` into the body, so a normal
+  request with a JSON body and no query string was rejected before anything ran.
+  **Every POST to Hermes' surface 422'd — 100% failure, strictly worse than the
+  22% cap it shipped beside, and it never reached the model.**
+- **It got to `main` and into the staged deploy clone.** The only reason the
+  service kept serving is that the running process had loaded the old module at
+  import three days earlier. Caught by `samclaude-admin` reading the diff, not
+  by anything in this repo. The deploy clone was rolled back to `6691982`
+  immediately — a fix to `main` alone would have left the landmine staged.
+- **Why 51 checks and nine mutations missed it.** Both branches register the
+  same number of routes: **the count did not change, the binding did.** Nothing
+  asserted which handler a path resolves to, and no test went through the ASGI
+  app at all — the deadline logic was tested directly while the route that
+  reaches it was not. That is this repo's own "assert a count, not a presence"
+  rule one level up, with the count right and the binding wrong. Third time in
+  two days that a number measured something other than what it looked like.
+- **`test_route_bindings`** pins the whole path -> handler table as an
+  independent statement of intent (derived from the app, it would have agreed
+  with the bug). Four more properties beyond the table, because the failure mode
+  is "a helper lands under a decorator" and any insertion can cause it:
+  **no `_private` name may be routed** — which catches it without the table
+  being up to date; the table must still cover what the app serves, so a new
+  endpoint cannot quietly fall outside it; no path may resolve to two handlers;
+  and **one real POST through the ASGI app**, asserting specifically that
+  `model` is not demanded as a query parameter. Verified by reintroducing the
+  defect: 5 checks fail, including the live 422.
+- **And the stale figure in `config.py` is corrected** — it still carried "121 x
+  200 and 17 x 500, ALL SEVENTEEN at 5m0s", wrong three ways: the denominator
+  spanned two days while every cut-off was on one, five of those 17 were the
+  CALLER disconnecting at ~180s, and six of ours were logged `200`. That file is
+  what a future reader consults first, so the repo was contradicting itself.
+
 ## 2026-10-08 — The first-token budget is queue + prefill, not one rate (#904)
 
 - **The trap, raised by `samclaude-admin` and `claude-containers` on #903 after

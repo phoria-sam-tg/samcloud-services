@@ -1301,7 +1301,6 @@ def _openai_shape_vlm(data: dict) -> dict:
     return data
 
 
-@app.post("/v1/chat/completions")
 def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):
     """Log prefill and decode rates off the `done` chunk (#904).
 
@@ -1371,6 +1370,7 @@ def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):
         log.info(f"Ollama timings for {model}: " + "; ".join(bits))
 
 
+@app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest, http_request: Request = None):
     mm = await _resolve_model(req.model)
     if not mm:

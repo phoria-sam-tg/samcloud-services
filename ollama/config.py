@@ -523,12 +523,26 @@ FFMPEG_BIN = _env("FFMPEG_BIN", shutil.which("ffmpeg") or "/opt/homebrew/bin/ffm
 # steadily was killed at 300s for being long, which is the one thing that is
 # not a fault.
 #
-# Measured on slice, /api/chat for 2026-10-07/08: 121 x 200 and 17 x 500, and
-# ALL SEVENTEEN of the 500s at exactly `5m0s`. Every one was hermes-assistant
-# (#884), during a delivery test whose results were partly this cap. Successful
-# durations the same day: 34s, 51s, 1m50s, 2m14s, 2m24s, 4m15s — the
-# distribution already touched the ceiling, so 4m15s was a near miss and not a
-# comfortable margin.
+# Measured on slice 2026-10-08, counting `Stream error` in the gateway's own
+# `server.log` and NOT Ollama's status column: **18 cut-offs in 81 /api/chat
+# requests, 22%**. The status column undercounts because our abort races the
+# response completion — 11 were logged `500 | 5m0s` and 6 were logged
+# `200 | 5m0s`, the same event recorded as a success.
+#
+# An earlier version of this comment said "121 x 200 and 17 x 500, ALL
+# SEVENTEEN at 5m0s", which was wrong three ways and is corrected here because
+# this is the file a future reader consults first. The denominator spanned two
+# days while every cut-off was on one; FIVE of those 17 were at ~3m0s and were
+# the CALLER disconnecting at ~180s, not us; and six of ours were invisible in
+# the status column entirely.
+#
+# The longest request that actually COMPLETED that day ran 285.0s — fifteen
+# seconds under the wall. So the near miss was tight, not comfortable.
+#
+# What it did NOT cause: 18 visible failures. The seat's adapter journal shows
+# three consecutive turns of 56, 50 and 31 minutes all completing. A turn makes
+# many requests and Hermes retried across the boundary, so the cost was latency
+# and a wasted inference slot rather than a broken answer.
 #
 # The shape is taken from the exo pool, which already has it and has the
 # measurements behind it (EXO_STALL_TIMEOUT / EXO_FIRST_TOKEN_*, #830). What

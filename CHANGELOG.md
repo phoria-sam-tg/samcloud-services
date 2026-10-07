@@ -2,6 +2,56 @@
 
 Project history and current state. This is a living document.
 
+## 2026-10-08 — The inter-token bound was my own regression, found live (#904)
+
+- **I shipped 60s and it aborted a third of real traffic.** Within six minutes
+  of the #904 rollout, **2 of the first 6 requests** died: `13 chunks then 60s
+  of silence` and `15 chunks then 60s of silence`. That is a **33% abort rate,
+  worse than the 22%** the elapsed-time cap was causing. Found in the live log,
+  not in review, not by a test.
+- **How it got in.** 60 was `EXO_STALL_TIMEOUT` — a *measured* figure for a
+  different backend (p99 52-65ms between tokens, worst healthy gap 3.511s). The
+  comment beside it said *"this backend has not been characterised to the same
+  depth"* and shipped the tight number anyway. In the **same change** I removed
+  a guessed 60 tok/s from `OLLAMA_FIRST_TOKEN_RATE_TPS` on exactly that
+  reasoning. The discipline was applied to one constant and not to its
+  neighbour.
+- **300 is the faithful translation, and the number was never the bug.** The
+  httpx sync path has always used `read=300`, a per-chunk **idle** bound —
+  "300s of silence". #904 was transcribing that into aiohttp's wall-clock
+  `total`. So restoring the semantics while *keeping* the number is the correct
+  fix; tightening it on the way past was a second change smuggled into the
+  first. Inter-token gaps here are still uncharacterised — what is now known is
+  that they exceed 60s in normal operation.
+- **A cache hit is not a rate either.** The live instrument immediately
+  produced `prefill 76321 tok in 22.73s = 3358.2 tok/s`. Ollama reports
+  `prompt_eval_count` as the whole prompt but `prompt_eval_duration` as only
+  the part it evaluated, so KV reuse divides a big count by a tiny duration.
+  `_MAX_PLAUSIBLE_TOK_S = 400` names those rows `cache hit` and keeps the
+  count, which is the useful half.
+- **And that filter loses nothing**, because of `claude-wafer-services`' reuse
+  rule (#904): ollama reuses the cache only when the new prompt is a strict
+  token-prefix **extension** of the cached one. Appending a turn qualifies;
+  rewriting earlier content does not — so **a context-compression event
+  guarantees a cold prefill on the very next request, at the largest prompt
+  size in the conversation.** The cache never helps where the budget is tested,
+  and the rows surviving the ceiling are exactly the cold prefills anyone
+  wanted.
+- **Three live measurements the rollout immediately produced**, which four
+  weeks of `pipeline.go` could not:
+
+  | | |
+  |---|---|
+  | decode rate | **11.7 and 21.6 tok/s** — the 1800s ceiling's decode budget was assumed, now measured |
+  | our token count vs ollama's | **201,746 vs 76,321** — the 1.5 chars/token estimate over-counts **2.64x** on real traffic |
+  | queue residue | `queued ~55.7s (82% of wall)` on one request |
+- **And the armed/not-armed line claimed a state it was not in.** It logged
+  `armed ... (201399 tokens / 0 tok/s + 90s)` on a box with no measured rate,
+  because the branch keyed on *whether the prompt was counted* rather than on
+  whether the deadline was armed — displaying the zero it had divided by. Same
+  class as everything else on this ticket, in the line whose whole job is to
+  say which state the mechanism is in.
+
 ## 2026-10-08 — A quotient under a token floor is not a rate (#904)
 
 - **Found by `claude-wafer-services` while sweeping with `num_predict:1`**, and

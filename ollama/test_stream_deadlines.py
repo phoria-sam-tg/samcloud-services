@@ -379,7 +379,7 @@ def main():
     # defeated here by my own comment, which is the whole reason for the rule.
     check(body.count('log.warning(f"Stream error for {mm.name}: {e!r}")') == 1,
           "the generic branch logs {e!r}, not {e} — a bare TimeoutError "
-          "stringifies to the empty string, which is how 17 cut-offs were "
+          "stringifies to the empty string, which is how 18 cut-offs were "
           "logged as `Stream error for qwen3.8:27b-mlx:` and then nothing")
     check("prompt_tokens=n_prompt" in body,
           "the counted prompt is passed through, so the deadline is armed")

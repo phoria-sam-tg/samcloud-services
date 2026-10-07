@@ -26,6 +26,24 @@ once and it completed — bash had buffered enough of the file — but it
 re-reads from a byte offset, so a script that changes size under itself can
 execute garbage. Not a property to rely on.
 
+**Then verify the clone, from inside the clone, before you restart anything.**
+Not your checkout — the thing that is about to be served:
+
+```sh
+cd ~/var/samcloud-services-deploy
+.venv/bin/python -m ollama.test_route_bindings    # every path -> its own handler
+.venv/bin/python -m ollama.test_num_ctx
+.venv/bin/python -m ollama.test_stream_deadlines
+```
+
+`test_route_bindings` is first because of #904, where a helper inserted between
+`@app.post("/v1/chat/completions")` and its handler bound the **helper**. The
+route count was unchanged, 51 other checks passed, `main` merged it and
+`rollout.sh` staged it — and every POST to that path would have 422'd on the
+next restart. The running process was serving a module it had loaded three days
+earlier, which is the only thing that hid it. **A clone that imports is not a
+clone that routes**, and the difference is invisible until something restarts.
+
 Then, separately and idle-gated:
 
 ```sh

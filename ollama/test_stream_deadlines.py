@@ -404,6 +404,13 @@ def main():
     check("our count" in fn,
           "our token count is logged beside ollama's own, turning the "
           "chars/token estimate into a checkable number")
+    check("queued ~" in fn,
+          "the queue residue is stated, not left as arithmetic — it is the "
+          "field the #904 correlation gets sorted on, and a correlation that "
+          "needs read-and-subtract per line gets done on three samples")
+    check("gap > 0.5" in fn,
+          "...and only when it is real, so the normal path does not carry a "
+          "`queued ~0.0s` that teaches its reader to skip the line")
 
     print(f"\n{'='*66}")
     print(f"  {checks - len(failures)}/{checks} checks passed")

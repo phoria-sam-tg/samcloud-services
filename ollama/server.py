@@ -1340,10 +1340,29 @@ def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):
     if ec and ed:
         bits.append(f"decode {ec} tok in {ed / 1e9:.2f}s "
                     f"= {ec / (ed / 1e9):.1f} tok/s")
-    if chunk.get("total_duration"):
-        # Includes queue wait, so it is NOT prefill + decode. Named as wall so
+    total = chunk.get("total_duration")
+    if total:
+        # Includes queue wait, so it is NOT prefill + decode. Named `wall` so
         # nobody derives a rate from it.
-        bits.append(f"wall {chunk['total_duration'] / 1e9:.1f}s")
+        bits.append(f"wall {total / 1e9:.1f}s")
+        # And the gap stated outright rather than left as arithmetic. This is
+        # the field the #904 correlation is done on: `samclaude-admin` can say
+        # what the seat was doing at a given moment (turn boundaries, adapter
+        # count, tool-call bursts, the `think` tier) but cannot see a request's
+        # durations; we can see the durations but not what held the slot.
+        # Finding the outliers has to be a sort, not a read-and-subtract, or
+        # the correlation does not get done on more than three samples.
+        #
+        # `queued` is the honest name for the residue: it is everything
+        # total_duration counts that is not prefill or decode, which is
+        # dominated by waiting for the single inference slot but is not
+        # exclusively that. Measured 73.8s wall against 1.8s of compute on a
+        # 15-token prompt, so this is the term that makes an elapsed-time
+        # budget unsafe — a request can spend all of it without working.
+        gap = (total - (pd or 0) - (ed or 0)) / 1e9
+        if gap > 0.5:
+            bits.append(f"queued ~{gap:.1f}s ({100 * gap / (total / 1e9):.0f}% "
+                        f"of wall)")
     if counted and pc:
         drift = counted - pc
         bits.append(f"our count {counted} vs ollama {pc} "

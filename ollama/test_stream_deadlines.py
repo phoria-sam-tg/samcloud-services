@@ -452,25 +452,46 @@ def main():
     check("prompt_tokens=n_prompt" in body,
           "the counted prompt is passed through, so the deadline is armed")
 
-    step(16, "a failure frame never carries a finish_reason")
+    step(16, "a failure frame is DETECTABLE, not merely honest")
+    # The rule is "never stamp a finish_reason a client could read as
+    # SUCCESS", not "never stamp one". samclaude-admin read Hermes' source:
+    #   _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
+    #   if not text: return None            <- needs non-empty content
+    #   if reason not in that set: return None
+    # So "stalled"/"timeout" were invisible (not in the set) and `choices: []`
+    # — the first fix — is invisible for BOTH reasons. Asserting the exact
+    # JSON-key forms, not substrings: the comments here discuss these fields
+    # in prose and a presence check passes on reverted code
+    # (claude-wafer-services; and my own {e!r} trap one step down).
     srv_s = open(os.path.join(os.path.dirname(__file__), "server.py")).read()
     ob = srv_s.split("if mm.backend == Backend.OLLAMA:", 1)[1].split(
         'return StreamingResponse(stream(), media_type="text/event-stream")', 1)[0]
-    for bad in ('"finish_reason": "stalled"', '"finish_reason": "timeout"',
-                '"finish_reason": "error"'):
+    for bad in ('"finish_reason": "stalled"', '"finish_reason": "timeout"'):
         check(bad not in ob,
-              f'no {bad} — `finish_reason` is the field every client trusts '
-              f'to mean "completed normally", so a plausible value there is '
-              f'worse than sending no frame at all')
-    check(ob.count('"choices": [],') == 3,
-          f'all three failure frames send `choices: []` '
-          f'({ob.count(chr(34) + "choices" + chr(34) + ": [],")})')
+              f'no {bad} — an unrecognised reason degrades to "assume '
+              f'normal" in most clients, which is the actual defect: those '
+              f'frames did not merely lie, they fell through to success')
+    check(ob.count('"choices": [],') == 0,
+          f'and NOT `choices: []` either ({ob.count(chr(34)+"choices"+chr(34)+": [],")})'
+          f' — it has neither text nor a reason, so it is invisible twice over')
+    check(ob.count('"finish_reason": _FAILURE_FINISH_REASON') == 3,
+          f'all three failure frames use the one conventional failure value '
+          f'({ob.count(chr(34)+"finish_reason"+chr(34)+": _FAILURE_FINISH_REASON")})')
+    check('_FAILURE_FINISH_REASON = "error"' in srv_s,
+          '...which is "error" — the one value no client reads as normal '
+          'completion')
+    check(ob.count('"delta": {"content":') == 3,
+          f'each carries NON-EMPTY content, because the guard needs text as '
+          f'well as a reason ({ob.count(chr(34)+"delta"+chr(34)+": {"+chr(34)+"content"+chr(34)+":")})')
     check(ob.count('"error_type":') == 3 and ob.count('"error_message":') == 3,
-          "...with the cause at TOP level as well as nested, because a "
-          "consumer reading only the OpenAI shape never opens the nested one")
+          "...and the cause at TOP level too, for a client that reads only "
+          "the canonical shape and never opens the nested object")
+    check(ob.count('"error": {') == 3,
+          "the nested object is KEPT beside them, so deadline_s / elapsed_s / "
+          "tokens_before_* survive for anything reading extras")
     check('"finish_reason": finish' in ob,
-          "and the SUCCESS frame still carries one — the rule is about "
-          "failures, not about removing the field")
+          "and the SUCCESS frame is untouched — the rule is about which "
+          "value, not about removing the field")
 
     step(15, "the armed/not-armed line reports the state it is actually in")
     # Caught in the live log a minute after the #904 restart: the branch keyed

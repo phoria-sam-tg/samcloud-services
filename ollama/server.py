@@ -1353,9 +1353,44 @@ def _rate(count: int, duration_ns: int, unit: str,
 # So: `choices: []`, the cause at top level where the OpenAI shape puts it, and
 # the rich nested object kept for anything that wants the detail. Asserted by
 # `test_stream_deadlines`.
-_FAILURE_FRAME_RULE = (
-    "choices must be empty and no finish_reason may appear on a failure frame"
-)
+# THE REFINED RULE, after samclaude-admin read Hermes' actual source:
+#
+#   never stamp a finish_reason A CLIENT COULD READ AS SUCCESS.
+#
+# Not "never stamp one at all", which is what the first fix said and which is
+# wrong for this surface. Hermes' guard is a closed set:
+#
+#   _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
+#   if not text: return None                      <- needs NON-EMPTY content
+#   if finish_reason not in that set: return None  <- needs a KNOWN reason
+#
+# So `choices: []` is invisible to it for BOTH reasons — no text and no
+# reason — and `"stalled"`/`"timeout"` were invisible because they are not in
+# the set. An unrecognised custom reason degrades to "assume normal" in most
+# clients, which is the actual defect: the original frames did not merely lie,
+# they fell through to success.
+#
+# `"error"` is the conventional failure value and is the one value no client
+# reads as normal completion. So the frame carries all three shapes at once:
+#
+#   finish_reason "error" + the cause in delta.content   the provider
+#                                                        convention Hermes
+#                                                        and others detect
+#   top-level error_type / error_message                 the canonical shape,
+#                                                        for a client that
+#                                                        reads only that
+#   the nested `error` object                            deadline_s, elapsed_s,
+#                                                        tokens_before_* for
+#                                                        anything reading extras
+#
+# THE COST, stated because it is real: a client that ignores `finish_reason`
+# entirely will concatenate the cause into the answer text. That is accepted
+# deliberately — the answer is already truncated and wrong, so a visible
+# marker in it beats silence. Fixing this in Hermes' vendored client instead
+# would mean patching it for every provider that invents a reason; the gateway
+# speaking the convention clients already handle is the right layer
+# (samclaude-admin).
+_FAILURE_FINISH_REASON = "error"
 
 
 def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):
@@ -1554,8 +1589,8 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                         # OpenAI shape never opens the nested object.
                         "error_type": "model_stalled",
                         "error_message": e.detail,
-                        # EMPTY. See _FAILURE_FRAME_RULE.
-                        "choices": [],
+                        "choices": [{"delta": {"content": e.detail},
+                                     "finish_reason": _FAILURE_FINISH_REASON}],
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
                 except OllamaRequestTimeout as e:
@@ -1579,7 +1614,8 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                                   "tokens_before_timeout": e.tokens},
                         "error_type": "request_timeout",
                         "error_message": e.detail,
-                        "choices": [],
+                        "choices": [{"delta": {"content": e.detail},
+                                     "finish_reason": _FAILURE_FINISH_REASON}],
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
                 except Exception as e:
@@ -1594,7 +1630,8 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                                   "type": "stream_error"},
                         "error_type": "stream_error",
                         "error_message": f"{type(e).__name__}: {e}",
-                        "choices": [],
+                        "choices": [{"delta": {"content": f"{type(e).__name__}: {e}"},
+                                     "finish_reason": _FAILURE_FINISH_REASON}],
                     }) + "\n\n"
                     yield "data: [DONE]\n\n"
             return StreamingResponse(stream(), media_type="text/event-stream")

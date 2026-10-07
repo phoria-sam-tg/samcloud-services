@@ -26,14 +26,24 @@ once and it completed — bash had buffered enough of the file — but it
 re-reads from a byte offset, so a script that changes size under itself can
 execute garbage. Not a property to rely on.
 
-**Then verify the clone, from inside the clone, before you restart anything.**
-Not your checkout — the thing that is about to be served:
+**`rollout.sh` verifies the route bindings itself and refuses (exit 7) if they
+are wrong**, restoring the clone to where it was — the same treatment a failed
+pip install gets, because a staged commit that cannot route is just as fatal as
+one whose dependencies are missing. You do not have to remember that one.
+
+It is *skipped with a note*, not failed, on a commit that predates
+`ollama/test_route_bindings` (#40) — otherwise the gate would block a rollback
+to a pre-#40 commit, which is exactly the move #904 needed in a hurry.
+
+**The other two suites are still yours to run, from inside the clone, before
+you restart anything.** Not your checkout — the thing that is about to be
+served:
 
 ```sh
 cd ~/var/samcloud-services-deploy
 .venv/bin/python -m ollama.test_route_bindings    # every path -> its own handler
-.venv/bin/python -m ollama.test_num_ctx
-.venv/bin/python -m ollama.test_stream_deadlines
+.venv/bin/python -m ollama.test_num_ctx           # not gated: asserts logic, not the surface
+.venv/bin/python -m ollama.test_stream_deadlines  # not gated: asserts logic, not the surface
 ```
 
 `test_route_bindings` is first because of #904, where a helper inserted between

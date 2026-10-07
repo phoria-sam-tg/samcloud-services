@@ -384,6 +384,27 @@ def main():
     check("prompt_tokens=n_prompt" in body,
           "the counted prompt is passed through, so the deadline is armed")
 
+    step(12, "the rate gets measured from real traffic, not a synthetic sweep")
+    check("def _log_ollama_timings(" in srv,
+          "the done chunk's timings are logged — `/api/chat` returns "
+          "prompt_eval_duration and eval_duration, which we were already "
+          "half-reading for `usage` and throwing away")
+    check(srv.count("_log_ollama_timings(mm.name, chunk, n_prompt)") == 2,
+          f"on BOTH ollama paths, streaming and collect "
+          f"({srv.count('_log_ollama_timings(mm.name, chunk, n_prompt)')}) — "
+          f"one of two would silently halve the sample")
+    fn = srv.split("def _log_ollama_timings(", 1)[1].split("\ndef ", 1)[0]
+    check("prompt_eval_duration" in fn and "eval_duration" in fn,
+          "both durations, so prefill and decode are separable — which is "
+          "what nobody could do when today's 5-minute requests were triaged")
+    check("wall" in fn and "queue" in fn,
+          "total_duration is labelled `wall` and documented as including "
+          "queue wait: it was 73.8s on a prompt whose compute took 1.8s, so a "
+          "rate derived from it would be wrong by 40x")
+    check("our count" in fn,
+          "our token count is logged beside ollama's own, turning the "
+          "chars/token estimate into a checkable number")
+
     print(f"\n{'='*66}")
     print(f"  {checks - len(failures)}/{checks} checks passed")
     if failures:

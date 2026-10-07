@@ -1302,6 +1302,56 @@ def _openai_shape_vlm(data: dict) -> dict:
 
 
 @app.post("/v1/chat/completions")
+def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):
+    """Log prefill and decode rates off the `done` chunk (#904).
+
+    THIS IS THE MEASUREMENT BOTH #903 AND #904 ARE WAITING ON, and it costs
+    nothing to take. The claim on #904 was that this backend emits no
+    per-request timings — true of `ollama.log`, where the `slot print_timing`
+    lines stop at 2026-09-30 and come from a llama.cpp runner. It is NOT true
+    of the API: `/api/chat` returns `prompt_eval_count` /
+    `prompt_eval_duration` / `eval_count` / `eval_duration` on the final chunk,
+    verified on the live 27b on 2026-10-08. We were already reading two of
+    those four for `usage` and throwing the durations away.
+
+    So the prefill rate gets measured from REAL hermes traffic — real prompt
+    shapes, real sizes — rather than from a synthetic sweep that would occupy
+    the single inference slot for half an hour. Nothing to schedule and nothing
+    to interrupt.
+
+    `prompt_eval_count` is also Ollama's OWN count of the prompt, so logging it
+    beside ours turns `prompt_size.count`'s estimate into a checkable number
+    instead of a hope — the same drift check the pool does (`_check_drift`).
+
+    One number NOT to read as compute: `total_duration` was 73.8s on a 15-token
+    prompt whose prefill and decode together took 1.8s. The rest is queueing
+    behind another request for the single slot. That gap is exactly why an
+    elapsed-time bound is the wrong instrument — a request can spend its whole
+    budget waiting rather than working.
+    """
+    pc = chunk.get("prompt_eval_count")
+    pd = chunk.get("prompt_eval_duration")
+    ec = chunk.get("eval_count")
+    ed = chunk.get("eval_duration")
+    bits = []
+    if pc and pd:
+        bits.append(f"prefill {pc} tok in {pd / 1e9:.2f}s "
+                    f"= {pc / (pd / 1e9):.0f} tok/s")
+    if ec and ed:
+        bits.append(f"decode {ec} tok in {ed / 1e9:.2f}s "
+                    f"= {ec / (ed / 1e9):.1f} tok/s")
+    if chunk.get("total_duration"):
+        # Includes queue wait, so it is NOT prefill + decode. Named as wall so
+        # nobody derives a rate from it.
+        bits.append(f"wall {chunk['total_duration'] / 1e9:.1f}s")
+    if counted and pc:
+        drift = counted - pc
+        bits.append(f"our count {counted} vs ollama {pc} "
+                    f"({drift:+d}, {100 * drift / pc:+.0f}%)")
+    if bits:
+        log.info(f"Ollama timings for {model}: " + "; ".join(bits))
+
+
 async def chat_completions(req: ChatRequest, http_request: Request = None):
     mm = await _resolve_model(req.model)
     if not mm:
@@ -1370,6 +1420,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                             delta["tool_calls"] = _fix_tool_calls(chunk["message"]["tool_calls"])
                             saw_tool_calls = True
                         if chunk.get("done"):
+                            _log_ollama_timings(mm.name, chunk, n_prompt)
                             finish = "tool_calls" if saw_tool_calls else "stop"
                             yield "data: " + json.dumps({
                                 "choices": [{"delta": {}, "finish_reason": finish}]
@@ -1464,6 +1515,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                     if chunk["message"].get("tool_calls"):
                         tool_calls = chunk["message"]["tool_calls"]
                 if chunk.get("done"):
+                    _log_ollama_timings(mm.name, chunk, n_prompt)
                     usage = {
                         "prompt_tokens": chunk.get("prompt_eval_count", 0),
                         "completion_tokens": chunk.get("eval_count", 0),

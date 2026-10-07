@@ -91,8 +91,23 @@ Project history and current state. This is a living document.
   which pins a window, and invisible to `test_stream_deadlines` alone. And the
   unknown-prompt message was unreachable: with no token count the first-token
   budget IS the request budget, so `bounded_by_request` always won.
-- **Still outstanding.** The prefill rate, which is also what #903 needs to
-  know what 70,000 tokens costs. And `wafer-services/model-service` is a
+- **The prefill rate is measurable for free, and now is.** The claim that this
+  backend emits no per-request timings is true of `ollama.log` and **not of the
+  API**: `/api/chat` returns `prompt_eval_count`, `prompt_eval_duration`,
+  `eval_count` and `eval_duration` on the final chunk — verified on the live
+  27b — and we were already reading two of those four for `usage` while
+  throwing the durations away. `_log_ollama_timings` logs prefill and decode
+  rates on both ollama paths, so the rate arrives from REAL hermes traffic
+  instead of from a synthetic sweep that would hold the single inference slot
+  for half an hour. It also logs our token count beside Ollama's own, which
+  turns `prompt_size.count`'s estimate into a checkable number.
+- **One number not to read as compute.** `total_duration` was **73.8s** on a
+  15-token prompt whose prefill and decode together took **1.8s** — the rest is
+  queueing for the single slot. A rate derived from it would be wrong by 40x,
+  so it is logged as `wall`. It is also a second argument against elapsed-time
+  bounds: a request can spend its whole budget waiting rather than working.
+- **Still outstanding.** The measured rate itself, which is also what #903
+  needs to know what 70,000 tokens costs. And `wafer-services/model-service` is a
   declared mirror carrying the same `total=300`; the repo fix covers both, its
   rollout does not.
 

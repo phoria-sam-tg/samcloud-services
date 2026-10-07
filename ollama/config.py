@@ -523,12 +523,26 @@ FFMPEG_BIN = _env("FFMPEG_BIN", shutil.which("ffmpeg") or "/opt/homebrew/bin/ffm
 # steadily was killed at 300s for being long, which is the one thing that is
 # not a fault.
 #
-# Measured on slice, /api/chat for 2026-10-07/08: 121 x 200 and 17 x 500, and
-# ALL SEVENTEEN of the 500s at exactly `5m0s`. Every one was hermes-assistant
-# (#884), during a delivery test whose results were partly this cap. Successful
-# durations the same day: 34s, 51s, 1m50s, 2m14s, 2m24s, 4m15s — the
-# distribution already touched the ceiling, so 4m15s was a near miss and not a
-# comfortable margin.
+# Measured on slice 2026-10-08, counting `Stream error` in the gateway's own
+# `server.log` and NOT Ollama's status column: **18 cut-offs in 81 /api/chat
+# requests, 22%**. The status column undercounts because our abort races the
+# response completion — 11 were logged `500 | 5m0s` and 6 were logged
+# `200 | 5m0s`, the same event recorded as a success.
+#
+# An earlier version of this comment said "121 x 200 and 17 x 500, ALL
+# SEVENTEEN at 5m0s", which was wrong three ways and is corrected here because
+# this is the file a future reader consults first. The denominator spanned two
+# days while every cut-off was on one; FIVE of those 17 were at ~3m0s and were
+# the CALLER disconnecting at ~180s, not us; and six of ours were invisible in
+# the status column entirely.
+#
+# The longest request that actually COMPLETED that day ran 285.0s — fifteen
+# seconds under the wall. So the near miss was tight, not comfortable.
+#
+# What it did NOT cause: 18 visible failures. The seat's adapter journal shows
+# three consecutive turns of 56, 50 and 31 minutes all completing. A turn makes
+# many requests and Hermes retried across the boundary, so the cost was latency
+# and a wasted inference slot rather than a broken answer.
 #
 # The shape is taken from the exo pool, which already has it and has the
 # measurements behind it (EXO_STALL_TIMEOUT / EXO_FIRST_TOKEN_*, #830). What
@@ -572,16 +586,53 @@ OLLAMA_STALL_TIMEOUT = _env_int("OLLAMA_STALL_TIMEOUT", 60)
 # nothing is unguarded by leaving this off.
 #
 # Same convention as FOREIGN_IDLE_MB (#861): no default, and a box that has not
-# measured its own floor does not get the mechanism. Measure with a prompt
-# sweep (8k/16k/32k/70k), then set it to a rate BELOW every sample so it is a
-# floor and not an average.
+# measured its own floor does not get the mechanism.
+#
+# **THE RATE IS NOT `prompt_eval_duration`, AND THIS IS THE TRAP.** Our clock
+# starts when the POST returns headers, which Ollama sends on ACCEPTING the
+# request — before the model is scheduled. So the silence this deadline bounds
+# is `queue + prefill`, while `prompt_eval_duration` measures prefill alone.
+# Arming the first one with the second makes contention trip a prefill guard:
+# a request killed for being slow when it was only waiting, and reported as a
+# stall. That is the `sock_read` trap again — a more legible failure that is
+# wrong more often. Raised by samclaude-admin and claude-containers on #903
+# after the 73.8s-wall-against-1.8s-of-compute measurement, where the gap
+# between the two framings was ~40x: far too large to absorb in a margin.
+#
+# So the budget has THREE terms, because they have different shapes:
+#
+#   QUEUE_ALLOWANCE_S   absolute       waiting for the single slot. Does NOT
+#                                      scale with the prompt — a 15-token
+#                                      prompt waited 72s. Measure from the
+#                                      `queued ~Ns` field in the timing log,
+#                                      and measure it under REPRESENTATIVE
+#                                      contention, not on an idle box.
+#   tokens / RATE_TPS   scales         prefill compute. THIS is what
+#                                      `prompt_eval_duration` measures, and it
+#                                      is immune to contention because it
+#                                      times the model and not the clock.
+#   MARGIN_S            absolute       everything else (KV transition, etc).
+#
+# Rejected alternative: don't count queue time, by tracking our own in-flight
+# requests. It only sees OUR queue. The exo `think` tier and every other
+# consumer of this box are invisible to it — the same blind spot `foreign_mb`
+# has and for the same reason (#861) — so it would under-allow exactly when
+# contention is worst.
 #
 # Once set, with the floor below:
-#    8,000 tokens ->  max(300, 8000/r + margin)
-#   70,000 tokens ->  max(300, 70000/r + margin)      (#884's trigger size)
+#    8,000 tokens ->  max(300, q + 8000/r + margin)
+#   70,000 tokens ->  max(300, q + 70000/r + margin)   (#884's trigger size)
 #  262,144 tokens ->  clamped to OLLAMA_GENERATE_TIMEOUT
 OLLAMA_FIRST_TOKEN_RATE_TPS = max(0, _env_int("OLLAMA_FIRST_TOKEN_RATE_TPS", 0))
 OLLAMA_FIRST_TOKEN_MARGIN_S = _env_int("OLLAMA_FIRST_TOKEN_MARGIN_S", 90)
+
+# The absolute queue term above. Separate from MARGIN_S even though both are
+# constants, because they are measured from different things and will be
+# re-derived at different times: the margin covers post-prefill model
+# behaviour, this covers other tenants. Folding them together would lose which
+# number to change when contention changes.
+OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = max(
+    0, _env_int("OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S", 0))
 
 # A FLOOR under the scaled budget, and it is not decoration — without it this
 # change is a regression for small prompts. At 60 tok/s an 8,000-token prompt
@@ -621,7 +672,12 @@ def ollama_first_token_deadline(prompt_tokens: int | None) -> float:
         # prefill rate. Both mean the same thing: no deadline computed from a
         # guess. Falls back to the whole-request budget, which still fires.
         return float(OLLAMA_GENERATE_TIMEOUT)
-    scaled = (prompt_tokens / OLLAMA_FIRST_TOKEN_RATE_TPS
+    # queue (absolute) + prefill (scales with the prompt) + margin. See the
+    # comment above OLLAMA_FIRST_TOKEN_RATE_TPS for why the queue term cannot
+    # be folded into the rate: it does not scale with the prompt, and the rate
+    # is measured from `prompt_eval_duration`, which excludes queueing.
+    scaled = (OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S
+              + prompt_tokens / OLLAMA_FIRST_TOKEN_RATE_TPS
               + OLLAMA_FIRST_TOKEN_MARGIN_S)
     return min(
         max(float(OLLAMA_FIRST_TOKEN_MIN_S), scaled),
@@ -689,9 +745,10 @@ def _say_first_token_state():
     """
     if OLLAMA_FIRST_TOKEN_RATE_TPS > 0:
         log.info(
-            f"ollama first-token deadline ARMED at "
-            f"{OLLAMA_FIRST_TOKEN_RATE_TPS} tok/s + "
-            f"{OLLAMA_FIRST_TOKEN_MARGIN_S}s, floor "
+            f"ollama first-token deadline ARMED: "
+            f"{OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S}s queue + "
+            f"tokens/{OLLAMA_FIRST_TOKEN_RATE_TPS} tok/s + "
+            f"{OLLAMA_FIRST_TOKEN_MARGIN_S}s margin, floor "
             f"{OLLAMA_FIRST_TOKEN_MIN_S}s, ceiling "
             f"{OLLAMA_GENERATE_TIMEOUT}s"
         )
@@ -706,8 +763,31 @@ def _say_first_token_state():
         )
 
 
+def _warn_if_rate_armed_without_queue_allowance():
+    """Arming the rate without a queue term is the #903 trap, so say so.
+
+    The rate comes from `prompt_eval_duration`, which excludes queueing; the
+    deadline bounds `queue + prefill`. With no queue allowance, a request that
+    waited for the slot is killed for being slow and reported as a stall —
+    measured at ~40x on this box (73.8s wall, 1.8s compute). The floor absorbs
+    it for short prompts; for a long one the scaled term dominates and the
+    floor does not help.
+    """
+    if (OLLAMA_FIRST_TOKEN_RATE_TPS > 0
+            and OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S <= 0):
+        log.warning(
+            f"OLLAMA_FIRST_TOKEN_RATE_TPS is set ({OLLAMA_FIRST_TOKEN_RATE_TPS}"
+            f" tok/s) but OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S is 0. The rate "
+            f"measures prefill compute and the deadline bounds queue+prefill, "
+            f"so a request that merely waited for the inference slot will be "
+            f"reported as a stalled prefill. Measure the `queued ~Ns` field "
+            f"under representative contention and set it (#903/#904)."
+        )
+
+
 _warn_if_budget_under_window()
 _warn_if_first_token_floor_collapses()
+_warn_if_rate_armed_without_queue_allowance()
 _say_first_token_state()
 
 

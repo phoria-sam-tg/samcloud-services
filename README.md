@@ -276,6 +276,35 @@ reporting which one. `/v1/models` carried `memory_mb` and nothing else;
 this gateway had to guess, and one shipped a hand-picked 65,536 — a window this
 box has never served.
 
+### The window is not the usable prompt, and the limit is time
+
+**`context_length` is a memory bound. There is a second, tighter bound made of
+time**, and a consumer sizing against the first will be cut by the second.
+
+From `claude-wafer-services`' sweep on the same model (#904), cold prefill
+~74.7 tok/s — a floor, since a cold prefill pages weights in as it goes:
+
+| prompt | prefill alone | vs `OLLAMA_GENERATE_TIMEOUT` (1800s) |
+|---|---|---|
+| 8,000 | ~107s | 6% |
+| 32,000 | ~428s | 24% |
+| **70,000** | **~937s** | **52%** — #884's trigger |
+| 131,072 | ~1755s | 98% |
+| **262,144** | **~3509s** | **195% — cannot complete** |
+
+So the published window is 262,144 and the **time-usable** prompt is **~125,000
+tokens**, leaving room to decode. 70,000 fits with less headroom than it reads.
+
+Two things follow. **A box that wants full-window prompts must raise
+`OLLAMA_GENERATE_TIMEOUT`** — the ceiling is the binding constraint well before
+the window is. And retrospectively, under the 300s cap that #904 replaced, any
+prompt over **~22,000 tokens** could not complete at all: prefill alone
+exceeded the wall. The 65,536 `hermes-assistant` believed it had was never
+usable, and neither was 32,000.
+
+Rates are per box. Re-derive from `_log_ollama_timings` on the box you are
+sizing for rather than carrying these across.
+
 `OLLAMA_NUM_CTX_MODELS` makes the window a decision instead of a side-effect of
 memory pressure. Two things it is not:
 

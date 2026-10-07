@@ -177,6 +177,7 @@ def main():
     config.OLLAMA_FIRST_TOKEN_RATE_TPS = 60
     config.OLLAMA_FIRST_TOKEN_MARGIN_S = 90
     config.OLLAMA_FIRST_TOKEN_MIN_S = 300
+    config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = 0
     d8 = config.ollama_first_token_deadline(8000)
     d70 = config.ollama_first_token_deadline(70000)
     check(8000 / 60 + 90 < 300,
@@ -264,6 +265,68 @@ def main():
     step(7, "the session is closed on every path")
     check(all(s.closed for s in SESSIONS),
           f"all {len(SESSIONS)} fake sessions closed in the finally")
+
+    step(13, "queue and prefill are separate terms, because they have "
+             "different shapes")
+    config.OLLAMA_GENERATE_TIMEOUT = 1800
+    config.OLLAMA_FIRST_TOKEN_MIN_S = 0       # isolate the arithmetic
+    config.OLLAMA_FIRST_TOKEN_RATE_TPS = 100
+    config.OLLAMA_FIRST_TOKEN_MARGIN_S = 0
+    config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = 0
+    bare_small = config.ollama_first_token_deadline(100)
+    bare_big = config.ollama_first_token_deadline(70000)
+    config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = 120
+    q_small = config.ollama_first_token_deadline(100)
+    q_big = config.ollama_first_token_deadline(70000)
+    check(q_small - bare_small == 120 and q_big - bare_big == 120,
+          "the queue term is ABSOLUTE — it adds the same 120s to a 100-token "
+          "prompt as to a 70,000-token one, because a 15-token prompt waited "
+          "72s for the slot and waiting does not scale with the prompt")
+    check(bare_big - bare_small == (70000 - 100) / 100,
+          "the prefill term SCALES — that is the part "
+          "`prompt_eval_duration` measures, and the only part it measures")
+    # If the queue term were folded into the rate instead, it would have to be
+    # a much slower rate, which would over-allow long prompts by the same
+    # factor it under-allows short ones. Show that the two models diverge.
+    config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = 0
+    config.OLLAMA_FIRST_TOKEN_RATE_TPS = 50   # "absorb" queueing by halving it
+    folded_small = config.ollama_first_token_deadline(100)
+    folded_big = config.ollama_first_token_deadline(70000)
+    check(folded_small < 120,
+          f"folding queueing into the rate CANNOT cover a short prompt's "
+          f"72s wait ({folded_small:.0f}s for 100 tokens) — the absolute "
+          f"term is not expressible as a rate")
+    check(folded_big > q_big,
+          f"...while over-allowing a long one ({folded_big:.0f}s vs "
+          f"{q_big:.0f}s), so the deadline stops firing when it should")
+
+    step(14, "arming the rate without a queue allowance is called out")
+    import logging as _l
+    seen = []
+    h = type("H", (_l.Handler,), {"emit": lambda _s, r: seen.append(r.getMessage())})()
+    config.OLLAMA_FIRST_TOKEN_RATE_TPS = 100
+    config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = 0
+    config.log.addHandler(h)
+    config._warn_if_rate_armed_without_queue_allowance()
+    config.log.removeHandler(h)
+    check(len(seen) == 1 and "reported as a stalled prefill" in seen[0],
+          "a rate with no queue term warns: the rate measures compute, the "
+          "deadline bounds queue+prefill, and the difference was ~40x here")
+    seen.clear()
+    config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = 120
+    config.log.addHandler(h)
+    config._warn_if_rate_armed_without_queue_allowance()
+    config.log.removeHandler(h)
+    check(not seen, "both set: silent")
+    seen.clear()
+    config.OLLAMA_FIRST_TOKEN_RATE_TPS = 0
+    config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S = 0
+    config.log.addHandler(h)
+    config._warn_if_rate_armed_without_queue_allowance()
+    config.log.removeHandler(h)
+    check(not seen,
+          "and UNARMED is silent too — the shipped default must not warn, or "
+          "every box logs it forever and nobody reads it")
 
     step(11, "shipped default: the deadline is NOT armed, because nothing "
              "measures prefill on this backend yet")
@@ -404,6 +467,57 @@ def main():
     check("our count" in fn,
           "our token count is logged beside ollama's own, turning the "
           "chars/token estimate into a checkable number")
+
+    # A quotient under a token floor is not a rate — it is fixed overhead
+    # wearing a rate's units. Driven, not read: these are real samples.
+    from .server import _log_ollama_timings, _MIN_TOKENS_FOR_RATE
+    import logging as _lg
+    lines = []
+    _h = type("H", (_lg.Handler,), {"emit": lambda _s, r: lines.append(r.getMessage())})()
+    _log = _lg.getLogger("model-service")
+    _log.addHandler(_h)
+    # slice, measured: a 15-token prompt and a 1-token generation. Used to
+    # claim 10 tok/s prefill and 4.3 tok/s decode.
+    _log_ollama_timings("m", {"prompt_eval_count": 15,
+                              "prompt_eval_duration": 1561665666,
+                              "eval_count": 1, "eval_duration": 230414084,
+                              "total_duration": 73825340875}, 18)
+    # wafer, measured cold: 2,676 tokens at 74.7 tok/s, num_predict:1.
+    _log_ollama_timings("m", {"prompt_eval_count": 2676,
+                              "prompt_eval_duration": 35830000000,
+                              "eval_count": 1, "eval_duration": 310000000,
+                              "total_duration": 60900000000}, 2700)
+    # a real generation: both columns earn a rate.
+    _log_ollama_timings("m", {"prompt_eval_count": 2000,
+                              "prompt_eval_duration": 20000000000,
+                              "eval_count": 300, "eval_duration": 12000000000,
+                              "total_duration": 32100000000}, 1950)
+    _log.removeHandler(_h)
+    check(len(lines) == 3, f"three samples logged (got {len(lines)})")
+    tiny, cold, real = lines
+    check("10 tok/s" not in tiny and "no rate" in tiny,
+          "a 15-token prompt does NOT claim 10 tok/s — under the floor it "
+          "logs the duration and refuses the quotient")
+    check("4.3 tok/s" not in tiny and "first_token 0.23s" in tiny,
+          "a 1-token generation is reported as first_token latency, not as a "
+          "decode rate (claude-wafer-services, #904: `eval_count/eval_duration`"
+          " at ec=1 is the total_duration trap one column over)")
+    check("1 token, not a rate" in cold,
+          "...including on a long prompt swept with num_predict:1, which is "
+          "the exact shape that produced the finding")
+    check("74.7 tok/s" in cold,
+          f"but the PREFILL on that row does earn its rate — reproduces "
+          f"wafer's measured 74.7 tok/s from their own numbers")
+    check("queued ~24.8s" in cold,
+          "and `queued` independently agrees with their 24.7s weight-load "
+          "figure, from the same row")
+    check("= 100.0 tok/s" in real and "decode 300 tok" in real
+          and "= 25.0 tok/s" in real,
+          "a real generation rates both columns")
+    check("queued" not in real,
+          "...and carries no queued term, because there was none")
+    check(_MIN_TOKENS_FOR_RATE >= 32,
+          f"the floor is at least 32 tokens ({_MIN_TOKENS_FOR_RATE})")
     check("queued ~" in fn,
           "the queue residue is stated, not left as arithmetic — it is the "
           "field the #904 correlation gets sorted on, and a correlation that "

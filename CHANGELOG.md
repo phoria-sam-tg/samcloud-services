@@ -2,6 +2,115 @@
 
 Project history and current state. This is a living document.
 
+## 2026-10-08 — A quotient under a token floor is not a rate (#904)
+
+- **Found by `claude-wafer-services` while sweeping with `num_predict:1`**, and
+  it is the `total_duration` trap one column over. `_log_ollama_timings`
+  computed `eval_count / eval_duration` unconditionally, so a one-token
+  generation reported **time-to-first-token wearing a rate's units**. It would
+  have read correctly on real traffic and wildly wrong on every short
+  generation — the ones that look harmless.
+- **My own first sample proves it twice.** `prefill 15 tok in 1.56s = 10 tok/s`
+  and `decode 1 tok in 0.23s = 4.3 tok/s`, against ~75 tok/s prefill on a
+  2,676-token prompt. Two orders of magnitude of nonsense, in the field whose
+  entire purpose is to be read as a rate and used to size a deadline. So the
+  floor applies to **both** columns, not just decode.
+- `_MIN_TOKENS_FOR_RATE = 32`. Under it, the duration is logged and the
+  quotient refused: `prefill 15 tok in 1.56s (under 32 tok: no rate)`. At
+  `eval_count == 1` specifically, `first_token 0.23s (1 token, not a rate)`,
+  because that number is a latency and is worth having under its own name. Not
+  a filter — the row still appears, it just cannot assert a rate it does not
+  support.
+- **The window is not the usable prompt.** Applying wafer's 74.7 tok/s: a
+  70,000-token prefill is ~937s, which is 52% of the 1800s ceiling, and a full
+  262,144-token prefill is ~3509s and **cannot complete**. So the published
+  window is a memory bound and there is a second, tighter bound made of time —
+  the time-usable prompt is ~125,000 tokens. Recorded in the README beside the
+  published window, because a consumer sizing against `context_length` alone
+  will be cut by the ceiling.
+- **And retrospectively: under the 300s cap, any prompt over ~22,000 tokens
+  could not complete at all.** Prefill alone exceeded the wall. The 65,536
+  `hermes-assistant` believed it had was never usable; neither was 32,000.
+
+## 2026-10-08 — A route is bound to a handler, and nothing asserted which (#904)
+
+- **`_log_ollama_timings` was inserted between `@app.post("/v1/chat/completions")`
+  and `async def chat_completions`, so the decorator bound the HELPER.** The path
+  still existed; `chat_completions` became unreachable. `model: str` turned into
+  a required **query** parameter and `chunk: dict` into the body, so a normal
+  request with a JSON body and no query string was rejected before anything ran.
+  **Every POST to Hermes' surface 422'd — 100% failure, strictly worse than the
+  22% cap it shipped beside, and it never reached the model.**
+- **It got to `main` and into the staged deploy clone.** The only reason the
+  service kept serving is that the running process had loaded the old module at
+  import three days earlier. Caught by `samclaude-admin` reading the diff, not
+  by anything in this repo. The deploy clone was rolled back to `6691982`
+  immediately — a fix to `main` alone would have left the landmine staged.
+- **Why 51 checks and nine mutations missed it.** Both branches register the
+  same number of routes: **the count did not change, the binding did.** Nothing
+  asserted which handler a path resolves to, and no test went through the ASGI
+  app at all — the deadline logic was tested directly while the route that
+  reaches it was not. That is this repo's own "assert a count, not a presence"
+  rule one level up, with the count right and the binding wrong. Third time in
+  two days that a number measured something other than what it looked like.
+- **`test_route_bindings`** pins the whole path -> handler table as an
+  independent statement of intent (derived from the app, it would have agreed
+  with the bug). Four more properties beyond the table, because the failure mode
+  is "a helper lands under a decorator" and any insertion can cause it:
+  **no `_private` name may be routed** — which catches it without the table
+  being up to date; the table must still cover what the app serves, so a new
+  endpoint cannot quietly fall outside it; no path may resolve to two handlers;
+  and **one real POST through the ASGI app**, asserting specifically that
+  `model` is not demanded as a query parameter. Verified by reintroducing the
+  defect: 5 checks fail, including the live 422.
+- **And the stale figure in `config.py` is corrected** — it still carried "121 x
+  200 and 17 x 500, ALL SEVENTEEN at 5m0s", wrong three ways: the denominator
+  spanned two days while every cut-off was on one, five of those 17 were the
+  CALLER disconnecting at ~180s, and six of ours were logged `200`. That file is
+  what a future reader consults first, so the repo was contradicting itself.
+
+## 2026-10-08 — The first-token budget is queue + prefill, not one rate (#904)
+
+- **The trap, raised by `samclaude-admin` and `claude-containers` on #903 after
+  #39 was already approved.** Our first-token clock starts when the POST
+  returns headers, which Ollama sends on *accepting* a request — before the
+  model is scheduled. So the silence it bounds is **queue + prefill**, while
+  `prompt_eval_duration` measures **prefill alone**. Arming the first with the
+  second makes contention trip a prefill guard: a request killed for being slow
+  when it was only waiting, and reported as a stall.
+- **It is the `sock_read` trap a second time** — a more legible failure that is
+  wrong more often — and the gap is not absorbable. Measured on this box, 73.8s
+  of wall against 1.8s of compute: **~40x**.
+- **Three terms, because they have three shapes.** Folding them is what makes
+  the number wrong, and the test shows the two models diverge rather than
+  arguing it:
+
+  | term | shape | measured from |
+  |---|---|---|
+  | `..._QUEUE_ALLOWANCE_S` | **absolute** | the `queued ~Ns` field, under real contention |
+  | `tokens / ..._RATE_TPS` | **scales** | `prompt_eval_duration` — immune to contention |
+  | `..._MARGIN_S` | absolute | post-prefill model behaviour |
+
+  A 15-token prompt waited 72s, so waiting does not scale with the prompt and
+  cannot be expressed as a rate. Halving the rate to "absorb" queueing covers
+  neither end: it still cannot give a 100-token prompt 120s, and it
+  over-allows a 70,000-token one — so the deadline stops firing when it should.
+- **Rejected: don't count queue time at all**, by tracking our own in-flight
+  requests. It only sees OUR queue. The exo `think` tier and every other
+  consumer of this box are invisible to it — the same blind spot `foreign_mb`
+  has, for the same reason (#861) — so it would under-allow exactly when
+  contention is worst.
+- **Arming the rate without a queue term now warns**, naming the failure
+  (`reported as a stalled prefill`) rather than the setting. Silent when both
+  are set and silent when unarmed, so the shipped default logs nothing.
+- **And the 120s datapoint is an upper bound, not a prefill measurement.**
+  `waiting for stream response (120s, first_chunk)` is wall-clock from the
+  caller's side, so it contains the same queueing; the seat cannot decompose it
+  (`api_call_count: 0` for this provider). Read as "the seat waits up to 120s
+  before first output at today's context", which is what a timeout has to
+  cover — not as "prefill takes 120s", which would size the deadline too
+  generously to fire.
+
 ## 2026-10-08 — Streaming deadlines: silence is bounded, elapsed time is not (#904)
 
 - **The rule**, `claude-containers`' phrasing and better than anything else on
@@ -29,12 +138,20 @@ Project history and current state. This is a living document.
   broken answer.
 - **And ours was not even the first cap for most of the window.** Five of the
   500s sit at ~3m0s and match `Client disconnected during stream` to the
-  second — eight such disconnects between 00:02 and 00:24, ~3 minutes apart, a
-  caller giving up at ~180s and retrying. They stop at 00:24; our first 5m0s
-  cut-off is at 01:03. **The caller's bound moved at ~00:30, and that is the
-  only reason ours became the visible one.** `min(caller, ours)` is what
-  actually bounds a generation, so this change hands the cap back rather than
-  removing it.
+  second — eight such disconnects between 00:02 and 00:24, ~3 minutes apart.
+  They stop at 00:24; our first 5m0s cut-off is at 01:03. **The caller's bound
+  moved at ~00:30, and that is the only reason ours became the visible one.**
+  `min(caller, ours)` is what actually bounds a generation, so this change hands
+  the cap back rather than removing it.
+- **And "client disconnected" was not the caller giving up — it was their read
+  timeout**, which `claude-containers` traced and `samclaude-admin` relayed
+  (#903): Hermes' `_stream_timeouts()` sets httpx's **read** bound from its
+  stale timeout for a non-local URL, and that was **180s** before 2026-10-08.
+  So one knob plays two roles on their side, and our log recorded their timeout
+  firing as the client's choice to leave. Worth stating because
+  `Client disconnected during stream` reads as the caller's fault and some of
+  that count was not. Together with the queue residue, two separate terms
+  inflate what looks like gateway trouble.
 - **Three bounds, not two.** The structure is `exo_client`'s, which was bitten
   by exactly this on #830, and the constants in `config.py` are the design doc:
 

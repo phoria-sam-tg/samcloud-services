@@ -2,6 +2,87 @@
 
 Project history and current state. This is a living document.
 
+## 2026-10-08 — The served context window: pinned, and reported (#903)
+
+- **The number nobody could read.** A consumer sizing itself against this
+  gateway had three ways to ask what context we serve, and all three failed:
+  `/v1/models` carried `memory_mb` and nothing else, and `/models/info` and
+  `/v1/models/{id}` both 404'd. So `hermes-assistant` (#884) hand-picked
+  `model.context_length = 65536` — a window this box has never served — and it
+  looked configured. A harness claiming more context than the endpoint serves
+  gets truncated or refused; claiming less wastes the window it has.
+- **And nothing was setting it.** The assumed 65,536 cap did not exist. Nothing
+  in this repo passed `num_ctx`, and Ollama answers that absence by DERIVING a
+  default from free VRAM at the moment of load, logged as `vram-based default
+  context`. slice's own `ollama.log`:
+
+  | `total_vram` | derived `num_ctx` | occurrences |
+  |---|---|---|
+  | 48.0 GiB | 262,144 | 19 |
+  | 58.0 GiB | 262,144 | 1 |
+  | 60.8 GiB | 262,144 | 2 |
+  | **0 B** | **4,096** | **2** |
+
+  The two `0 B` rows are 2026-08-25 and 2026-08-26, when llama-server GPU
+  discovery timed out, Ollama fell back to CPU and read no VRAM at all. So the
+  served window was never a cap — it was a **64x spread** decided by whatever
+  the box had free that minute, and reported nowhere. That is worse than a
+  wrong number, because a wrong number can at least be found.
+- **What it was actually serving.** 262,144 — the model's full native window —
+  on every load since the `0 B` incidents. `qwen3.8:27b-mlx` therefore already
+  cleared #903's 140,000 crossover by 1.9x, and the entire exchange was about a
+  cap that was never imposed. Pinning it changes no behaviour today; it stops
+  the window being re-decided by memory pressure on the next load.
+- **Pinned.** `OLLAMA_NUM_CTX` (all Ollama models) and `OLLAMA_NUM_CTX_MODELS`
+  (`name=tokens`, per-model, wins over the global). Unset keeps the old derive
+  behaviour, which is right for a box nobody is sizing against and wrong for
+  one that has a consumer. A malformed pair is dropped with a warning and never
+  read as `0`, because `0` means "let Ollama derive one" — the behaviour the
+  setting exists to stop. A value above the window the weights declare is
+  clamped to the weights and logged once, so a stale copy of another box's
+  setting cannot become an allocation.
+- **One num_ctx, every call path.** Ollama keys a loaded instance by its
+  options: a request whose `num_ctx` differs from the resident instance's
+  **reloads the model**. So the merge lives in `OllamaClient._with_num_ctx` and
+  not at five call sites, `unload_model` is excluded, and `test_num_ctx` reads
+  the source to assert each path routes through it rather than trusting that it
+  does. A caller's own explicit `num_ctx` still wins — `/models/load` takes one.
+- **Adoption keeps the instance's own window.** On startup the gateway
+  re-applies `keep_alive` to a model somebody else loaded. Sending OUR `num_ctx`
+  there would reload a resident model to change a number nobody was waiting on,
+  i.e. a gateway restart would bounce a job. It re-applies the adopted
+  instance's own `context_length` instead; the configured window lands on the
+  next real load, which `keep_alive` guarantees arrives.
+- **Reported, from the truth and not from the config.** `offering()` carries
+  `context_length`, so `/warm`, `/v1/models` and `/status` cannot disagree
+  about it. On a resident model it is read back from `ollama ps` — after the
+  load, never assumed, because what we asked for and what we got are different
+  facts. `ensure_running` refreshes it off a read it already makes, so a reload
+  Ollama performed under us does not strand a stale number. A **loadable**
+  model reports it only where we pin one: predicting a VRAM-derived default
+  would be this ticket's invented number one layer down. **Absent means
+  unknown, not unlimited**, and `/service-docs` says so.
+- **`GET /v1/models/{id}` exists now.** `:path`, so an id with a slash
+  (`mlx-community/Qwen2.5-VL-7B-Instruct-4bit`) resolves rather than 404ing on
+  the segment boundary. Same contract as the list — 404 for anything not on
+  offer, blocked models included — and it accepts the partial name the chat
+  route accepts, because a consumer that gets a working completion and a 404
+  window has the worst of both.
+- **The cost of the clamp, bounded.** `num_ctx_for()` is reached from
+  `offering()`, which serves the auth-exempt `/warm` for every model in the
+  catalogue. It returns before touching Ollama when nothing is pinned, and when
+  something is, `/api/show` is cached by digest and the digest map is read at
+  most once per 300s — so an anonymous request rate cannot become an Ollama
+  request rate. Same mistake `/warm`'s docstring already records about
+  subprocess spawns.
+- **Still open, and not fixed here.** `ManagedModel.memory_mb` is read once at
+  load and never again, while the MLX KV cache grows with the conversation:
+  measured 2026-10-08, the lease said 17,530 MB for a model `ollama ps` put at
+  26,681 → 30,311 → 31,187 MB over forty minutes. The local fit gate is
+  unaffected (it reads hardware), but the registry is told a number that is
+  13 GB light and getting lighter, which is exactly the figure another box
+  reads to decide whether it can place work here. Separate ticket.
+
 ## 2026-09-29 — Speech to text: the gateway takes audio (#858)
 
 - **What was missing.** The gateway served text and vision. Audio had nowhere to

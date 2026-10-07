@@ -113,6 +113,7 @@ curl -s https://models-cs.samtg.xyz/v1/audio/transcriptions \
 | `POST` | `/models/load` | Load a model — pulls if needed, requests GPU lease |
 | `POST` | `/models/unload` | Unload a model — releases GPU lease |
 | `GET` | `/models` | List managed and available models |
+| `GET` | `/v1/models/{id}` | One model's entry, including its `context_length` |
 | `GET` | `/status` | Full status: backends, models, leases, resource utilisation |
 
 ### Discovery
@@ -215,6 +216,8 @@ samcloud registry + the `claude-services-slice` device.
 | `SC_VERIFY_URL` | `${SC_BASE}/auth/verify` | SAMcloud auth endpoint |
 | `SC_REQUIRED_SCOPE` | `device:${SC_DEVICE}` | Required scope for callers |
 | `AUTH_ENABLED` | `true` | Set `false` to disable auth (development only) |
+| `OLLAMA_NUM_CTX` | unset | Served context window for every Ollama model, in tokens. Unset = Ollama derives one from free VRAM |
+| `OLLAMA_NUM_CTX_MODELS` | unset | Per-model override: `qwen3.8:27b-mlx=262144,qwen3:1.7b=40960`. Wins over `OLLAMA_NUM_CTX` |
 | `VLM_PYTHON` | `~/code/mlx-vlm-server/.venv/bin/python` | Python that runs `mlx_vlm.server` |
 | `VLM_HOST` | `127.0.0.1` | Host the on-demand mlx-vlm server binds |
 | `VLM_PORT` | `8801` | Port for the on-demand mlx-vlm server |
@@ -238,6 +241,52 @@ samcloud registry + the `claude-services-slice` device.
 | `LEASE_TTL` | `3600` (1 hr) | Lease duration in seconds |
 | `LEASE_RENEW_AT` | `0.5` | Renew at 50% of TTL |
 | `RESOURCE_ID` | `slice-test/gpu-0` | SAMcloud resource to lease |
+
+## The served context window
+
+**Size your harness against `context_length` on `/v1/models`. Do not pick a
+number.** Every entry that we can answer for carries it:
+
+```bash
+curl -s https://models-cs.samtg.xyz/v1/models/qwen3.8:27b-mlx \
+  -H @"$HOME/.samcloud/token.hdr"
+# {"id": "qwen3.8:27b-mlx", "status": "resident",
+#  "memory_mb": 31187, "context_length": 262144}
+```
+
+On a **resident** model that is what the live instance actually has, read from
+`ollama ps`. On a **loadable** one it is the window we pin, and it is **absent**
+where we pin nothing — because Ollama then derives the window from free VRAM at
+load time and a prediction of that would be a guess. An absent field means "we
+do not know", which is **not** the same as "no limit".
+
+Why this exists (#903): nothing used to set `num_ctx`, and the absence was not
+neutral. Ollama logs the window it picks as `vram-based default context`, and
+slice's own log has it as 262,144 nineteen times — and as **4,096 twice**, on
+2026-08-25 and 2026-08-26, when llama-server GPU discovery timed out and Ollama
+fell back to CPU. That is a 64x spread in what a caller got, with no endpoint
+reporting which one. `/v1/models` carried `memory_mb` and nothing else;
+`/models/info` and `/v1/models/{id}` both 404'd. So a consumer sizing against
+this gateway had to guess, and one shipped a hand-picked 65,536 — a window this
+box has never served.
+
+`OLLAMA_NUM_CTX_MODELS` makes the window a decision instead of a side-effect of
+memory pressure. Two things it is not:
+
+- **not a reservation.** The MLX engine grows the KV cache as a conversation
+  fills it — measured on slice 2026-10-08, `ollama ps` climbing 26,681 →
+  30,311 → 31,187 MB on one resident model at a fixed 262,144. Raising the
+  number costs nothing at load; a long conversation costs memory later.
+- **not a limit we can exceed.** A configured value above the window the
+  weights declare is clamped to the weights and logged once, rather than passed
+  to Ollama to allocate for.
+
+One operational note: every path that touches a model sends the same `num_ctx`,
+because **Ollama keys a loaded instance by its options** — a request whose
+`num_ctx` differs from the resident instance's reloads the model. Adoption is
+the deliberate exception: on startup the gateway re-applies the *instance's own*
+window, so a gateway restart cannot bounce a model mid-job to change a number.
+The configured window takes effect on the next real load.
 
 ## SAMcloud Integration
 

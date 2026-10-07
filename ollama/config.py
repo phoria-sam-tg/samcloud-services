@@ -159,6 +159,84 @@ LEASE_TTL = _env_int("LEASE_TTL", 3600)
 LEASE_RENEW_AT = float(_env("LEASE_RENEW_AT", "0.25"))
 OLLAMA_KEEP_ALIVE = _env_int("OLLAMA_KEEP_ALIVE", -1)
 
+# --- The served context window (ticket #903) --------------------------------
+# What `num_ctx` we ask Ollama for. Nothing used to set it, and the absence was
+# not neutral: Ollama DERIVES a default from free VRAM at the moment of load
+# and logs it as `vram-based default context`. On slice that read
+# `total_vram="48.0 GiB" default_num_ctx=262144` nineteen times — and
+# `total_vram="0 B" default_num_ctx=4096` twice, on 2026-08-25 and 2026-08-26,
+# when llama-server GPU discovery timed out and Ollama fell back to CPU. So the
+# window a caller got was whatever this box happened to have free that minute,
+# with a 64x spread across observed loads and no way to find out which one it
+# had been handed.
+#
+# That is worse than a cap, because a cap is at least a number. A harness
+# claiming more context than the endpoint serves gets truncated or refused
+# while looking configured, which is exactly what #884 was about to be
+# configured into. Pinning it makes the window a decision instead of a
+# side-effect of memory pressure, and makes it a number we can publish.
+#
+# Unset (0) keeps the old behaviour — we send no num_ctx and Ollama derives
+# one. That is the right default for a box that has not been measured; it is
+# not the right setting for a box with a consumer sizing against it.
+#
+#   OLLAMA_NUM_CTX=131072                       every ollama model
+#   OLLAMA_NUM_CTX_MODELS=qwen3.8:27b-mlx=262144,qwen3:1.7b=40960
+#
+# Per-model wins over the global. Both are CEILINGS, not reservations: the MLX
+# engine grows the KV cache as a conversation fills it, measured on slice
+# 2026-10-08 as `ollama ps` size_vram climbing 26,681 -> 30,311 MB on one
+# resident model at a fixed num_ctx=262144. So raising this number does not
+# cost memory at load; a long conversation does, later.
+OLLAMA_NUM_CTX = max(0, _env_int("OLLAMA_NUM_CTX", 0))
+
+
+def _num_ctx_models() -> dict:
+    """Parse OLLAMA_NUM_CTX_MODELS — `name=tokens` pairs, comma separated.
+
+    A malformed pair is dropped with a warning rather than taken as 0: 0 is
+    "let Ollama derive one", which is the behaviour this setting exists to
+    stop, so a typo must not quietly mean it.
+    """
+    raw = os.environ.get("OLLAMA_NUM_CTX_MODELS", "").strip()
+    out: dict[str, int] = {}
+    if not raw:
+        return out
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        name, _, value = pair.partition("=")
+        name = name.strip()
+        try:
+            n = int(value.strip())
+        except ValueError:
+            log.warning(f"OLLAMA_NUM_CTX_MODELS: not a number, ignoring: {pair!r}")
+            continue
+        if not name or n <= 0:
+            log.warning(f"OLLAMA_NUM_CTX_MODELS: unusable pair, ignoring: {pair!r}")
+            continue
+        out[name] = n
+    return out
+
+
+OLLAMA_NUM_CTX_MODELS = _num_ctx_models()
+
+
+def ollama_num_ctx(model: str) -> int:
+    """The num_ctx configured for this model, or 0 for "we do not set it".
+
+    Matches the exact name first, then the name without an Ollama `:tag`, so
+    `OLLAMA_NUM_CTX_MODELS=qwen3.8:27b-mlx=262144` covers the model however it
+    was written and a bare `qwen3.8=…` still covers every tag of it.
+    """
+    if model in OLLAMA_NUM_CTX_MODELS:
+        return OLLAMA_NUM_CTX_MODELS[model]
+    base = model.split(":", 1)[0]
+    if base in OLLAMA_NUM_CTX_MODELS:
+        return OLLAMA_NUM_CTX_MODELS[base]
+    return OLLAMA_NUM_CTX
+
 # --- Stage-1 capacity offering (doc #8) ---
 # The service self-reports a coarse offering tier as an `offering:<tier>`
 # capability, recomputed from live pressure and updated via PATCH on change.

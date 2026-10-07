@@ -300,6 +300,12 @@ class ManagedModel:
     # for ("think") while `name` is whatever model the pool currently holds.
     # Every other backend keys on the model name itself.
     tier: Optional[str] = None
+    # The window this instance is actually serving, in tokens (#903). Read from
+    # `ollama ps`, not from our config: Ollama derives a default from free VRAM
+    # when nothing pins one, so the configured value and the served value are
+    # different facts and a consumer has to size against the second. None on
+    # the backends that do not report one.
+    context_length: Optional[int] = None
     llama_instance: Optional[LlamaInstance] = field(default=None, repr=False)
     vlm_process: Optional[subprocess.Popen] = field(default=None, repr=False)
     whisper_process: Optional[subprocess.Popen] = field(default=None, repr=False)
@@ -420,8 +426,19 @@ class ModelManager:
                 #      (The same sum also over-counts evictable memory in the
                 #      fit path itself, but that read is behind AUTO_EVICT,
                 #      which defaults False and is set on neither box.)
+                #
+                # Re-apply at the instance's OWN num_ctx, not our configured
+                # one (#903). Ollama keys a loaded instance by its options, so
+                # a re-apply that changes num_ctx reloads the model — which
+                # would mean a gateway restart bounces a model mid-job to
+                # change a number nobody was waiting on. The configured window
+                # takes effect on the next real load, which keep_alive makes
+                # sure arrives.
+                adopted_ctx = m.get("context_length")
+                adopted_ctx = int(adopted_ctx) if adopted_ctx else None
                 try:
-                    self.ollama.load_model(name, keep_alive=OLLAMA_KEEP_ALIVE)
+                    self.ollama.load_model(name, keep_alive=OLLAMA_KEEP_ALIVE,
+                                           num_ctx=adopted_ctx)
                     log.info(f"Re-applied keep_alive={OLLAMA_KEEP_ALIVE} to adopted Ollama model {name}")
                 except Exception as e:
                     log.warning(f"Failed to set keep_alive on {name}: {e}")
@@ -434,6 +451,7 @@ class ModelManager:
                     loaded_at=time.time(),
                     last_used=time.time(),
                     managed=True,
+                    context_length=adopted_ctx,
                 )
                 self.models[name] = mm
                 adopted.append(mm)
@@ -711,6 +729,12 @@ class ModelManager:
                 "memory_mb": mm.memory_mb,
                 "idle_seconds": int(now - mm.last_used),
                 "request_count": mm.request_count,
+                # What this instance is serving RIGHT NOW, so a consumer sizes
+                # against the window it will actually get rather than one we
+                # declared (#903). None means we could not read it, which is
+                # not the same as "no limit" — a caller must not take it as
+                # permission to send an unbounded prompt.
+                "context_length": mm.context_length,
             }
             for name, mm in self.models.items()
         ]
@@ -720,6 +744,22 @@ class ModelManager:
         for name, size_mb in self.catalogue_mb().items():
             if name not in resident_names:
                 candidates[name] = (Backend.OLLAMA.value, max(1024, size_mb))
+
+        # The window a not-yet-resident ollama model WOULD get. Only reported
+        # where we pin it (#903): if nothing is pinned, Ollama derives the
+        # window from whatever VRAM is free at the moment of load, and a
+        # prediction of that is a guess with a 64x observed spread on this box
+        # — publishing it would be the same invented number this ticket is
+        # about, just invented one layer down. Absent field, not a wrong one.
+        prospective_ctx: dict = {}
+        for name in candidates:
+            if candidates[name][0] == Backend.OLLAMA.value:
+                try:
+                    n = self.ollama.num_ctx_for(name)
+                except Exception:
+                    n = None
+                if n:
+                    prospective_ctx[name] = n
         for info in VLM_MODELS.values():
             name = info["default"]
             if name not in resident_names and hf_model_installed(name):
@@ -745,6 +785,8 @@ class ModelManager:
             candidates.items(), key=lambda kv: kv[1][1], reverse=True
         ):
             entry = {"name": name, "backend": backend, "need_mb": need}
+            if name in prospective_ctx:
+                entry["context_length"] = prospective_ctx[name]
             if working:
                 # Not a fit refusal: it might fit fine. The device is in use by
                 # somebody whose work we are not going to take memory from, and
@@ -840,14 +882,25 @@ class ModelManager:
         log.info(f"Loading {model_name} into Ollama (keep_alive={OLLAMA_KEEP_ALIVE})...")
         self.ollama.load_model(model_name, keep_alive=OLLAMA_KEEP_ALIVE)
 
-        # Get actual VRAM from Ollama ps
+        # Get actual VRAM from Ollama ps, and the window it actually got.
+        # Both are read AFTER the load and neither is assumed: the window is
+        # ours only if `OLLAMA_NUM_CTX*` pinned one, and otherwise Ollama
+        # derived it from free VRAM (#903).
         actual_mb = memory_mb
+        served_ctx = None
         for m in self.ollama.list_running():
             if model_name in m.get("name", ""):
                 reported = int(m.get("size", 0) / 1024 / 1024)
                 if reported > 0:
                     actual_mb = reported
                     log.info(f"Actual VRAM for {model_name}: {actual_mb}MB (estimated {memory_mb}MB)")
+                ctx = m.get("context_length")
+                served_ctx = int(ctx) if ctx else None
+                asked = self.ollama.num_ctx_for(model_name)
+                log.info(
+                    f"Served context for {model_name}: {served_ctx} "
+                    f"({'pinned ' + str(asked) if asked else 'ollama-derived, not pinned'})"
+                )
                 break
 
         lease_id = self._reconcile_lease(
@@ -864,6 +917,7 @@ class ModelManager:
             last_used=now,
             request_count=1,
             managed=True,
+            context_length=served_ctx,
         )
         self.models[model_name] = mm
         return mm
@@ -1996,8 +2050,21 @@ class ModelManager:
         if mm.backend != Backend.OLLAMA:
             return True  # llama-server managed separately
         # Check if Ollama still has it loaded
-        running = [m.get("name", "") for m in self.ollama.list_running()]
+        instances = self.ollama.list_running()
+        running = [m.get("name", "") for m in instances]
         if mm.name in running or any(mm.name in r for r in running):
+            # Refresh the served window off the same read (#903). It is the one
+            # place that already has `ollama ps` on the request path, so the
+            # published number tracks a reload we did not perform — Ollama
+            # evicting and re-deriving under us — without costing an extra call
+            # on `/warm`, which is auth-exempt and polled.
+            for m in instances:
+                name = m.get("name", "")
+                if name == mm.name or mm.name in name:
+                    ctx = m.get("context_length")
+                    if ctx:
+                        mm.context_length = int(ctx)
+                    break
             return True
         # Model was dropped by Ollama — reload it
         log.warning(f"Model {mm.name} dropped by Ollama — reloading (keep_alive={OLLAMA_KEEP_ALIVE})")

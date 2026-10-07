@@ -342,9 +342,13 @@ def main():
           == float(shipped.OLLAMA_GENERATE_TIMEOUT),
           "unarmed, a 70k prompt falls back to the whole-request budget "
           "rather than a deadline derived from a guessed rate")
-    check(shipped.OLLAMA_STALL_TIMEOUT == 60,
-          "the inter-token bound is armed regardless, so the inference slot "
-          "is covered while the rate is unmeasured")
+    check(shipped.OLLAMA_STALL_TIMEOUT == 300,
+          f"the inter-token default is 300s, not 60 "
+          f"({shipped.OLLAMA_STALL_TIMEOUT}). 60 was EXO_STALL_TIMEOUT, a "
+          f"measured figure for a different backend, and it aborted 2 of the "
+          f"first 6 real requests after the #904 rollout — a 33% abort rate, "
+          f"worse than the 22% it replaced. 300 is the per-chunk idle bound "
+          f"the sync path always had, i.e. the original intent")
     # The two settings SHIP TOGETHER, so the unarmed rate meets a pinned
     # window on the first box that takes both. That combination divided by
     # zero at import and would have taken the gateway down at startup.
@@ -447,6 +451,28 @@ def main():
     check("prompt_tokens=n_prompt" in body,
           "the counted prompt is passed through, so the deadline is armed")
 
+    step(15, "the armed/not-armed line reports the state it is actually in")
+    # Caught in the live log a minute after the #904 restart: the branch keyed
+    # on `if prompt_tokens:`, so a box with a counted prompt and NO measured
+    # rate logged "armed ... / 0 tok/s" — claiming a state it was not in and
+    # displaying the zero it had divided by.
+    src_c = open(os.path.join(os.path.dirname(__file__),
+                              "ollama_client.py")).read()
+    fn = src_c.split("async def _stream_with_deadlines", 1)[1].split(
+        "\n    async def ", 1)[0]
+    check("armed = (prompt_tokens" in fn
+          and "config.OLLAMA_FIRST_TOKEN_RATE_TPS > 0" in fn,
+          "the log branch keys on whether the deadline is ARMED, not on "
+          "whether the prompt was counted")
+    check("if armed:" in fn,
+          "...and the armed message is behind that condition")
+    check('"OLLAMA_FIRST_TOKEN_RATE_TPS is unset"' in fn,
+          "the not-armed message says WHICH of the two reasons it was — an "
+          "unset rate and an uncountable prompt are different problems")
+    check("counted {prompt_tokens} prompt tokens" in fn,
+          "...and still reports the count it does have, so the line is not "
+          "less informative for being honest")
+
     step(12, "the rate gets measured from real traffic, not a synthetic sweep")
     check("def _log_ollama_timings(" in srv,
           "the done chunk's timings are logged — `/api/chat` returns "
@@ -518,6 +544,32 @@ def main():
           "...and carries no queued term, because there was none")
     check(_MIN_TOKENS_FOR_RATE >= 32,
           f"the floor is at least 32 tokens ({_MIN_TOKENS_FOR_RATE})")
+
+    # The other end: a cache hit divides the WHOLE prompt count by only the
+    # uncached duration. Live row from slice, minutes after the #904 rollout.
+    from .server import _MAX_PLAUSIBLE_TOK_S
+    lines.clear()
+    _log.addHandler(_h)
+    _log_ollama_timings("m", {"prompt_eval_count": 76321,
+                              "prompt_eval_duration": 22730000000,
+                              "eval_count": 397, "eval_duration": 33800000000,
+                              "total_duration": 56600000000}, 201746)
+    _log.removeHandler(_h)
+    hit = lines[0]
+    check("3,358 tok/s" in hit and "cache hit" in hit,
+          "76,321 tok in 22.73s is named a CACHE HIT, not reported as "
+          "3358 tok/s — the real cold figure on this box is ~100-104")
+    check("= 3358" not in hit,
+          "...and the bare `= N tok/s` form is NOT used for it, so a log "
+          "scraper cannot pick it up as a rate")
+    check("76321" in hit,
+          "the COUNT is kept — it is the useful half; only the quotient is "
+          "meaningless")
+    check("decode 397 tok" in hit and "11.7 tok/s" in hit,
+          "and decode on the same row still earns its rate at 397 tokens")
+    check(_MAX_PLAUSIBLE_TOK_S <= 400,
+          f"the ceiling is at most 400 tok/s ({_MAX_PLAUSIBLE_TOK_S}), well "
+          f"above the ~104 cold rate and far below a cache hit")
     check("queued ~" in fn,
           "the queue residue is stated, not left as arithmetic — it is the "
           "field the #904 correlation gets sorted on, and a correlation that "

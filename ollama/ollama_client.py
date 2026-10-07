@@ -416,22 +416,38 @@ class OllamaClient:
                 # when it fires cannot be told apart from one that was never
                 # wired up — which is how the old flat cap went unnoticed for as
                 # long as it did.
-                if prompt_tokens:
+                #
+                # KEYED ON WHETHER IT IS ACTUALLY ARMED, not on whether we
+                # counted the prompt. An earlier version branched on
+                # `if prompt_tokens:` and printed "armed ... / 0 tok/s" on a
+                # box with no measured rate — claiming a state it was not in,
+                # and dividing by a zero it then displayed. Caught in the live
+                # log within a minute of the #904 restart, which is the exact
+                # class of defect #903 and #904 are both about: a line whose
+                # name promises more than it measures.
+                armed = (prompt_tokens
+                         and config.OLLAMA_FIRST_TOKEN_RATE_TPS > 0)
+                if armed:
                     log.info(
                         f"ollama deadlines armed for {payload.get('model')}: "
                         f"first-token {first_budget:.0f}s "
                         f"({prompt_tokens} tokens / "
                         f"{config.OLLAMA_FIRST_TOKEN_RATE_TPS} tok/s + "
-                        f"{config.OLLAMA_FIRST_TOKEN_MARGIN_S}s), inter-token "
-                        f"{config.OLLAMA_STALL_TIMEOUT}s, whole request "
-                        f"{config.OLLAMA_GENERATE_TIMEOUT}s"
+                        f"{config.OLLAMA_FIRST_TOKEN_QUEUE_ALLOWANCE_S}s queue + "
+                        f"{config.OLLAMA_FIRST_TOKEN_MARGIN_S}s margin), "
+                        f"inter-token {config.OLLAMA_STALL_TIMEOUT}s, whole "
+                        f"request {config.OLLAMA_GENERATE_TIMEOUT}s"
                     )
                 else:
+                    why = ("OLLAMA_FIRST_TOKEN_RATE_TPS is unset"
+                           if prompt_tokens else "prompt size unknown")
                     log.info(
-                        f"ollama first-token deadline NOT armed (prompt size "
-                        f"unknown) — falling back to the whole-request budget "
-                        f"{config.OLLAMA_GENERATE_TIMEOUT}s; inter-token "
+                        f"ollama first-token deadline NOT armed ({why}) — a "
+                        f"silent prefill is bounded only by the whole-request "
+                        f"budget {config.OLLAMA_GENERATE_TIMEOUT}s; inter-token "
                         f"{config.OLLAMA_STALL_TIMEOUT}s"
+                        + (f"; counted {prompt_tokens} prompt tokens"
+                           if prompt_tokens else "")
                     )
                 while True:
                     line_budget = (

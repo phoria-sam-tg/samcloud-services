@@ -559,10 +559,30 @@ FFMPEG_BIN = _env("FFMPEG_BIN", shutil.which("ffmpeg") or "/opt/homebrew/bin/ffm
 OLLAMA_GENERATE_TIMEOUT = _env_int("OLLAMA_GENERATE_TIMEOUT", 1800)
 
 # How long a generation may go silent AFTER it has produced its first token.
-# Once tokens are flowing, a gap this long is a stopped generation and not a
-# slow one. 60s mirrors the pool's measured figure; this backend has not been
-# characterised to the same depth, and the number is cheap to lower once it is.
-OLLAMA_STALL_TIMEOUT = _env_int("OLLAMA_STALL_TIMEOUT", 60)
+#
+# **300, AND IT WAS 60 FOR ABOUT SIX MINUTES.** 60 mirrored
+# EXO_STALL_TIMEOUT, which is a MEASURED figure for a different backend —
+# p99 52-65ms between tokens, worst healthy gap 3.511s. The comment here said
+# "this backend has not been characterised to the same depth" and then shipped
+# the tight number anyway, which is the same discipline failure
+# OLLAMA_FIRST_TOKEN_RATE_TPS was corrected for in the same change: a bound
+# arms on a measurement, not on another box's constant.
+#
+# Measured on slice immediately after the #904 rollout, 2026-10-08: **2 of the
+# first 6 requests aborted** — "13 chunks then 60s of silence" and "15 chunks
+# then 60s of silence". A 33% abort rate, worse than the 22% the elapsed-time
+# cap was causing. Found in the live log, not in review.
+#
+# 300 is the faithful translation of the original intent. The httpx sync path
+# has always used `read=300`, which is a PER-CHUNK IDLE bound — "300s of
+# silence". The #904 defect was transcribing that into aiohttp's wall-clock
+# `total`, NOT the number itself. So the correct fix restores the semantics and
+# keeps the number, rather than tightening it on the way past.
+#
+# Tighten only on measurement. Inter-token gaps on this backend are still
+# uncharacterised; what is now known is that they exceed 60s in normal
+# operation.
+OLLAMA_STALL_TIMEOUT = _env_int("OLLAMA_STALL_TIMEOUT", 300)
 
 # The first-token deadline, as a function of the prompt. Scales with the prompt
 # because prompt length is the only thing that predicts how long the silence
@@ -601,12 +621,29 @@ OLLAMA_STALL_TIMEOUT = _env_int("OLLAMA_STALL_TIMEOUT", 60)
 #
 # So the budget has THREE terms, because they have different shapes:
 #
-#   QUEUE_ALLOWANCE_S   absolute       waiting for the single slot. Does NOT
-#                                      scale with the prompt — a 15-token
+#   QUEUE_ALLOWANCE_S   absolute       everything before compute starts. Does
+#                                      NOT scale with the prompt — a 15-token
 #                                      prompt waited 72s. Measure from the
 #                                      `queued ~Ns` field in the timing log,
-#                                      and measure it under REPRESENTATIVE
-#                                      contention, not on an idle box.
+#                                      under REPRESENTATIVE contention rather
+#                                      than on an idle box.
+#                                      TWO THINGS LIVE IN THAT FIELD
+#                                      (claude-wafer-services, #904): waiting
+#                                      for the slot, AND loading the weights.
+#                                      Their 24.7s row was 100% weight-load and
+#                                      0% contention — an evicted model, 18.2 GB
+#                                      off disk. Both belong in this budget and
+#                                      both are absolute, so it is not a
+#                                      correctness problem; it is the
+#                                      "which number do I change" problem,
+#                                      because weight-load moves when the MODEL
+#                                      changes and slot-wait moves when
+#                                      contention does. With OLLAMA_KEEP_ALIVE
+#                                      at 300s, any box whose traffic is
+#                                      sparser than five minutes pays a cold
+#                                      load on the first-token path routinely —
+#                                      so measure it on the box you are arming,
+#                                      not on a warm one.
 #   tokens / RATE_TPS   scales         prefill compute. THIS is what
 #                                      `prompt_eval_duration` measures, and it
 #                                      is immune to contention because it

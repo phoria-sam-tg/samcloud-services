@@ -52,19 +52,23 @@ def check(cond, msg):
 # path -> the handler that path MUST resolve to. Written out rather than derived,
 # because deriving it from the app is what makes the bug invisible: the table has
 # to be the independent statement of intent.
+# **AND the method**, which an earlier version of this file left unpinned
+# (samclaude-admin, #904): a handler rebound POST -> GET on the same path still
+# passed. Same class as the defect this file exists for — the thing that
+# changed was not the thing being asserted.
 EXPECTED = {
-    "/health": "health",
-    "/warm": "warm",
-    "/service-docs": "service_docs",
-    "/status": "status",
-    "/models": "list_models",
-    "/v1/models": "list_models_openai",
-    "/v1/models/{model_id:path}": "retrieve_model_openai",
-    "/models/load": "load_model",
-    "/models/unload": "unload_model",
-    "/v1/chat/completions": "chat_completions",
-    "/v1/completions": "completions",
-    "/v1/audio/transcriptions": "create_transcription",
+    "/health": ("health", "GET"),
+    "/warm": ("warm", "GET"),
+    "/service-docs": ("service_docs", "GET"),
+    "/status": ("status", "GET"),
+    "/models": ("list_models", "GET"),
+    "/v1/models": ("list_models_openai", "GET"),
+    "/v1/models/{model_id:path}": ("retrieve_model_openai", "GET"),
+    "/models/load": ("load_model", "POST"),
+    "/models/unload": ("unload_model", "POST"),
+    "/v1/chat/completions": ("chat_completions", "POST"),
+    "/v1/completions": ("completions", "POST"),
+    "/v1/audio/transcriptions": ("create_transcription", "POST"),
 }
 
 
@@ -72,17 +76,28 @@ def main():
     from .server import app
 
     table = {}
+    methods = {}
     for r in app.routes:
         path = getattr(r, "path", None)
         ep = getattr(r, "endpoint", None)
         if path and ep is not None:
             table.setdefault(path, set()).add(ep.__name__)
+            # HEAD and OPTIONS are added by Starlette for a GET; they are not
+            # a second binding and must not read as one.
+            verbs = {m for m in (getattr(r, "methods", None) or set())
+                     if m not in ("HEAD", "OPTIONS")}
+            methods.setdefault(path, set()).update(verbs)
 
-    step(1, "every named path resolves to its own handler")
-    for path, want in sorted(EXPECTED.items()):
+    step(1, "every named path resolves to its own handler, on its own method")
+    for path, (want, verb) in sorted(EXPECTED.items()):
         got = table.get(path)
         check(got == {want},
               f"{path} -> {want}" + (f"  (got {got})" if got != {want} else ""))
+        got_m = methods.get(path)
+        check(got_m == {verb},
+              f"{path} is {verb}"
+              + (f"  (got {sorted(got_m) if got_m else got_m})"
+                 if got_m != {verb} else ""))
 
     step(2, "the one that broke, stated on its own")
     check(table.get("/v1/chat/completions") == {"chat_completions"},

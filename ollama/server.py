@@ -1313,12 +1313,39 @@ def _openai_shape_vlm(data: dict) -> dict:
 # something; it just does not get to assert a rate it cannot support.
 _MIN_TOKENS_FOR_RATE = 32
 
+# The other end of the same problem. Ollama reports `prompt_eval_count` as the
+# WHOLE prompt but `prompt_eval_duration` as only the part it actually
+# evaluated, so a KV-cache hit divides a big count by a tiny duration.
+# Measured live on slice 2026-10-08, minutes after the #904 rollout:
+#
+#   prefill 76321 tok in 22.73s = 3358.2 tok/s
+#
+# which is not a prefill rate, it is a cache hit wearing one. The real cold
+# figure on this box is ~100-104 tok/s, so anything past a few hundred is
+# arithmetic on a reused cache.
+#
+# `claude-wafer-services` established the reuse rule on #904: ollama reuses the
+# cache only when the new prompt is a strict token-prefix EXTENSION of the
+# cached one. Appending a turn qualifies; editing earlier content does not —
+# which is why a context-compression event guarantees a cold prefill on the
+# very next request, at the largest prompt size in the conversation. So the
+# rows that survive this ceiling are exactly the cold prefills, which are the
+# only rows a deadline can be sized from. It is a filter that loses nothing
+# anyone wanted.
+_MAX_PLAUSIBLE_TOK_S = 400
+
 
 def _rate(count: int, duration_ns: int, unit: str) -> str:
     """` = N tok/s`, or an explicit refusal to divide. Never a bare quotient."""
     if count < _MIN_TOKENS_FOR_RATE:
         return f" (under {_MIN_TOKENS_FOR_RATE} tok: no rate)"
-    return f" = {count / (duration_ns / 1e9):.1f} {unit}"
+    r = count / (duration_ns / 1e9)
+    if r > _MAX_PLAUSIBLE_TOK_S:
+        # Named for what it is, and the count kept — the count is the useful
+        # part, it is the quotient that is meaningless.
+        return (f" (cache hit: {r:,.0f} {unit} exceeds "
+                f"{_MAX_PLAUSIBLE_TOK_S}, so this is reuse and not a rate)")
+    return f" = {r:.1f} {unit}"
 
 
 def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):

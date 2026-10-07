@@ -455,6 +455,25 @@ async def service_docs():
                     "tier). /models lists the whole catalogue including what is "
                     "blocked and why."
                 ),
+                "context_length": (
+                    "The served window in tokens, per entry — size your "
+                    "harness against THIS and do not hand-pick one. On a "
+                    "resident model it is what the live instance actually has; "
+                    "on a loadable one it is present only where this box pins "
+                    "num_ctx, because otherwise Ollama derives the window from "
+                    "free VRAM at load time. An ABSENT field means we do not "
+                    "know it, which is not the same as unlimited."
+                ),
+            },
+            "GET /v1/models/{id}": {
+                "description": "OpenAI-compatible retrieve-model — one entry, with its context_length",
+                "auth": True,
+                "notes": (
+                    "Same entry shape and same contract as /v1/models: 404 for "
+                    "anything not on offer right now, blocked models included. "
+                    "Accepts the partial name the chat route accepts; an "
+                    "ambiguous one is a 404 naming the candidates."
+                ),
             },
             "GET /status": {
                 "description": "Full status — backends, models, leases, resource utilisation",
@@ -565,7 +584,8 @@ async def list_models_openai():
     seen: set = set()
     data: list[dict] = []
 
-    def add(model_id: str, owned_by: str, status: str, memory_mb=None):
+    def add(model_id: str, owned_by: str, status: str, memory_mb=None,
+            context_length=None):
         if model_id and model_id not in seen:
             seen.add(model_id)
             entry = {
@@ -577,6 +597,8 @@ async def list_models_openai():
             }
             if memory_mb is not None:
                 entry["memory_mb"] = memory_mb
+            if context_length is not None:
+                entry["context_length"] = context_length
             data.append(entry)
 
     # Tiers first: a caller asking this gateway for the pool asks by tier, and
@@ -590,11 +612,63 @@ async def list_models_openai():
                 else {"resident": [], "loadable": []})
     for m in offering["resident"]:
         if m["backend"] != Backend.EXO.value:   # already added under its tier
-            add(m["name"], m["backend"], "resident", m.get("memory_mb"))
+            add(m["name"], m["backend"], "resident", m.get("memory_mb"),
+                m.get("context_length"))
     for m in offering["loadable"]:
-        add(m["name"], m["backend"], "loadable", m.get("need_mb"))
+        add(m["name"], m["backend"], "loadable", m.get("need_mb"),
+            m.get("context_length"))
 
     return {"object": "list", "data": data}
+
+
+@app.get("/v1/models/{model_id:path}")
+async def retrieve_model_openai(model_id: str):
+    """OpenAI-compatible retrieve-model — one entry, by the id a request names.
+
+    Added with the context field (#903) and for the same reason. A consumer
+    that must size itself against our window had three ways to ask and all
+    three 404'd: `/models/info`, `/v1/models/{id}`, and `/v1/models` carried no
+    window to read. So every consumer of this gateway was guessing, and at
+    least one shipped a hand-picked 65,536 that this endpoint never served —
+    which then looked configured rather than wrong.
+
+    `:path` because model ids here contain slashes
+    (`mlx-community/Qwen2.5-VL-7B-Instruct-4bit`); a plain `{model_id}` matches
+    one segment and 404s exactly the vision models.
+
+    404 for a model this box will not serve right now, INCLUDING a blocked one,
+    so this agrees with `/v1/models` rather than contradicting it: a 200 here
+    for an entry absent from the list would invite the request the list exists
+    to prevent. `/models` remains the operator view that hides nothing, blocked
+    entries and reasons included.
+    """
+    listing = await list_models_openai()
+    for entry in listing["data"]:
+        if entry["id"] == model_id:
+            return entry
+
+    # Then the same substring match the chat route accepts, so a consumer can
+    # look up the window for the exact string it puts in `model:` and not only
+    # for the canonical id. Without this, a caller asking by partial name gets
+    # a working completion and a 404 window, which is the worst of the two.
+    # Ambiguity is a 404 and names the candidates: picking one for the caller
+    # would hand them a window that belongs to a model the chat route might
+    # resolve differently.
+    lower = model_id.lower()
+    hits = [e for e in listing["data"] if lower in e["id"].lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{model_id}' is ambiguous — matches "
+                   f"{', '.join(sorted(e['id'] for e in hits))}",
+        )
+    raise HTTPException(
+        status_code=404,
+        detail=f"Model '{model_id}' is not on offer right now — "
+               f"GET /models for the full catalogue and the reason",
+    )
 
 
 @app.get("/models")
@@ -605,6 +679,7 @@ async def list_models():
                 "backend": mm.backend.value,
                 "port": mm.port,
                 "memory_mb": mm.memory_mb,
+                "context_length": mm.context_length,
                 "lease_id": mm.lease_id,
                 "idle_seconds": int(time.time() - mm.last_used),
                 "request_count": mm.request_count,

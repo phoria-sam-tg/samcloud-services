@@ -14,6 +14,46 @@ OLLAMA_BASE = config.OLLAMA_BASE
 
 log = logging.getLogger("ollama-client")
 
+
+class OllamaStalled(Exception):
+    """A generation went silent past its deadline (#904).
+
+    Carries which deadline fired, because two stalls with the same symptom need
+    telling apart in a log a week later: `first_token` is a prefill that never
+    produced, `inter_token` is a decode that stopped mid-answer. Same shape as
+    `ExoStalled`, so the two backends report a stall the same way.
+    """
+
+    def __init__(self, detail: str, tokens: int = 0, silent_for: float = 0.0,
+                 phase: str = "inter_token", deadline: float = 0.0):
+        super().__init__(detail)
+        self.detail = detail
+        self.tokens = tokens
+        self.silent_for = silent_for
+        self.phase = phase
+        self.deadline = deadline
+
+
+class OllamaRequestTimeout(Exception):
+    """The whole-request budget ran out (#904).
+
+    Distinct from OllamaStalled on purpose. Both used to surface as the same
+    bare `asyncio.TimeoutError`, and a single `except` cannot tell them apart —
+    which is how 17 requests in one day were logged as `Stream error for
+    qwen3.8:27b-mlx:` with nothing after the colon. A request that was
+    producing tokens the whole time and simply ran long is not a stall, and
+    saying so is the difference between "raise the budget" and "the model is
+    stuck".
+    """
+
+    def __init__(self, detail: str, tokens: int = 0, elapsed: float = 0.0,
+                 deadline: float = 0.0):
+        super().__init__(detail)
+        self.detail = detail
+        self.tokens = tokens
+        self.elapsed = elapsed
+        self.deadline = deadline
+
 # Approximate VRAM requirements (MB) for common model sizes.
 # Ollama reports actual size once pulled - these are planning estimates.
 MODEL_MEMORY_ESTIMATES = {
@@ -265,6 +305,17 @@ class OllamaClient:
         r.raise_for_status()
         return r.json()
 
+    # UNCHANGED, AND THAT IS THE POINT (#904). httpx `read` is a per-chunk
+    # IDLE bound — 300s of silence, not 300s of elapsed time — so this line was
+    # always the right shape and needs nothing. The async methods below were
+    # written by transcribing this `300` into aiohttp's `total=`, which is
+    # wall-clock: the intent was always "300s of silence" and the SHAPE was
+    # lost in the httpx -> aiohttp translation. That is the whole bug.
+    #
+    # Left at 300 and NOT wired to the new constants. It covers a prefill as
+    # one long read, so the inter-token budget would be the wrong value here —
+    # and changing a correct line to look like the fix is how the next reader
+    # loses track of which one was broken.
     _stream_timeout = httpx.Timeout(connect=10, read=300, write=10, pool=10)
 
     def generate(self, model: str, prompt: str, **kwargs) -> Iterator[dict]:
@@ -291,45 +342,208 @@ class OllamaClient:
                 if line.strip():
                     yield json.loads(line)
 
-    async def chat_stream(self, model: str, messages: list[dict], **kwargs):
-        """Chat completion, async streaming. Kills connection on cancel."""
+    async def _stream_with_deadlines(self, path: str, payload: dict,
+                                     prompt_tokens: Optional[int] = None):
+        """POST a streaming Ollama request under three separate deadlines (#904).
+
+        WHY NOT aiohttp's own `total=`, which is what this used to be.
+        `total` bounds ELAPSED TIME, so it kills a generation for being long —
+        and being long is the one thing that is not a fault.
+
+        Measured on slice 2026-10-08, counting `Stream error` in `server.log`
+        and NOT Ollama's status column: **18 cut-offs out of 81 `/api/chat`
+        requests, 22%**. The status column undercounts, because our abort races
+        the response completion: 11 of the 18 were recorded `500 | 5m0s` and
+        **6 were recorded `200 | 5m0s`** — the same event, logged as a success.
+        The longest request that actually COMPLETED today ran 285.0s, which is
+        **15 seconds** under the wall. The cap was the failure, and not a rare
+        one.
+
+        What actually wants bounding is SILENCE, and silence means two different
+        things at two points in a request:
+
+          before the first token   prefill, legitimately silent, for longer the
+                                   longer the prompt — so the budget scales with
+                                   the prompt (`ollama_first_token_deadline`)
+          between tokens           a gap here is a stopped generation, not a
+                                   slow one, so it can be tight
+                                   (`OLLAMA_STALL_TIMEOUT`)
+
+        A single silence budget cannot be both: it must cover the worst prefill,
+        which makes it useless at catching a stall during decode.
+
+        The whole-request budget is kept as a leak bound and tracked HERE rather
+        than handed to aiohttp, because aiohttp's `total` and our own
+        `wait_for` both raise `asyncio.TimeoutError` and a single `except`
+        cannot tell them apart. Owning it makes "ran long" and "went silent"
+        different facts with different exceptions — which is the whole point,
+        since they call for opposite responses.
+
+        Same structure, constants and reasoning as `ExoClient.chat_stream`
+        (#830). Asserted by `test_stream_deadlines`.
+        """
         import aiohttp
-        payload = self._with_num_ctx(
-            model, {"model": model, "messages": messages, "stream": True, **kwargs})
+        import asyncio
         session = aiohttp.ClientSession()
         try:
             async with session.post(
-                f"{self.base_url}/api/chat",
+                f"{self.base_url}{path}",
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=300),
+                # `total=None` is NOT "no ceiling". OLLAMA_GENERATE_TIMEOUT
+                # is a real ceiling, enforced in the loop below — because
+                # aiohttp's `total` and our own `wait_for` both raise
+                # asyncio.TimeoutError and one `except` cannot tell them apart.
+                # Owning it is what makes the cause nameable instead of an
+                # empty `{e}`.
+                #
+                # The slot still matters (#97): an unbounded generation can
+                # occupy the single inference slot for minutes and starve every
+                # other route. And raising the ceiling WITHOUT the inter-token
+                # bound would trade a 5-minute truncation for a 30-minute
+                # single-slot occupation on a wedge — so the stall bound is
+                # what makes a generous ceiling affordable, not a nicety.
+                # sock_connect still bounds reaching a dead Ollama, which is
+                # neither a stall nor a long generation.
+                timeout=aiohttp.ClientTimeout(total=None, sock_connect=10),
             ) as resp:
                 resp.raise_for_status()
-                async for line in resp.content:
-                    line = line.decode().strip()
+                stream = resp.content.__aiter__()
+                seen = 0
+                started = time.monotonic()
+                last = started
+                first_budget = config.ollama_first_token_deadline(prompt_tokens)
+                # Logged ARMED, not only on failure. A deadline visible only
+                # when it fires cannot be told apart from one that was never
+                # wired up — which is how the old flat cap went unnoticed for as
+                # long as it did.
+                if prompt_tokens:
+                    log.info(
+                        f"ollama deadlines armed for {payload.get('model')}: "
+                        f"first-token {first_budget:.0f}s "
+                        f"({prompt_tokens} tokens / "
+                        f"{config.OLLAMA_FIRST_TOKEN_RATE_TPS} tok/s + "
+                        f"{config.OLLAMA_FIRST_TOKEN_MARGIN_S}s), inter-token "
+                        f"{config.OLLAMA_STALL_TIMEOUT}s, whole request "
+                        f"{config.OLLAMA_GENERATE_TIMEOUT}s"
+                    )
+                else:
+                    log.info(
+                        f"ollama first-token deadline NOT armed (prompt size "
+                        f"unknown) — falling back to the whole-request budget "
+                        f"{config.OLLAMA_GENERATE_TIMEOUT}s; inter-token "
+                        f"{config.OLLAMA_STALL_TIMEOUT}s"
+                    )
+                while True:
+                    line_budget = (
+                        config.OLLAMA_STALL_TIMEOUT if seen else first_budget
+                    )
+                    remaining = (
+                        started + config.OLLAMA_GENERATE_TIMEOUT
+                        - time.monotonic()
+                    )
+                    # Whichever runs out first, and we record which so the
+                    # handler reports the cause it actually hit rather than the
+                    # one it assumed.
+                    bounded_by_request = remaining <= line_budget
+                    budget = max(0.0, min(line_budget, remaining))
+                    try:
+                        raw = await asyncio.wait_for(
+                            stream.__anext__(), timeout=budget
+                        )
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        elapsed = time.monotonic() - started
+                        if bounded_by_request:
+                            # With no token count the first-token budget IS the
+                            # request budget, so this branch is the one an
+                            # unarmed deadline always reaches. An earlier
+                            # version put that explanation in a separate
+                            # `if not seen and not prompt_tokens` below, which
+                            # could therefore never run — caught by
+                            # `test_stream_deadlines` step 6 looking for the
+                            # reason in the message and not finding it.
+                            unarmed = (
+                                " No first-token deadline was armed, because "
+                                "the prompt size was unknown."
+                                if not prompt_tokens else ""
+                            )
+                            raise OllamaRequestTimeout(
+                                f"the model did not finish within "
+                                f"{config.OLLAMA_GENERATE_TIMEOUT}s "
+                                f"({seen} chunks received in {elapsed:.0f}s). "
+                                f"This is the whole-request budget, NOT a "
+                                f"stall — the generation may have been "
+                                f"producing the whole time. Raise "
+                                f"OLLAMA_GENERATE_TIMEOUT if prompts this "
+                                f"large are expected.{unarmed}",
+                                tokens=seen, elapsed=elapsed,
+                                deadline=float(config.OLLAMA_GENERATE_TIMEOUT),
+                            )
+                        if not seen:
+                            if prompt_tokens:
+                                raise OllamaStalled(
+                                    f"no first token within {first_budget:.0f}s "
+                                    f"for a {prompt_tokens}-token prompt "
+                                    f"(tokens/"
+                                    f"{config.OLLAMA_FIRST_TOKEN_RATE_TPS} + "
+                                    f"{config.OLLAMA_FIRST_TOKEN_MARGIN_S}s). "
+                                    f"Prefill never produced, so this is a "
+                                    f"stuck runner rather than a slow one.",
+                                    tokens=0, silent_for=first_budget,
+                                    phase="first_token", deadline=first_budget,
+                                )
+                            # Unreachable when the prompt size is unknown —
+                            # that case is handled above, where the request
+                            # budget bound us. Kept as a guard rather than
+                            # deleted: if the floor or the clamp ever make the
+                            # first-token budget strictly smaller than the
+                            # request budget with no token count, silence
+                            # before the first token must still not be reported
+                            # as a measured stall.
+                            raise OllamaRequestTimeout(
+                                f"no answer within {first_budget:.0f}s and the "
+                                f"prompt size was unknown, so no first-token "
+                                f"deadline was armed",
+                                tokens=0, elapsed=elapsed,
+                                deadline=first_budget,
+                            )
+                        silent = time.monotonic() - last
+                        raise OllamaStalled(
+                            f"the generation stopped mid-answer: {seen} chunks, "
+                            f"then nothing for {silent:.0f}s (limit "
+                            f"{config.OLLAMA_STALL_TIMEOUT}s). Stuck, not slow.",
+                            tokens=seen, silent_for=silent,
+                            phase="inter_token",
+                            deadline=float(config.OLLAMA_STALL_TIMEOUT),
+                        )
+                    line = raw.decode(errors="replace").strip()
                     if line:
+                        seen += 1
+                        last = time.monotonic()
                         yield json.loads(line)
         finally:
             await session.close()
 
-    async def generate_stream(self, model: str, prompt: str, **kwargs):
+    async def chat_stream(self, model: str, messages: list[dict],
+                          prompt_tokens: Optional[int] = None, **kwargs):
+        """Chat completion, async streaming. Kills connection on cancel."""
+        payload = self._with_num_ctx(
+            model, {"model": model, "messages": messages, "stream": True, **kwargs})
+        async for chunk in self._stream_with_deadlines(
+            "/api/chat", payload, prompt_tokens
+        ):
+            yield chunk
+
+    async def generate_stream(self, model: str, prompt: str,
+                              prompt_tokens: Optional[int] = None, **kwargs):
         """Generate completion, async streaming. Kills connection on cancel."""
-        import aiohttp
         payload = self._with_num_ctx(
             model, {"model": model, "prompt": prompt, "stream": True, **kwargs})
-        session = aiohttp.ClientSession()
-        try:
-            async with session.post(
-                f"{self.base_url}/api/generate",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=300),
-            ) as resp:
-                resp.raise_for_status()
-                async for line in resp.content:
-                    line = line.decode().strip()
-                    if line:
-                        yield json.loads(line)
-        finally:
-            await session.close()
+        async for chunk in self._stream_with_deadlines(
+            "/api/generate", payload, prompt_tokens
+        ):
+            yield chunk
 
     def show_model(self, model: str) -> dict:
         """Get model metadata."""

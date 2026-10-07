@@ -218,6 +218,12 @@ samcloud registry + the `claude-services-slice` device.
 | `AUTH_ENABLED` | `true` | Set `false` to disable auth (development only) |
 | `OLLAMA_NUM_CTX` | unset | Served context window for every Ollama model, in tokens. Unset = Ollama derives one from free VRAM |
 | `OLLAMA_NUM_CTX_MODELS` | unset | Per-model override: `qwen3.8:27b-mlx=262144,qwen3:1.7b=40960`. Wins over `OLLAMA_NUM_CTX` |
+| `OLLAMA_GENERATE_TIMEOUT` | `1800` | Whole streaming request, seconds. Enforced in-process, not by aiohttp |
+| `OLLAMA_STALL_TIMEOUT` | `60` | Max silence **between** tokens, once the first has arrived |
+| `OLLAMA_FIRST_TOKEN_RATE_TPS` | **unset** | Measured prefill rate, tok/s. Unset = no first-token deadline |
+| `OLLAMA_FIRST_TOKEN_MARGIN_S` | `90` | Added to the scaled first-token budget |
+| `OLLAMA_FIRST_TOKEN_MIN_S` | `300` | Floor under the first-token budget, so a short prompt is never worse off |
+| `OLLAMA_CHARS_PER_TOKEN` | `1.5` | Fallback ratio when an Ollama model has no tokenizer |
 | `VLM_PYTHON` | `~/code/mlx-vlm-server/.venv/bin/python` | Python that runs `mlx_vlm.server` |
 | `VLM_HOST` | `127.0.0.1` | Host the on-demand mlx-vlm server binds |
 | `VLM_PORT` | `8801` | Port for the on-demand mlx-vlm server |
@@ -287,6 +293,68 @@ because **Ollama keys a loaded instance by its options** — a request whose
 the deliberate exception: on startup the gateway re-applies the *instance's own*
 window, so a gateway restart cannot bounce a model mid-job to change a number.
 The configured window takes effect on the next real load.
+
+## Streaming deadlines
+
+**A timeout is only meaningful relative to every other timeout on the path, and
+the one that fires first should be the one that reports best.**
+(`claude-containers`, #904.) This gateway used to fire first and report worst.
+
+The owned Ollama streaming path had one bound, aiohttp's `total=` at 300s, and
+`total` bounds **elapsed time**. So a generation streaming tokens steadily was
+killed at 300s for being long — the one thing that is not a fault. Measured on
+slice 2026-10-08, counting `Stream error` in `server.log` rather than Ollama's
+status column: **18 cut-offs in 81 `/api/chat` requests, 22%**, and the longest
+request that actually completed ran **285.0s — 15 seconds** under the wall.
+
+(The status column undercounts: our abort races the response completion, so 11
+were logged `500 | 5m0s` and **6 were logged `200 | 5m0s`** — the same event as
+a success. Count the gateway's own log, not Ollama's.)
+
+Three bounds now, the structure `exo_client` arrived at on #830:
+
+| | what it bounds | default |
+|---|---|---|
+| `OLLAMA_FIRST_TOKEN_*` | silence **before** token 1 — prefill, legitimately silent | **unarmed** |
+| `OLLAMA_STALL_TIMEOUT` | silence **between** tokens — a stopped generation | `60` |
+| `OLLAMA_GENERATE_TIMEOUT` | the whole request | `1800` |
+
+Why not one silence bound for both: prefill produces nothing at all, for longer
+the longer the prompt. `sock_read=60` would kill a 70k-token request at 60s
+instead of 300s — strictly worse, and it would look like a stall. So the
+first-token budget scales with the prompt and the inter-token budget does not.
+
+**The first-token deadline is unarmed by default and setting
+`OLLAMA_FIRST_TOKEN_RATE_TPS` is what enables it** — the MLX runner emits no
+per-request timings, so this box has no measured prefill rate and any default
+would be an invented number. Unarmed, a silent prefill falls back to the
+whole-request budget. The inter-token bound is armed regardless, so the single
+inference slot (#97) is covered either way; it is also what makes a generous
+whole-request ceiling affordable, since raising the ceiling alone would trade a
+5-minute truncation for a 30-minute slot occupation on a wedge.
+
+`total=None` is passed to aiohttp, which is **not** "no ceiling":
+`OLLAMA_GENERATE_TIMEOUT` is enforced in our own loop. aiohttp's `total` and our
+`wait_for` both raise `asyncio.TimeoutError`, and one `except` cannot tell them
+apart — owning the deadline is what makes the cause nameable.
+
+The sync (`httpx`) path is **unchanged and was always correct**: httpx `read` is
+a per-chunk idle bound, i.e. already silence. The bug was transcribing its `300`
+into aiohttp's wall-clock `total=` — the intent was always "300s of silence" and
+the shape was lost in the translation.
+
+Every failure now terminates the stream properly. A cut-off used to log and stop
+yielding: no `[DONE]`, no `finish_reason`, and `TimeoutError` stringifies to the
+empty string so even our log read `Stream error for <model>:` and nothing. Now:
+
+```json
+{"error": {"message": "...", "type": "model_stalled", "deadline": "first_token",
+           "deadline_s": 1257.0, "tokens_before_stall": 0, "silent_for_s": 1257.0},
+ "choices": [{"delta": {}, "finish_reason": "stalled"}]}
+```
+
+`model_stalled` / `request_timeout` / `stream_error`, each with its own
+`finish_reason`, then `[DONE]`.
 
 ## SAMcloud Integration
 

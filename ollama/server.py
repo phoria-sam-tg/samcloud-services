@@ -55,6 +55,7 @@ from .manager import (
 )
 from .manager import TranscriberBusy
 from .exo_client import ExoUnavailable, ExoRequestFailed, ExoStalled
+from .ollama_client import OllamaStalled, OllamaRequestTimeout
 from .samcloud import SamcloudClient
 from .ollama_client import OllamaClient
 from .llama_client import LlamaServerClient
@@ -1301,6 +1302,75 @@ def _openai_shape_vlm(data: dict) -> dict:
 
 
 @app.post("/v1/chat/completions")
+def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):
+    """Log prefill and decode rates off the `done` chunk (#904).
+
+    THIS IS THE MEASUREMENT BOTH #903 AND #904 ARE WAITING ON, and it costs
+    nothing to take. The claim on #904 was that this backend emits no
+    per-request timings — true of `ollama.log`, where the `slot print_timing`
+    lines stop at 2026-09-30 and come from a llama.cpp runner. It is NOT true
+    of the API: `/api/chat` returns `prompt_eval_count` /
+    `prompt_eval_duration` / `eval_count` / `eval_duration` on the final chunk,
+    verified on the live 27b on 2026-10-08. We were already reading two of
+    those four for `usage` and throwing the durations away.
+
+    So the prefill rate gets measured from REAL hermes traffic — real prompt
+    shapes, real sizes — rather than from a synthetic sweep that would occupy
+    the single inference slot for half an hour. Nothing to schedule and nothing
+    to interrupt.
+
+    `prompt_eval_count` is also Ollama's OWN count of the prompt, so logging it
+    beside ours turns `prompt_size.count`'s estimate into a checkable number
+    instead of a hope — the same drift check the pool does (`_check_drift`).
+
+    One number NOT to read as compute: `total_duration` was 73.8s on a 15-token
+    prompt whose prefill and decode together took 1.8s. The rest is queueing
+    behind another request for the single slot. That gap is exactly why an
+    elapsed-time bound is the wrong instrument — a request can spend its whole
+    budget waiting rather than working.
+    """
+    pc = chunk.get("prompt_eval_count")
+    pd = chunk.get("prompt_eval_duration")
+    ec = chunk.get("eval_count")
+    ed = chunk.get("eval_duration")
+    bits = []
+    if pc and pd:
+        bits.append(f"prefill {pc} tok in {pd / 1e9:.2f}s "
+                    f"= {pc / (pd / 1e9):.0f} tok/s")
+    if ec and ed:
+        bits.append(f"decode {ec} tok in {ed / 1e9:.2f}s "
+                    f"= {ec / (ed / 1e9):.1f} tok/s")
+    total = chunk.get("total_duration")
+    if total:
+        # Includes queue wait, so it is NOT prefill + decode. Named `wall` so
+        # nobody derives a rate from it.
+        bits.append(f"wall {total / 1e9:.1f}s")
+        # And the gap stated outright rather than left as arithmetic. This is
+        # the field the #904 correlation is done on: `samclaude-admin` can say
+        # what the seat was doing at a given moment (turn boundaries, adapter
+        # count, tool-call bursts, the `think` tier) but cannot see a request's
+        # durations; we can see the durations but not what held the slot.
+        # Finding the outliers has to be a sort, not a read-and-subtract, or
+        # the correlation does not get done on more than three samples.
+        #
+        # `queued` is the honest name for the residue: it is everything
+        # total_duration counts that is not prefill or decode, which is
+        # dominated by waiting for the single inference slot but is not
+        # exclusively that. Measured 73.8s wall against 1.8s of compute on a
+        # 15-token prompt, so this is the term that makes an elapsed-time
+        # budget unsafe — a request can spend all of it without working.
+        gap = (total - (pd or 0) - (ed or 0)) / 1e9
+        if gap > 0.5:
+            bits.append(f"queued ~{gap:.1f}s ({100 * gap / (total / 1e9):.0f}% "
+                        f"of wall)")
+    if counted and pc:
+        drift = counted - pc
+        bits.append(f"our count {counted} vs ollama {pc} "
+                    f"({drift:+d}, {100 * drift / pc:+.0f}%)")
+    if bits:
+        log.info(f"Ollama timings for {model}: " + "; ".join(bits))
+
+
 async def chat_completions(req: ChatRequest, http_request: Request = None):
     mm = await _resolve_model(req.model)
     if not mm:
@@ -1334,11 +1404,34 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
         if req.max_tokens is not None:
             ollama_kwargs["options"] = {"num_predict": req.max_tokens}
 
+        # Count the prompt, so the first-token deadline can scale to it (#904).
+        # NOT a limit — nothing is refused here, unlike the pool's #837 gate.
+        # The only consumer is the deadline, and an unknown count falls back to
+        # the whole-request budget, i.e. to not having this. So a counting
+        # failure must never fail the request: `count` already degrades to a
+        # chars/token estimate with no tokenizer (the normal case for an Ollama
+        # model, which holds its own weights), and anything else is swallowed.
+        n_prompt = None
+        try:
+            n_prompt, how = prompt_size.count(
+                req.messages, mm.name,
+                models_dir=str(config.MODELS_DIR),
+                chars_per_token=config.OLLAMA_CHARS_PER_TOKEN,
+                tools=req.tools,
+            )
+            log.info(f"Ollama prompt: {n_prompt} tokens by {how}")
+        except Exception as e:
+            log.warning(f"Could not size the prompt for {mm.name} ({e}); the "
+                        f"first-token deadline will not be armed")
+
         if req.stream:
             async def stream():
                 saw_tool_calls = False
                 try:
-                    async for chunk in mgr.ollama.chat_stream(mm.name, ollama_messages, **ollama_kwargs):
+                    async for chunk in mgr.ollama.chat_stream(
+                        mm.name, ollama_messages,
+                        prompt_tokens=n_prompt, **ollama_kwargs
+                    ):
                         delta = {}
                         if "message" in chunk and chunk["message"].get("content"):
                             delta["content"] = chunk["message"]["content"]
@@ -1346,6 +1439,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                             delta["tool_calls"] = _fix_tool_calls(chunk["message"]["tool_calls"])
                             saw_tool_calls = True
                         if chunk.get("done"):
+                            _log_ollama_timings(mm.name, chunk, n_prompt)
                             finish = "tool_calls" if saw_tool_calls else "stop"
                             yield "data: " + json.dumps({
                                 "choices": [{"delta": {}, "finish_reason": finish}]
@@ -1358,8 +1452,76 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                             }) + "\n\n"
                 except asyncio.CancelledError:
                     log.info(f"Client disconnected during stream for {mm.name}")
+                    raise
+                # Everything below TELLS THE CALLER (#904). The headers went out
+                # with the first chunk, so none of this can be a 504 — but the
+                # alternative was worse than a wrong status code: this used to
+                # log and stop yielding, so a cut-off generation reached the
+                # caller as a stream that simply ended. No `[DONE]`, no
+                # finish_reason, and nothing to distinguish it from a short
+                # answer.
+                #
+                # It did NOT, as an earlier version of this comment claimed,
+                # surface to hermes-assistant as the model being unresponsive:
+                # its adapter journal shows the 17 cut-offs of 2026-10-08
+                # absorbed below the turn level by retries, with three turns of
+                # 56, 50 and 31 minutes all completing. A turn makes many
+                # requests. The cost was latency and a wasted inference slot.
+                # What makes this worth fixing anyway is the rule
+                # claude-containers put on #904: a timeout is only meaningful
+                # relative to every other timeout on the path, and the one that
+                # fires first should be the one that reports best. Ours fires
+                # first and used to report worst.
+                except OllamaStalled as e:
+                    log.error(
+                        f"Ollama STALLED mid-stream for {mm.name} on the "
+                        f"{e.phase} deadline ({e.deadline:.0f}s): {e.tokens} "
+                        f"chunks then {e.silent_for:.0f}s of silence"
+                    )
+                    yield "data: " + json.dumps({
+                        "error": {"message": e.detail, "type": "model_stalled",
+                                  "deadline": e.phase,
+                                  "deadline_s": round(e.deadline, 1),
+                                  "tokens_before_stall": e.tokens,
+                                  "silent_for_s": round(e.silent_for, 1)},
+                        "choices": [{"delta": {}, "finish_reason": "stalled"}],
+                    }) + "\n\n"
+                    yield "data: [DONE]\n\n"
+                except OllamaRequestTimeout as e:
+                    # Named apart from a stall because the caller's correct
+                    # response is the opposite: a stall means the runner is
+                    # stuck, this means the request was legitimately long and
+                    # the budget is what to change. The log says the elapsed
+                    # time and the cap, so the next reader gets two numbers
+                    # instead of `Stream error for <model>:` and nothing.
+                    log.error(
+                        f"Ollama request budget exhausted for {mm.name}: "
+                        f"{e.tokens} chunks in {e.elapsed:.0f}s against a "
+                        f"{e.deadline:.0f}s whole-request budget "
+                        f"(OLLAMA_GENERATE_TIMEOUT)"
+                    )
+                    yield "data: " + json.dumps({
+                        "error": {"message": e.detail,
+                                  "type": "request_timeout",
+                                  "deadline_s": round(e.deadline, 1),
+                                  "elapsed_s": round(e.elapsed, 1),
+                                  "tokens_before_timeout": e.tokens},
+                        "choices": [{"delta": {}, "finish_reason": "timeout"}],
+                    }) + "\n\n"
+                    yield "data: [DONE]\n\n"
                 except Exception as e:
-                    log.warning(f"Stream error for {mm.name}: {e}")
+                    # Also terminated now, for the same reason. `{e!r}` not
+                    # `{e}`: a bare TimeoutError stringifies to the empty
+                    # string, which is how 17 cut-off requests were logged as
+                    # `Stream error for qwen3.8:27b-mlx:` with nothing after
+                    # the colon and went unattributed for a day.
+                    log.warning(f"Stream error for {mm.name}: {e!r}")
+                    yield "data: " + json.dumps({
+                        "error": {"message": f"{type(e).__name__}: {e}",
+                                  "type": "stream_error"},
+                        "choices": [{"delta": {}, "finish_reason": "error"}],
+                    }) + "\n\n"
+                    yield "data: [DONE]\n\n"
             return StreamingResponse(stream(), media_type="text/event-stream")
         else:
             # Non-streaming: collect full response via native API
@@ -1372,6 +1534,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                     if chunk["message"].get("tool_calls"):
                         tool_calls = chunk["message"]["tool_calls"]
                 if chunk.get("done"):
+                    _log_ollama_timings(mm.name, chunk, n_prompt)
                     usage = {
                         "prompt_tokens": chunk.get("prompt_eval_count", 0),
                         "completion_tokens": chunk.get("eval_count", 0),

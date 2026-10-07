@@ -2,6 +2,115 @@
 
 Project history and current state. This is a living document.
 
+## 2026-10-08 — Streaming deadlines: silence is bounded, elapsed time is not (#904)
+
+- **The rule**, `claude-containers`' phrasing and better than anything else on
+  the ticket: *a timeout is only meaningful relative to every other timeout on
+  the path, and the one that fires first should be the one that reports best.*
+  This gateway fired first and reported worst.
+- **The defect.** The owned Ollama streaming path had one bound — aiohttp's
+  `total=` at 300s — and `total` bounds **elapsed time**. A generation streaming
+  tokens steadily was killed at 300s for being long, which is the one thing
+  that is not a fault.
+- **The numbers, counted from the right log.** 2026-10-08: **18 `Stream error`
+  events in 81 `/api/chat` requests, 22%**. Ollama's status column undercounts
+  because our abort races the response completion — 11 were recorded
+  `500 | 5m0s` and **6 were recorded `200 | 5m0s`**, the same event logged as a
+  success. The longest request that actually COMPLETED ran **285.0s**, fifteen
+  seconds under the wall. An earlier draft of this said 17 of 138 across two
+  days; `samclaude-admin` corrected both the count and the denominator.
+- **What it did NOT cause**, because the first version of this entry said it
+  did. The 18 cut-offs did not produce 18 visible failures. The seat's adapter
+  journal shows three consecutive turns of 56, 50 and 31 minutes, all accepted,
+  all posting answers, and no matches for error/timeout/retry/stale in its own
+  logs. **A turn makes many requests**; Hermes retried across the boundary. So
+  a 5-minute per-request ceiling coexists with 56-minute turns and was absorbed
+  below the turn level. The cost was latency and a wasted inference slot, not a
+  broken answer.
+- **And ours was not even the first cap for most of the window.** Five of the
+  500s sit at ~3m0s and match `Client disconnected during stream` to the
+  second — eight such disconnects between 00:02 and 00:24, ~3 minutes apart, a
+  caller giving up at ~180s and retrying. They stop at 00:24; our first 5m0s
+  cut-off is at 01:03. **The caller's bound moved at ~00:30, and that is the
+  only reason ours became the visible one.** `min(caller, ours)` is what
+  actually bounds a generation, so this change hands the cap back rather than
+  removing it.
+- **Three bounds, not two.** The structure is `exo_client`'s, which was bitten
+  by exactly this on #830, and the constants in `config.py` are the design doc:
+
+  | | bounds | default |
+  |---|---|---|
+  | `OLLAMA_FIRST_TOKEN_*` | silence **before** token 1 | **unarmed** |
+  | `OLLAMA_STALL_TIMEOUT` | silence **between** tokens | `60` |
+  | `OLLAMA_GENERATE_TIMEOUT` | the whole request | `1800` |
+
+  **`sock_read` alone would have been worse than the bug**: prefill is silent,
+  so a 60s silence bound kills a 70,000-token request at 60s instead of 300s —
+  and reports it as a stall. The first-token budget scales with the prompt
+  because prompt length is the only thing that predicts how long that silence
+  should last; the inter-token budget does not, because once tokens are flowing
+  a gap is a stopped generation.
+- **`total=None` to aiohttp is not "no ceiling".** `OLLAMA_GENERATE_TIMEOUT` is
+  enforced in our own loop with `asyncio.wait_for` per line, because aiohttp's
+  `total` and ours both raise `asyncio.TimeoutError` and a single `except`
+  cannot tell them apart — owning it is what makes the cause nameable instead
+  of an empty `{e}`. The slot still matters (#97), and the inter-token bound is
+  what makes a generous ceiling affordable: raising `total` alone would trade a
+  5-minute truncation for a 30-minute single-slot occupation on a wedge.
+- **The deadline arms on a measurement, not on a default.**
+  `OLLAMA_FIRST_TOKEN_RATE_TPS` is **unset** and setting it is what enables the
+  first-token deadline — the `FOREIGN_IDLE_MB` convention from #861. Nothing
+  measures prefill on this backend: the MLX runner emits no per-request
+  timings, and the `slot print_timing` lines stop at 2026-09-30 and come from a
+  llama.cpp runner whose largest prompt in the entire log is 2,371 tokens. An
+  earlier draft shipped 60 tok/s as a "conservative" default, which is the same
+  mistake #903 is about. Unarmed falls back to the whole-request budget.
+- **A floor, because the scaled budget was a regression without it.** At any
+  plausible rate a short prompt derives *less* than the 300s being replaced —
+  8,000 tokens at 60 tok/s is 223s — so a prompt whose prefill took 250s would
+  have survived the old cap and died under the new one.
+  `OLLAMA_FIRST_TOKEN_MIN_S` is the old cap exactly, which makes the change
+  non-regressive by construction rather than by argument. Found by
+  `test_stream_deadlines` step 1 failing.
+- **The sync path is unchanged and was always correct.** httpx `read` is a
+  per-chunk idle bound — already silence. The async methods were written by
+  transcribing its `300` into aiohttp's wall-clock `total=`: **the intent was
+  always "300s of silence" and the shape was lost in the httpx -> aiohttp
+  translation.** Left at 300 and deliberately not wired to the new constants,
+  because changing a correct line to look like the fix is how the next reader
+  loses track of which one was broken.
+- **Every failure terminates the stream.** `model_stalled`, `request_timeout`
+  and `stream_error`, each with its own `finish_reason`, each followed by
+  `[DONE]`. The generic branch logs `{e!r}` and not `{e}`, because a bare
+  `TimeoutError` stringifies to the empty string — which is how 18 cut-offs
+  were logged as `Stream error for qwen3.8:27b-mlx:` and then nothing.
+- **Two bugs this found in its own making.** The budget-vs-window warning
+  divided by the now-unset rate and raised `ZeroDivisionError` **at import**,
+  firing exactly when a window is pinned — i.e. on the #903 configuration this
+  ships beside, taking the gateway down at startup. Caught by `test_num_ctx`,
+  which pins a window, and invisible to `test_stream_deadlines` alone. And the
+  unknown-prompt message was unreachable: with no token count the first-token
+  budget IS the request budget, so `bounded_by_request` always won.
+- **The prefill rate is measurable for free, and now is.** The claim that this
+  backend emits no per-request timings is true of `ollama.log` and **not of the
+  API**: `/api/chat` returns `prompt_eval_count`, `prompt_eval_duration`,
+  `eval_count` and `eval_duration` on the final chunk — verified on the live
+  27b — and we were already reading two of those four for `usage` while
+  throwing the durations away. `_log_ollama_timings` logs prefill and decode
+  rates on both ollama paths, so the rate arrives from REAL hermes traffic
+  instead of from a synthetic sweep that would hold the single inference slot
+  for half an hour. It also logs our token count beside Ollama's own, which
+  turns `prompt_size.count`'s estimate into a checkable number.
+- **One number not to read as compute.** `total_duration` was **73.8s** on a
+  15-token prompt whose prefill and decode together took **1.8s** — the rest is
+  queueing for the single slot. A rate derived from it would be wrong by 40x,
+  so it is logged as `wall`. It is also a second argument against elapsed-time
+  bounds: a request can spend its whole budget waiting rather than working.
+- **Still outstanding.** The measured rate itself, which is also what #903
+  needs to know what 70,000 tokens costs. And `wafer-services/model-service` is a
+  declared mirror carrying the same `total=300`; the repo fix covers both, its
+  rollout does not.
+
 ## 2026-10-08 — The served context window: pinned, and reported (#903)
 
 - **The number nobody could read.** A consumer sizing itself against this

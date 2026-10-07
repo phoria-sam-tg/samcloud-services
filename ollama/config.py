@@ -516,6 +516,201 @@ WHISPER_LOG_FILE = Path(
 # launchd, whose PATH does not include /opt/homebrew/bin.
 FFMPEG_BIN = _env("FFMPEG_BIN", shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg")
 
+# --- Streaming deadlines for the OWNED backends (ticket #904) ---------------
+# Three numbers with three jobs, because one number cannot do it. The owned
+# Ollama paths had exactly one — `aiohttp.ClientTimeout(total=300)` — and
+# `total` bounds ELAPSED TIME, not silence. So a generation streaming tokens
+# steadily was killed at 300s for being long, which is the one thing that is
+# not a fault.
+#
+# Measured on slice, /api/chat for 2026-10-07/08: 121 x 200 and 17 x 500, and
+# ALL SEVENTEEN of the 500s at exactly `5m0s`. Every one was hermes-assistant
+# (#884), during a delivery test whose results were partly this cap. Successful
+# durations the same day: 34s, 51s, 1m50s, 2m14s, 2m24s, 4m15s — the
+# distribution already touched the ceiling, so 4m15s was a near miss and not a
+# comfortable margin.
+#
+# The shape is taken from the exo pool, which already has it and has the
+# measurements behind it (EXO_STALL_TIMEOUT / EXO_FIRST_TOKEN_*, #830). What
+# changes for the owned backends is only which constants, not the reasoning:
+#
+#   OLLAMA_GENERATE_TIMEOUT    the whole request          a leak bound
+#   OLLAMA_FIRST_TOKEN_*       silence BEFORE token 1     prefill is silent
+#   OLLAMA_STALL_TIMEOUT       silence BETWEEN tokens     a stopped generation
+#
+# The middle one is why `total=` cannot be the mechanism: prefill produces
+# nothing at all, legitimately, for longer the longer the prompt is. A single
+# silence budget must therefore cover the worst prefill, which makes it useless
+# at catching a stall during decode — the failure it exists for.
+OLLAMA_GENERATE_TIMEOUT = _env_int("OLLAMA_GENERATE_TIMEOUT", 1800)
+
+# How long a generation may go silent AFTER it has produced its first token.
+# Once tokens are flowing, a gap this long is a stopped generation and not a
+# slow one. 60s mirrors the pool's measured figure; this backend has not been
+# characterised to the same depth, and the number is cheap to lower once it is.
+OLLAMA_STALL_TIMEOUT = _env_int("OLLAMA_STALL_TIMEOUT", 60)
+
+# The first-token deadline, as a function of the prompt. Scales with the prompt
+# because prompt length is the only thing that predicts how long the silence
+# before token 1 should last.
+#
+# **UNSET BY DEFAULT, AND SETTING IT IS WHAT ARMS THE MECHANISM.** Nothing
+# measures prefill on this backend: the MLX runner emits no per-request
+# timings, and the `slot print_timing` lines in `ollama.log` stop at
+# 2026-09-30 and come from a llama.cpp runner whose largest prompt in the whole
+# log is 2,371 tokens — not this model. So there is no prefill rate for
+# `qwen3.8:27b-mlx`, and no way to attribute today's five-minute requests to
+# prefill rather than decode.
+#
+# An earlier draft of this shipped 60 tok/s as a "conservative" default. That
+# was the same mistake this ticket and #903 are both about: a number nobody
+# measured, installed where a consumer would read it as a decision. With the
+# rate unset, `ollama_first_token_deadline` falls back to the whole-request
+# budget — exactly what `exo_first_token_deadline` does for an unknown prompt
+# size, and exactly today's behaviour minus the elapsed-time bug. The
+# inter-token bound below is what protects the inference slot meanwhile, so
+# nothing is unguarded by leaving this off.
+#
+# Same convention as FOREIGN_IDLE_MB (#861): no default, and a box that has not
+# measured its own floor does not get the mechanism. Measure with a prompt
+# sweep (8k/16k/32k/70k), then set it to a rate BELOW every sample so it is a
+# floor and not an average.
+#
+# Once set, with the floor below:
+#    8,000 tokens ->  max(300, 8000/r + margin)
+#   70,000 tokens ->  max(300, 70000/r + margin)      (#884's trigger size)
+#  262,144 tokens ->  clamped to OLLAMA_GENERATE_TIMEOUT
+OLLAMA_FIRST_TOKEN_RATE_TPS = max(0, _env_int("OLLAMA_FIRST_TOKEN_RATE_TPS", 0))
+OLLAMA_FIRST_TOKEN_MARGIN_S = _env_int("OLLAMA_FIRST_TOKEN_MARGIN_S", 90)
+
+# A FLOOR under the scaled budget, and it is not decoration — without it this
+# change is a regression for small prompts. At 60 tok/s an 8,000-token prompt
+# derives 8000/60 + 90 = 223s, which is TIGHTER than the flat 300s it replaces:
+# a short prompt whose prefill took 250s would have survived the old cap and
+# died under the new one. Found by `test_stream_deadlines` step 1, which
+# asserted the scaled budget beats 300s and was right to.
+#
+# So the deadline is `max(floor, scaled)`: the scaled part can only ever BUY
+# time for a long prompt, never take it from a short one. 300 is the old cap
+# exactly, which makes this change non-regressive by construction rather than
+# by argument.
+OLLAMA_FIRST_TOKEN_MIN_S = _env_int("OLLAMA_FIRST_TOKEN_MIN_S", 300)
+
+# Characters per token when there is no tokenizer for an Ollama model, which is
+# the normal case — Ollama holds its own weights and we do not get a
+# tokenizer.json. Over-counting here LENGTHENS the first-token budget, so the
+# conservative ratio errs toward not cutting a real prefill. Same constant and
+# same reasoning as EXO_CHARS_PER_TOKEN; separate so one backend's calibration
+# does not silently move the other's deadlines.
+OLLAMA_CHARS_PER_TOKEN = float(_env("OLLAMA_CHARS_PER_TOKEN", "1.5"))
+
+
+def ollama_first_token_deadline(prompt_tokens: int | None) -> float:
+    """Seconds to allow before the first token, or the whole-request budget.
+
+    Returns OLLAMA_GENERATE_TIMEOUT unchanged when the prompt size is unknown,
+    so a path that cannot count keeps the whole-request budget rather than a
+    deadline computed from a guess.
+
+    Clamped to the whole-request budget, because a deadline longer than the
+    request's own could never fire.
+    """
+    if (not prompt_tokens or prompt_tokens <= 0
+            or OLLAMA_FIRST_TOKEN_RATE_TPS <= 0):
+        # Either we cannot size the prompt, or this box has not measured its
+        # prefill rate. Both mean the same thing: no deadline computed from a
+        # guess. Falls back to the whole-request budget, which still fires.
+        return float(OLLAMA_GENERATE_TIMEOUT)
+    scaled = (prompt_tokens / OLLAMA_FIRST_TOKEN_RATE_TPS
+              + OLLAMA_FIRST_TOKEN_MARGIN_S)
+    return min(
+        max(float(OLLAMA_FIRST_TOKEN_MIN_S), scaled),
+        float(OLLAMA_GENERATE_TIMEOUT),
+    )
+
+
+# Say out loud when the whole-request budget cannot cover a full-window prefill
+# at the configured rate, because the clamp above makes that silent otherwise:
+# the first-token deadline quietly becomes the request budget and a long prompt
+# is cut by a number nobody chose for it. Only checked where a window is pinned
+# — with none pinned there is no window to reason about.
+def _warn_if_budget_under_window():
+    if OLLAMA_FIRST_TOKEN_RATE_TPS <= 0:
+        # Unarmed: there is no rate, so there is no prefill time to compare the
+        # budget against and nothing to warn about. Also a ZeroDivisionError at
+        # IMPORT if not guarded — and it fires exactly when a window IS pinned,
+        # i.e. on the #903 configuration this ships alongside, which would take
+        # the gateway down at startup. Caught by `test_num_ctx`, which pins a
+        # window; `test_stream_deadlines` alone never would have.
+        return
+    for model, window in OLLAMA_NUM_CTX_MODELS.items():
+        need = window / OLLAMA_FIRST_TOKEN_RATE_TPS + OLLAMA_FIRST_TOKEN_MARGIN_S
+        if need > OLLAMA_GENERATE_TIMEOUT:
+            log.warning(
+                f"OLLAMA_GENERATE_TIMEOUT={OLLAMA_GENERATE_TIMEOUT}s cannot cover "
+                f"a full {window}-token prefill for {model} at "
+                f"{OLLAMA_FIRST_TOKEN_RATE_TPS} tok/s (needs ~{need:.0f}s). A "
+                f"prompt near that window will be cut by the whole-request "
+                f"budget. Raise OLLAMA_GENERATE_TIMEOUT or accept the shorter "
+                f"usable prompt."
+            )
+
+
+def _warn_if_first_token_floor_collapses():
+    """The floor must leave room under the whole-request budget.
+
+    `ollama_first_token_deadline` clamps to OLLAMA_GENERATE_TIMEOUT, so a floor
+    at or above it makes the first-token budget EQUAL the request budget — and
+    then `bounded_by_request` always wins and the first-token phase can never
+    be reported. The deadline still fires, so nothing hangs; what is lost is
+    the distinction between "prefill never produced" and "the request ran out
+    of time", which is the reason there are two numbers. Defaults are 1800 vs
+    300 and fine; this only bites a box that lowers one without the other.
+    Asserted by `test_stream_deadlines` step 10.
+    """
+    if OLLAMA_GENERATE_TIMEOUT <= OLLAMA_FIRST_TOKEN_MIN_S:
+        log.warning(
+            f"OLLAMA_GENERATE_TIMEOUT={OLLAMA_GENERATE_TIMEOUT}s is not above "
+            f"OLLAMA_FIRST_TOKEN_MIN_S={OLLAMA_FIRST_TOKEN_MIN_S}s, so the "
+            f"first-token deadline collapses onto the whole-request budget and "
+            f"a silent prefill will be reported as a request timeout rather "
+            f"than as a stall. Nothing hangs; the diagnosis gets worse."
+        )
+
+
+def _say_first_token_state():
+    """Report whether the first-token deadline is armed, at startup.
+
+    Not a warning — an unmeasured box is a legitimate state and the
+    inter-token bound covers the slot either way. It is said out loud because
+    a deadline that is only visible when it fires cannot be told apart from one
+    that was never wired up, which is how aiohttp's flat `total=` survived as
+    long as it did.
+    """
+    if OLLAMA_FIRST_TOKEN_RATE_TPS > 0:
+        log.info(
+            f"ollama first-token deadline ARMED at "
+            f"{OLLAMA_FIRST_TOKEN_RATE_TPS} tok/s + "
+            f"{OLLAMA_FIRST_TOKEN_MARGIN_S}s, floor "
+            f"{OLLAMA_FIRST_TOKEN_MIN_S}s, ceiling "
+            f"{OLLAMA_GENERATE_TIMEOUT}s"
+        )
+    else:
+        log.info(
+            f"ollama first-token deadline NOT armed: "
+            f"OLLAMA_FIRST_TOKEN_RATE_TPS is unset, so a silent prefill is "
+            f"bounded only by the {OLLAMA_GENERATE_TIMEOUT}s whole-request "
+            f"budget. Measure prefill on this box and set it (#904). "
+            f"Inter-token silence is bounded at {OLLAMA_STALL_TIMEOUT}s "
+            f"regardless, so the inference slot is covered."
+        )
+
+
+_warn_if_budget_under_window()
+_warn_if_first_token_floor_collapses()
+_say_first_token_state()
+
+
 # Force-fit a requested model by unloading whatever is resident.
 # OFF by default: the contract is "publish what is available and let the
 # handshake pick a model that fits", not "evict to satisfy every ask".

@@ -47,6 +47,10 @@
 #
 # It does NOT restart anything. Restarting is `restart-when-idle`'s job and
 # stays a separate, idle-gated step — see ada/README.md.
+#
+# It DOES refuse to leave a clone staged that cannot serve: after the venv
+# syncs, the route bindings are verified and a failure restores the previous
+# commit and exits 7 (#904). Skipped with a note on commits predating #40.
 set -euo pipefail
 
 DEPLOY_DIR=${DEPLOY_DIR:-$HOME/var/samcloud-services-deploy}
@@ -194,9 +198,104 @@ if ! "$DEPLOY_DIR/.venv/bin/pip" install --quiet --upgrade -r "$DEPLOY_DIR/requi
   fi
   say "THE VENV MAY STILL BE PARTIAL. Restoring the code cannot undo a"
   say "half-finished install, so verify before any restart:"
-  say "  $DEPLOY_DIR/.venv/bin/python -c 'import ollama.server'"
+  # NOT `import ollama.server`, which is what this said until #904. A clone
+  # that imports is not a clone that routes: on ff20347 the import succeeded
+  # perfectly while every POST to /v1/chat/completions 422'd, because a helper
+  # had landed under the route decorator. Recommending the weaker check here
+  # was the worst place for it — this is the one path where the reader is
+  # already in trouble and reaching for the script's own guidance
+  # (claude-wafer-services, reviewing #40).
+  say "  (cd $DEPLOY_DIR && .venv/bin/python -m ollama.test_route_bindings)"
   exit 5
 fi
 
+# GATE THE SURFACE, don't just document it. #904 reached main and this script
+# staged it; the running gateway kept serving only because it had loaded the
+# old module three days earlier. `deploy/README.md` now tells the operator to
+# verify the bindings before restarting, and documentation is not a gate — the
+# absence of this check IS the ticket, so writing down what to check and still
+# leaving it to whoever remembers repeats the defect one turn later.
+#
+# A staged commit that cannot route is exactly as fatal as a staged commit
+# whose dependencies failed to install, and until now only one of the two was
+# gated. Same `$PREV` restore as the pip failure above, distinct exit code.
+#
+# Only the route bindings, not all three suites from the README: this gates the
+# failure mode "the clone imports but does not serve", which is invisible until
+# something restarts and is not caught by review. The deadline and num_ctx
+# suites assert logic, where a failure is a bug to read rather than a reason to
+# refuse a deploy, and they stay in the README as pre-restart checks.
+#
+# THE CHECK IS INLINE, NOT `-m ollama.test_route_bindings`, and that is the
+# whole point. The first draft of this gate ran the suite from the deployed
+# commit and skipped when it was absent — which meant it could not catch
+# ff20347, the actual defect, because the suite arrived in #40 and the defect
+# shipped in #39. Staging the broken commit printed "bindings NOT verified"
+# and then "route bindings verified" on the next line, and exited 0. Found by
+# running it against ff203471 instead of reasoning about it.
+#
+# A gate that depends on the deployed commit shipping its own test cannot
+# verify any commit older than the test. This asserts the property directly,
+# so it holds on every commit that has the route — including a rollback target
+# predating #40, which is precisely the move #904 needed in a hurry (the
+# deploy clone went back to 6691982 before anything was fixed forward).
+#
+# `setdefault`, not assignment: a box with a real SC_TOKEN keeps it. The value
+# only has to let the module import — nothing here serves a request.
+#
+# The suite is still run when present, because it asserts four properties this
+# cannot (the written-out table, coverage, double-binding, a live POST). Both
+# must pass. Only this one is required.
+if ! (cd "$DEPLOY_DIR" && .venv/bin/python - <<'ROUTECHECK' >/dev/null 2>&1
+import os, sys
+os.environ.setdefault("SC_TOKEN", "rollout-route-check")
+from ollama.server import app
+bound = {}
+for r in app.routes:
+    ep = getattr(r, "endpoint", None)
+    if ep is not None:
+        bound.setdefault(r.path, set()).add(ep.__name__)
+# A helper landing under a decorator is the failure (#904). It shows up two
+# ways: a private name serving a path, or the chat route not on its handler.
+private = sorted(p for p, n in bound.items() if any(x.startswith("_") for x in n))
+chat = bound.get("/v1/chat/completions", set())
+sys.exit(1 if private or chat != {"chat_completions"} else 0)
+ROUTECHECK
+); then
+  say "ROUTE BINDINGS FAILED at $SHA — the clone imports but does not route (#904)."
+  if [ -n "${PREV:-}" ] && [ "$PREV" != "$SHA" ]; then
+    git -C "$DEPLOY_DIR" checkout --quiet --detach "$PREV"
+    git -C "$DEPLOY_DIR" reset --hard --quiet "$PREV"
+    say "code restored to $(git -C "$DEPLOY_DIR" rev-parse --short HEAD) (where it was)"
+  else
+    say "code left at $SHA — there was no earlier commit to restore"
+  fi
+  say "DO NOT RESTART. See which path resolves where with:"
+  say "  (cd $DEPLOY_DIR && .venv/bin/python -c 'from ollama.server import app;"
+  say "   print({r.path: r.endpoint.__name__ for r in app.routes})')"
+  exit 7
+fi
+verified="route bindings verified"
+if [ -f "$DEPLOY_DIR/ollama/test_route_bindings.py" ]; then
+  if ! (cd "$DEPLOY_DIR" && .venv/bin/python -m ollama.test_route_bindings >/dev/null 2>&1); then
+    say "test_route_bindings FAILED at $SHA — the chat route binds, something else does not."
+    if [ -n "${PREV:-}" ] && [ "$PREV" != "$SHA" ]; then
+      git -C "$DEPLOY_DIR" checkout --quiet --detach "$PREV"
+      git -C "$DEPLOY_DIR" reset --hard --quiet "$PREV"
+      say "code restored to $(git -C "$DEPLOY_DIR" rev-parse --short HEAD) (where it was)"
+    else
+      say "code left at $SHA — there was no earlier commit to restore"
+    fi
+    say "DO NOT RESTART. Read the failure in full with:"
+    say "  (cd $DEPLOY_DIR && .venv/bin/python -m ollama.test_route_bindings)"
+    exit 7
+  fi
+  verified="$verified, test_route_bindings passed"
+else
+  # Say what was NOT checked. The first draft claimed "verified" on this path.
+  verified="$verified (inline only — $(git -C "$DEPLOY_DIR" rev-parse --short HEAD) predates ollama/test_route_bindings)"
+fi
+
 say "$DEPLOY_DIR is at $(git -C "$DEPLOY_DIR" rev-parse --short HEAD) (detached), venv synced"
+say "$verified"
 say "nothing restarted — that is restart-when-idle's step"

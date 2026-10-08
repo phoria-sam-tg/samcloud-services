@@ -512,6 +512,30 @@ def main():
     #
     # So drive the emitter for every cause and evaluate BOTH detectors on each
     # frame, the way the client does.
+    # THESE TWO CONDITIONS ARE A COPY OF SOMEONE ELSE'S LOGIC, not a property
+    # of our own code — read from Hermes' installed source on 2026-10-08 and
+    # reproduced here (samclaude-admin's caveat to claude-wafer-services, which
+    # applies to this helper with more force: their check runs pre-restart on
+    # one box, this one gates merges for everyone):
+    #
+    #   chat_completion_helpers.py:3219  `if not chunk.choices:`
+    #                                    -> _choiceless_chunk (:3046), which
+    #                                       raises on error_type/error_message
+    #                                       and reads NO accumulated content
+    #   chat_completion_helpers.py:338   _provider_stream_error_from_text
+    #     :341  `if not text: return None`      text == accumulated content
+    #     :344  `if finish_reason not in _PROVIDER_STREAM_ERROR_FINISH_REASONS`
+    #     :60   _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error","error_finish"}
+    #
+    # SO THIS IS A STRUCTURAL PROXY AND NOT THE AUTHORITY. It can show a frame
+    # is malformed; it CANNOT show a well-formed frame is detected — only the
+    # client can, and claude-containers' gate executes the frames against it.
+    # If the two disagree, the executable one is right.
+    #
+    # Treat divergence as expected drift: a Hermes upgrade or a vendored-client
+    # bump can leave this green while asserting conditions that no longer
+    # exist — a check naming a cause it no longer measures, which is the exact
+    # defect class #904 is about. Re-date the citation when Hermes moves.
     def detectable(f):
         d1 = (f.get("choices") == []
               and (f.get("error_type") or f.get("error_message")))
@@ -582,6 +606,19 @@ def main():
           or "error_type reaches the message: False" in srv_s,
           "B being detected-but-thin is recorded, so nobody reads the merged "
           "state as closing #904's second half")
+
+    _self = open(os.path.join(os.path.dirname(__file__),
+                              "test_stream_deadlines.py")).read()
+    check("chat_completion_helpers.py:3219" in _self
+          and "chat_completion_helpers.py:338" in _self
+          and "2026-10-08" in _self,
+          "this suite's own detector conditions cite their origin and the "
+          "date they were read — they are a COPY of Hermes' guards, not a "
+          "property of our code, and a client upgrade can leave this green "
+          "while asserting conditions that no longer exist")
+    check("STRUCTURAL PROXY AND NOT THE AUTHORITY" in _self,
+          "...and say so: this can show a frame is malformed, not that a "
+          "well-formed frame is detected. Only the client can do that")
 
     check("ASSEMBLES" in srv_s and "manufactured success" in srv_s,
           "the source records what the silence actually cost: not a dropped "

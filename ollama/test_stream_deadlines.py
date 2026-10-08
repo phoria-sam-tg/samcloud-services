@@ -525,7 +525,12 @@ def main():
     #   chat_completion_helpers.py:338   _provider_stream_error_from_text
     #     :341  `if not text: return None`      text == accumulated content
     #     :344  `if finish_reason not in _PROVIDER_STREAM_ERROR_FINISH_REASONS`
-    #     :60   _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error","error_finish"}
+    #     :60   _PROVIDER_STREAM_ERROR_FINISH_REASONS -- its value is
+    #           HERMES_ERROR_REASONS below, and that is the ONLY copy of it in
+    #           this file. claude-wafer-services' design, and better than
+    #           mine: two copies is two things to drift, and an assertion that
+    #           they match is a check that exists only because the duplication
+    #           does. One copy cannot disagree with itself.
     #
     # SO THIS IS A STRUCTURAL PROXY AND NOT THE AUTHORITY. It can show a frame
     # is malformed; it CANNOT show a well-formed frame is detected — only the
@@ -538,9 +543,9 @@ def main():
     # defect class #904 is about. Re-date the citation when Hermes moves.
     # THE CITED SET, AS A CONSTANT, so `d2` is derived from the citation rather
     # than merely accompanied by it. samclaude-admin's stronger property, found
-    # in claude-wafer-services' #48 where the comment quoted
-    # `{"error","error_finish"}` and the code twelve lines down tested
-    # `reason not in SUCCESSY` — a faithful implementation of rule **v2**,
+    # in claude-wafer-services' #48 where the comment cited Hermes' set
+    # correctly and the code twelve lines down tested `reason not in SUCCESSY`
+    # instead — a faithful implementation of rule **v2**,
     # which claude-containers had already disproved by running it:
     #
     #   v1  never stamp a finish_reason on a failure        too strong
@@ -559,7 +564,10 @@ def main():
     # So: one constant, used by `d2` and checked against the quoted values
     # below. A Hermes change that moves the set now breaks one thing loudly
     # instead of leaving a green check under a correct-looking citation.
-    HERMES_ERROR_REASONS = {"error", "error_finish"}     # :60, cited above
+    # THE ONE COPY. Read from chat_completion_helpers.py:60 on 2026-10-08.
+    # Nothing else in this file restates it, so a Hermes change edits exactly
+    # one line and the membership check below keeps `d2` honest about it.
+    HERMES_ERROR_REASONS = {"error", "error_finish"}
 
     def detectable(f):
         d1 = (f.get("choices") == []
@@ -641,10 +649,12 @@ def main():
           "date they were read — they are a COPY of Hermes' guards, not a "
           "property of our code, and a client upgrade can leave this green "
           "while asserting conditions that no longer exist")
-    check(HERMES_ERROR_REASONS == {"error", "error_finish"},
-          f"the constant matches the set quoted in the citation "
-          f"({sorted(HERMES_ERROR_REASONS)}) — the citation is asserted "
-          f"AGAINST the implementation, not merely placed above it")
+    # No "the constant equals the cited values" check here, deliberately.
+    # It would be a second copy of the set asserting agreement with the first,
+    # i.e. a check that exists only because of the duplication it detects
+    # (claude-wafer-services). The honest assertion is the one below: that `d2`
+    # is DERIVED from the constant, which is what makes the citation true of
+    # the code rather than merely adjacent to it.
     # Sliced to the FUNCTION BODY, not the file: the comment above quotes the
     # defective form to explain it, so a file-wide absence check fails on the
     # fix. Fourth time this trap has landed here, and the second time inside

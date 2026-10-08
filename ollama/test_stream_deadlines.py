@@ -435,12 +435,15 @@ def main():
     check(body.count('yield "data: [DONE]\\n\\n"') == 4,
           f"exactly 4 [DONE] emissions: finish, stall, timeout, error "
           f"(got {body.count('yield (data: [DONE]'.replace('(', chr(34)))})")
-    check(body.count('"error_type": "model_stalled"') == 1
-          and body.count('"error_type": "request_timeout"') == 1
-          and body.count('"error_type": "stream_error"') == 1,
-          "each failure carries its own error_type at top level, so a caller "
-          "can tell them apart without parsing prose — and WITHOUT a "
-          "finish_reason, which step 16 forbids")
+    # The three causes are now passed to the one emitter rather than spelled
+    # out per branch, so assert the CALLS, not the literals.
+    check(body.count('"model_stalled", e.detail') == 1
+          and body.count('"request_timeout", e.detail') == 1
+          and body.count('"stream_error", f"{type(e).__name__}: {e}"') == 1,
+          "each failure names its own cause to the emitter, so a caller can "
+          "tell them apart — noting claude-containers' finding that for "
+          "Hermes specifically the three collapse to a generic "
+          "provider_stream_error and only the TEXT distinguishes them")
     # The EXACT line, not the substring: the comment above it in server.py
     # also contains `{e!r}`, so a presence check passed on the reverted code
     # when this was mutation-tested. "Assert a count, not a presence" —
@@ -452,46 +455,100 @@ def main():
     check("prompt_tokens=n_prompt" in body,
           "the counted prompt is passed through, so the deadline is armed")
 
-    step(16, "a failure frame is DETECTABLE, not merely honest")
-    # The rule is "never stamp a finish_reason a client could read as
-    # SUCCESS", not "never stamp one". samclaude-admin read Hermes' source:
-    #   _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
-    #   if not text: return None            <- needs non-empty content
-    #   if reason not in that set: return None
-    # So "stalled"/"timeout" were invisible (not in the set) and `choices: []`
-    # — the first fix — is invisible for BOTH reasons. Asserting the exact
-    # JSON-key forms, not substrings: the comments here discuss these fields
-    # in prose and a presence check passes on reverted code
-    # (claude-wafer-services; and my own {e!r} trap one step down).
+    step(16, "a failure emits BOTH detector shapes, in order")
+    # Hermes has two detectors on two branches, each blind to what the other
+    # catches (claude-containers, driven against the installed client):
+    #   A choices: [] + flat pair -> _choiceless_chunk, needs NO content
+    #   B populated + delta.content + finish_reason "error" -> the text detector
+    # B alone works today but makes one field load-bearing, and that field is
+    # byte-identical to error_message. A alone is what admin asked for. Both.
+    # Imported defensively so this step REPORTS on a tree without the emitter
+    # rather than aborting the run — an ImportError halts main() and the named
+    # checks never appear, which is the weaker evidence of the two.
+    try:
+        from .server import _failure_frames, _FAILURE_FINISH_REASON
+    except ImportError:
+        _failure_frames = None
+        _FAILURE_FINISH_REASON = None
+    check(_failure_frames is not None,
+          "server exposes _failure_frames — the one emitter for the two "
+          "detector shapes")
+    frames = (_failure_frames("request_timeout", "cap fired after 1800s",
+                              {"deadline_s": 1800.0, "elapsed_s": 1801.2})
+              if _failure_frames else [])
+    check(len(frames) == 2, f"two frames per failure (got {len(frames)})")
+    A, B = (frames + [{}, {}])[:2]
+    check(A.get("choices") == [],
+          "A is choiceless — the path that needs no accumulated content, and "
+          "the one a prefill-phase cap can actually reach")
+    check(A.get("error_type") == "request_timeout" and A.get("error_message"),
+          "...carrying the flat pair _choiceless_chunk reads off the chunk")
+    check(A.get("error", {}).get("deadline_s") == 1800.0,
+          "...and the nested detail, so deadline_s/elapsed_s survive")
+    check((B.get("choices") or [{}])[0].get("delta", {}).get("content")
+          == "cap fired after 1800s",
+          "B carries NON-EMPTY delta.content — the only field the text "
+          "detector reads, which is why it is not duplication of error_message")
+    check((B.get("choices") or [{}])[0].get("finish_reason") == "error"
+          and _FAILURE_FINISH_REASON == "error",
+          'B uses "error", the one value no client reads as normal completion')
+    check(bool(frames) and frames.index(A) < frames.index(B),
+          "A is emitted FIRST, so it raises in the chunk loop before B is read")
+
     srv_s = open(os.path.join(os.path.dirname(__file__), "server.py")).read()
     ob = srv_s.split("if mm.backend == Backend.OLLAMA:", 1)[1].split(
         'return StreamingResponse(stream(), media_type="text/event-stream")', 1)[0]
     for bad in ('"finish_reason": "stalled"', '"finish_reason": "timeout"'):
         check(bad not in ob,
-              f'no {bad} — an unrecognised reason degrades to "assume '
-              f'normal" in most clients, which is the actual defect: those '
-              f'frames did not merely lie, they fell through to success')
-    check(ob.count('"choices": [],') == 0,
-          f'and NOT `choices: []` either ({ob.count(chr(34)+"choices"+chr(34)+": [],")})'
-          f' — it has neither text nor a reason, so it is invisible twice over')
-    check(ob.count('"finish_reason": _FAILURE_FINISH_REASON') == 3,
-          f'all three failure frames use the one conventional failure value '
-          f'({ob.count(chr(34)+"finish_reason"+chr(34)+": _FAILURE_FINISH_REASON")})')
-    check('_FAILURE_FINISH_REASON = "error"' in srv_s,
-          '...which is "error" — the one value no client reads as normal '
-          'completion')
-    check(ob.count('"delta": {"content":') == 3,
-          f'each carries NON-EMPTY content, because the guard needs text as '
-          f'well as a reason ({ob.count(chr(34)+"delta"+chr(34)+": {"+chr(34)+"content"+chr(34)+":")})')
-    check(ob.count('"error_type":') == 3 and ob.count('"error_message":') == 3,
-          "...and the cause at TOP level too, for a client that reads only "
-          "the canonical shape and never opens the nested object")
-    check(ob.count('"error": {') == 3,
-          "the nested object is KEPT beside them, so deadline_s / elapsed_s / "
-          "tokens_before_* survive for anything reading extras")
+              f'no {bad} — an unrecognised reason degrades to "assume normal", '
+              f'which is why those frames fell through to success')
+    # THE CONJUNCTION, asserted per frame rather than as two marginal counts
+    # (claude-wafer-services). Two counts of three do not state that the three
+    # are the SAME three: remove the text from one frame, add a stray match
+    # elsewhere, and both counts stay at 3 while a frame goes silent. A
+    # conjunction is not asserted by counting its conjuncts — "assert a count,
+    # not a presence" one step further on, and this conjunction has already
+    # been violated once in this file.
+    #
+    # So drive the emitter for every cause and evaluate BOTH detectors on each
+    # frame, the way the client does.
+    def detectable(f):
+        d1 = (f.get("choices") == []
+              and (f.get("error_type") or f.get("error_message")))
+        ch = (f.get("choices") or [{}])[0]
+        d2 = (bool(ch.get("delta", {}).get("content"))
+              and str(ch.get("finish_reason", "")).lower()
+              in {"error", "error_finish"})
+        return bool(d1), bool(d2)
+
+    for cause, msg in (("model_stalled", "13 chunks then 60s of silence"),
+                       ("request_timeout", "did not finish within 1800s"),
+                       ("stream_error", "TimeoutError: ")):
+        fs = _failure_frames(cause, msg, {}) if _failure_frames else []
+        verdicts = [detectable(f) for f in fs]
+        check(len(fs) == 2, f"{cause}: two frames (got {len(fs)})")
+        check(verdicts and verdicts[0][0],
+              f"{cause}: frame A satisfies detector 1 (choiceless + flat pair)")
+        check(len(verdicts) > 1 and verdicts[1][1],
+              f"{cause}: frame B satisfies detector 2 — text AND a known "
+              f"reason ON THE SAME FRAME, which two marginal counts cannot say")
+        check(all(any(v) for v in verdicts),
+              f"{cause}: EVERY emitted frame is seen by at least one detector "
+              f"— no frame is shape C or D")
+
+    check(ob.count("for frame in _failure_frames(") == 3,
+          f'all three branches go through the one emitter, so the two-frame '
+          f'sequence cannot be right in two places and wrong in the third '
+          f'({ob.count("for frame in _failure_frames(")})')
+    check(ob.count('yield "data: [DONE]') == 4,
+          f'and every terminal path still ends with [DONE] '
+          f'({ob.count(chr(34) + "data: [DONE]")})')
     check('"finish_reason": finish' in ob,
-          "and the SUCCESS frame is untouched — the rule is about which "
-          "value, not about removing the field")
+          "the SUCCESS frame is untouched — the rule is about which value, "
+          "not about removing the field")
+    check("ASSEMBLES" in srv_s and "manufactured success" in srv_s,
+          "the source records what the silence actually cost: not a dropped "
+          "error but a well-formed response accepted as an answer")
 
     step(15, "the armed/not-armed line reports the state it is actually in")
     # Caught in the live log a minute after the #904 restart: the branch keyed

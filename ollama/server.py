@@ -1392,6 +1392,59 @@ def _rate(count: int, duration_ns: int, unit: str,
 # (samclaude-admin).
 _FAILURE_FINISH_REASON = "error"
 
+# TWO FRAMES PER FAILURE, because Hermes has TWO detectors on TWO branches and
+# each is blind to what the other catches. Driven by claude-containers against
+# the installed client, not read (#904):
+#
+#   A  choices: []  + flat error_type/error_message
+#        -> _choiceless_chunk (:3046, from :3219 `if not chunk.choices`)
+#        -> RAISES, and touches NO accumulated content
+#   B  choices: [{delta.content, finish_reason: "error"}]
+#        -> _provider_stream_error_from_text (:341, called at :3428)
+#        -> RAISES, but :341 is `if not text` and text is the ACCUMULATED
+#           assistant content
+#   C  choices: [] with the error fields dropped        -> silent
+#   D  choices: [{delta:{}, finish_reason:"timeout"}]    -> silent (the #39 bug)
+#
+# B alone is sound today — B's own `delta.content` becomes that accumulated
+# text, which is why all three frames were measured raising. But it makes ONE
+# field load-bearing, and that field is byte-identical to `error_message`: a
+# future reader deleting the "duplication" would be making an obviously correct
+# tidy-up, every other field and every grep-based gate would stay green, and
+# detection would silently become shape D.
+#
+# A is what samclaude-admin asked for and is the more robust path — it needs no
+# content at all, and it is a shape Hermes already handles for another provider
+# (DeepInfra, #65631), so this speaks an existing convention rather than one
+# invented for us.
+#
+# So: A first, then B. A raises in the chunk loop before B is read, so B costs
+# this client nothing and serves any consumer that ignores choiceless chunks.
+# Neither frame is a single point of failure for the other.
+#
+# WHAT THE SILENCE COSTS, so this is not tidied away either: with no frame
+# either detector sees, a capped stream does not merely drop the error — it
+# ASSEMBLES. `effective_finish_reason` becomes `finish_reason or "stop"`
+# (:3427), choices is built populated (:3442), and `validate_response` returns
+# True on choices being non-empty. A manufactured success, with whatever tokens
+# had streamed becoming the reply and nothing saying the request was cut.
+def _failure_frames(error_type: str, message: str, detail: dict) -> list:
+    """The two SSE payloads for one failure, in detection order."""
+    return [
+        # A — choiceless. First, because it needs no accumulated content.
+        {"error": {"message": message, "type": error_type, **detail},
+         "error_type": error_type,
+         "error_message": message,
+         "choices": []},
+        # B — populated, for the text detector and for other consumers.
+        # `delta.content` is NOT duplication of error_message: it is the only
+        # field that detector reads.
+        {"error_type": error_type,
+         "error_message": message,
+         "choices": [{"delta": {"content": message},
+                      "finish_reason": _FAILURE_FINISH_REASON}]},
+    ]
+
 
 def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):
     """Log prefill and decode rates off the `done` chunk (#904).
@@ -1579,19 +1632,14 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                         f"{e.phase} deadline ({e.deadline:.0f}s): {e.tokens} "
                         f"chunks then {e.silent_for:.0f}s of silence"
                     )
-                    yield "data: " + json.dumps({
-                        "error": {"message": e.detail, "type": "model_stalled",
-                                  "deadline": e.phase,
-                                  "deadline_s": round(e.deadline, 1),
-                                  "tokens_before_stall": e.tokens,
-                                  "silent_for_s": round(e.silent_for, 1)},
-                        # Top-level too, because a consumer that reads only the
-                        # OpenAI shape never opens the nested object.
-                        "error_type": "model_stalled",
-                        "error_message": e.detail,
-                        "choices": [{"delta": {"content": e.detail},
-                                     "finish_reason": _FAILURE_FINISH_REASON}],
-                    }) + "\n\n"
+                    for frame in _failure_frames(
+                        "model_stalled", e.detail,
+                        {"deadline": e.phase,
+                         "deadline_s": round(e.deadline, 1),
+                         "tokens_before_stall": e.tokens,
+                         "silent_for_s": round(e.silent_for, 1)},
+                    ):
+                        yield "data: " + json.dumps(frame) + "\n\n"
                     yield "data: [DONE]\n\n"
                 except OllamaRequestTimeout as e:
                     # Named apart from a stall because the caller's correct
@@ -1606,17 +1654,13 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                         f"{e.deadline:.0f}s whole-request budget "
                         f"(OLLAMA_GENERATE_TIMEOUT)"
                     )
-                    yield "data: " + json.dumps({
-                        "error": {"message": e.detail,
-                                  "type": "request_timeout",
-                                  "deadline_s": round(e.deadline, 1),
-                                  "elapsed_s": round(e.elapsed, 1),
-                                  "tokens_before_timeout": e.tokens},
-                        "error_type": "request_timeout",
-                        "error_message": e.detail,
-                        "choices": [{"delta": {"content": e.detail},
-                                     "finish_reason": _FAILURE_FINISH_REASON}],
-                    }) + "\n\n"
+                    for frame in _failure_frames(
+                        "request_timeout", e.detail,
+                        {"deadline_s": round(e.deadline, 1),
+                         "elapsed_s": round(e.elapsed, 1),
+                         "tokens_before_timeout": e.tokens},
+                    ):
+                        yield "data: " + json.dumps(frame) + "\n\n"
                     yield "data: [DONE]\n\n"
                 except Exception as e:
                     # Also terminated now, for the same reason. `{e!r}` not
@@ -1625,14 +1669,10 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                     # `Stream error for qwen3.8:27b-mlx:` with nothing after
                     # the colon and went unattributed for a day.
                     log.warning(f"Stream error for {mm.name}: {e!r}")
-                    yield "data: " + json.dumps({
-                        "error": {"message": f"{type(e).__name__}: {e}",
-                                  "type": "stream_error"},
-                        "error_type": "stream_error",
-                        "error_message": f"{type(e).__name__}: {e}",
-                        "choices": [{"delta": {"content": f"{type(e).__name__}: {e}"},
-                                     "finish_reason": _FAILURE_FINISH_REASON}],
-                    }) + "\n\n"
+                    for frame in _failure_frames(
+                        "stream_error", f"{type(e).__name__}: {e}", {},
+                    ):
+                        yield "data: " + json.dumps(frame) + "\n\n"
                     yield "data: [DONE]\n\n"
             return StreamingResponse(stream(), media_type="text/event-stream")
         else:

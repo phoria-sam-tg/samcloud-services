@@ -329,8 +329,23 @@ fi
 # claude-containers' gate EXECUTES the frames against Hermes in the container;
 # that is the only check that can show a well-formed frame is actually
 # DETECTED. This one runs where that cannot — on every box, with no network and
-# no client — and it can only show a frame is MALFORMED. If the two ever
-# disagree, the executable one is right.
+# no client — and it can only show a frame is MALFORMED. If the two disagree,
+# the executable one is right.
+#
+# THAT IS NOT HYPOTHETICAL — IT HAPPENED TO THIS CHECK, within two hours of the
+# sentence above being written, and in the direction the sentence predicted.
+# The `d2` test below was `reason not in SUCCESSY`, a blocklist of success
+# values. claude-containers drove the sentinel through Hermes' own function and
+# found FOUR values — "timeout", "stalled", "aborted", "cancelled" — that this
+# proxy passed and Hermes' second detector ignored. samclaude-admin found it by
+# reading the citation against the code twelve lines apart.
+#
+# Neither the citation nor a check that the citation is PRESENT would have
+# caught it: a citation that is not asserted against the implementation beneath
+# it is the same class as a comment explaining code it contradicts
+# (samclaude-admin). What caught it was the authority, which holds no copy of
+# the set because it calls Hermes directly. So read the hierarchy above as a
+# fact about this file rather than as a disclaimer.
 #
 # AND IT WORKS BY REIMPLEMENTING SOMEBODY ELSE'S GUARDS, which is the risk in
 # it (samclaude-admin). The two conditions below are a COPY of Hermes' logic as

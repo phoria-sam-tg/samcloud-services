@@ -546,6 +546,22 @@ def main():
     check('"finish_reason": finish' in ob,
           "the SUCCESS frame is untouched — the rule is about which value, "
           "not about removing the field")
+    # The heading a skimmer reads must not contradict the code 250 lines down.
+    check("NEVER STAMP A `finish_reason` ON A FAILURE" not in srv_s,
+          "the stale heading is gone — it said never stamp one while the code "
+          "deliberately stamps \"error\", so a reader following it would "
+          "delete the field that makes the frame visible")
+    check("CANNOT READ AS SUCCESS" in srv_s and "AND** TEXT" in srv_s,
+          "...replaced by the conjunction, which is the final rule")
+    check("was silent for the same number of weeks" in srv_s,
+          "and the worked example is named: #39's third frame had the CORRECT "
+          "reason and an empty delta, and was silent — this repo's own proof "
+          "that the reason alone is insufficient")
+    check("reaches the message: False" in srv_s
+          or "error_type reaches the message: False" in srv_s,
+          "B being detected-but-thin is recorded, so nobody reads the merged "
+          "state as closing #904's second half")
+
     check("ASSEMBLES" in srv_s and "manufactured success" in srv_s,
           "the source records what the silence actually cost: not a dropped "
           "error but a well-formed response accepted as an answer")

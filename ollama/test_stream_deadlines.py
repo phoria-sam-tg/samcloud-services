@@ -502,6 +502,40 @@ def main():
         check(bad not in ob,
               f'no {bad} — an unrecognised reason degrades to "assume normal", '
               f'which is why those frames fell through to success')
+    # THE CONJUNCTION, asserted per frame rather than as two marginal counts
+    # (claude-wafer-services). Two counts of three do not state that the three
+    # are the SAME three: remove the text from one frame, add a stray match
+    # elsewhere, and both counts stay at 3 while a frame goes silent. A
+    # conjunction is not asserted by counting its conjuncts — "assert a count,
+    # not a presence" one step further on, and this conjunction has already
+    # been violated once in this file.
+    #
+    # So drive the emitter for every cause and evaluate BOTH detectors on each
+    # frame, the way the client does.
+    def detectable(f):
+        d1 = (f.get("choices") == []
+              and (f.get("error_type") or f.get("error_message")))
+        ch = (f.get("choices") or [{}])[0]
+        d2 = (bool(ch.get("delta", {}).get("content"))
+              and str(ch.get("finish_reason", "")).lower()
+              in {"error", "error_finish"})
+        return bool(d1), bool(d2)
+
+    for cause, msg in (("model_stalled", "13 chunks then 60s of silence"),
+                       ("request_timeout", "did not finish within 1800s"),
+                       ("stream_error", "TimeoutError: ")):
+        fs = _failure_frames(cause, msg, {}) if _failure_frames else []
+        verdicts = [detectable(f) for f in fs]
+        check(len(fs) == 2, f"{cause}: two frames (got {len(fs)})")
+        check(verdicts and verdicts[0][0],
+              f"{cause}: frame A satisfies detector 1 (choiceless + flat pair)")
+        check(len(verdicts) > 1 and verdicts[1][1],
+              f"{cause}: frame B satisfies detector 2 — text AND a known "
+              f"reason ON THE SAME FRAME, which two marginal counts cannot say")
+        check(all(any(v) for v in verdicts),
+              f"{cause}: EVERY emitted frame is seen by at least one detector "
+              f"— no frame is shape C or D")
+
     check(ob.count("for frame in _failure_frames(") == 3,
           f'all three branches go through the one emitter, so the two-frame '
           f'sequence cannot be right in two places and wrong in the third '

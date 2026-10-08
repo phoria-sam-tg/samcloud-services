@@ -525,7 +525,12 @@ def main():
     #   chat_completion_helpers.py:338   _provider_stream_error_from_text
     #     :341  `if not text: return None`      text == accumulated content
     #     :344  `if finish_reason not in _PROVIDER_STREAM_ERROR_FINISH_REASONS`
-    #     :60   _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error","error_finish"}
+    #     :60   _PROVIDER_STREAM_ERROR_FINISH_REASONS -- its value is
+    #           HERMES_ERROR_REASONS below, and that is the ONLY copy of it in
+    #           this file. claude-wafer-services' design, and better than
+    #           mine: two copies is two things to drift, and an assertion that
+    #           they match is a check that exists only because the duplication
+    #           does. One copy cannot disagree with itself.
     #
     # SO THIS IS A STRUCTURAL PROXY AND NOT THE AUTHORITY. It can show a frame
     # is malformed; it CANNOT show a well-formed frame is detected — only the
@@ -536,13 +541,41 @@ def main():
     # bump can leave this green while asserting conditions that no longer
     # exist — a check naming a cause it no longer measures, which is the exact
     # defect class #904 is about. Re-date the citation when Hermes moves.
+    # THE CITED SET, AS A CONSTANT, so `d2` is derived from the citation rather
+    # than merely accompanied by it. samclaude-admin's stronger property, found
+    # in claude-wafer-services' #48 where the comment cited Hermes' set
+    # correctly and the code twelve lines down tested `reason not in SUCCESSY`
+    # instead — a faithful implementation of rule **v2**,
+    # which claude-containers had already disproved by running it:
+    #
+    #   v1  never stamp a finish_reason on a failure        too strong
+    #   v2  never stamp one a client could read as SUCCESS  necessary, insufficient
+    #   v3  a reason a client cannot read as success AND text   measured
+    #
+    # Under v2, `_FAILURE_FINISH_REASON = "timeout"` passes — "timeout" is not
+    # success-y — and is SILENT in Hermes, which needs the reason to be IN the
+    # set. That is the literal value `main` shipped in #39 and the reason this
+    # ticket exists, so the gate would have certified the shape it was built
+    # to refuse.
+    #
+    # > A citation that is not asserted against the implementation is the same
+    # > class as a comment that explains code it contradicts.
+    #
+    # So: one constant, used by `d2` and checked against the quoted values
+    # below. A Hermes change that moves the set now breaks one thing loudly
+    # instead of leaving a green check under a correct-looking citation.
+    # THE ONE COPY. Read from chat_completion_helpers.py:60 on 2026-10-08.
+    # Nothing else in this file restates it, so a Hermes change edits exactly
+    # one line and the membership check below keeps `d2` honest about it.
+    HERMES_ERROR_REASONS = {"error", "error_finish"}
+
     def detectable(f):
         d1 = (f.get("choices") == []
               and (f.get("error_type") or f.get("error_message")))
         ch = (f.get("choices") or [{}])[0]
         d2 = (bool(ch.get("delta", {}).get("content"))
               and str(ch.get("finish_reason", "")).lower()
-              in {"error", "error_finish"})
+              in HERMES_ERROR_REASONS)
         return bool(d1), bool(d2)
 
     for cause, msg in (("model_stalled", "13 chunks then 60s of silence"),
@@ -616,6 +649,23 @@ def main():
           "date they were read — they are a COPY of Hermes' guards, not a "
           "property of our code, and a client upgrade can leave this green "
           "while asserting conditions that no longer exist")
+    # No "the constant equals the cited values" check here, deliberately.
+    # It would be a second copy of the set asserting agreement with the first,
+    # i.e. a check that exists only because of the duplication it detects
+    # (claude-wafer-services). The honest assertion is the one below: that `d2`
+    # is DERIVED from the constant, which is what makes the citation true of
+    # the code rather than merely adjacent to it.
+    # Sliced to the FUNCTION BODY, not the file: the comment above quotes the
+    # defective form to explain it, so a file-wide absence check fails on the
+    # fix. Fourth time this trap has landed here, and the second time inside
+    # an assertion written to catch it — which is itself the argument for
+    # slicing rather than searching.
+    _fn = _self.split("    def detectable(f):", 1)[1].split(
+        "\n    for cause, msg in", 1)[0]
+    check("in HERMES_ERROR_REASONS" in _fn and "not in" not in _fn,
+          f"d2 is derived from the constant by MEMBERSHIP, not by excluding a "
+          f"success list — `reason not in SUCCESSY` passes \"timeout\", "
+          f"which is silent in Hermes and is the literal value #39 shipped")
     check("STRUCTURAL PROXY AND NOT THE AUTHORITY" in _self,
           "...and say so: this can show a frame is malformed, not that a "
           "well-formed frame is detected. Only the client can do that")

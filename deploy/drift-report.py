@@ -169,8 +169,11 @@ def main():
                         "restart deploys nothing. ollama/whisper_server.py and "
                         "ollama/README.md are both in this class (#905)")
     p.add_argument("--imported", default=None,
-                   help="comma list (or @file) of ollama.* modules the running "
-                        "process imported; from /status loaded_modules (#905)")
+                   help="comma list (or @file) of modules the running process "
+                        "imported, from /status loaded_modules (#905). EITHER "
+                        "form: 'ollama.server' or 'server' -- normalised here, "
+                        "because sys.modules keys are dotted and this compares "
+                        "against file basenames")
     p.add_argument("--python", default=None,
                    help="interpreter with the app's deps (for the schema diff)")
     a = p.parse_args()
@@ -217,7 +220,28 @@ def main():
         raw = open(v[1:]).read() if v.startswith("@") else v
         return {x.strip() for x in raw.replace("\n", ",").split(",") if x.strip()}
 
+    # NORMALISE THE NAME FORM, because the two ends speak different ones and
+    # the mismatch failed silently in the dangerous direction.
+    #
+    # `module_name()` below returns a bare basename ("server"), while
+    # `sys.modules` keys -- which /status's loaded_modules reads -- are dotted
+    # ("ollama.server"). My own --imported help text said "ollama.* modules",
+    # which reads as dotted, so samclaude-services supplied dotted names on
+    # the first production run, nothing matched, and every changed module
+    # reported `NOT imported -> no effect`.
+    #
+    # That is the FALSE-REFUSAL direction (claude-containers' half): it tells
+    # an operator a restart deploys nothing about modules that are imported.
+    # On slice it was harmless because they were identical as executed; on
+    # wafer's pair it would have said "no effect" about config, manager,
+    # ollama_client and server all differing, i.e. "don't restart" when the
+    # restart IS the deployment.
+    #
+    # Two representations of one thing compared without conversion, failing to
+    # match rather than erroring. So accept either and convert.
     imported = listarg(a.imported)
+    if imported is not None:
+        imported = {m.rsplit(".", 1)[-1] for m in imported}
 
     # READ-AT-REQUEST-TIME IS ONE CLASS, AND IT IS NOT A FILE TYPE.
     #
@@ -284,6 +308,29 @@ def main():
         print("    import status unknown: pass --imported from /status's")
         print("    loaded_modules. Without it this cannot say whether a")
         print("    difference is one a restart would deploy.")
+    else:
+        # A NON-EMPTY SET THAT MATCHES NOTHING IS WORTH SAYING OUT LOUD.
+        #
+        # Normalising above removes the bare-vs-dotted mismatch, so this is a
+        # secondary net: a set taken from a different process, or from a
+        # different package, would still match zero and read as "none of these
+        # are imported".
+        #
+        # It is a NOTE rather than a forced UNKNOWN, departing from
+        # samclaude-services' suggestion, and the reason is the common case:
+        # after normalisation, zero matches is usually legitimate -- only
+        # tests or docs changed, and tests genuinely are not imported.
+        # Forcing UNKNOWN there would degrade the ordinary run to say nothing.
+        # So it is surfaced, not substituted.
+        pkg_mods = [m for m in (module_name(f) for f in pys) if m]
+        if pkg_mods and not (set(pkg_mods) & imported):
+            print(f"    NOTE: --imported had {len(imported)} entries and none "
+                  f"matched any of")
+            print(f"          the {len(pkg_mods)} changed {RUNTIME_PKG}/ "
+                  f"modules ({', '.join(sorted(pkg_mods))}).")
+            print("          Legitimate if only tests changed. If not, the set is")
+            print("          from a different process or package -- a set that")
+            print("          cannot be matched is not a set that matched nothing.")
 
     print("\npublished drift    (app.openapi(), the call FastAPI serves)")
     # ABSOLUTE, AND CHECKED AS THE THING THAT WILL BE RUN.

@@ -1436,7 +1436,20 @@ _FAILURE_FINISH_REASON = "error"
 # True on choices being non-empty. A manufactured success, with whatever tokens
 # had streamed becoming the reply and nothing saying the request was cut.
 def _failure_frames(error_type: str, message: str, detail: dict) -> list:
-    """The two SSE payloads for one failure, in detection order."""
+    """The two SSE payloads for one failure, in detection order.
+
+    A DELIBERATE TRADE, recorded so it does not read as an oversight later
+    (samclaude-admin, #904): frame **A** carries the nested `error` with
+    `deadline_s` / `elapsed_s` / `tokens_before_*`; frame **B** does not. So a
+    consumer that skips choiceless chunks gets the cause as TEXT and not as
+    structured numbers, where #43's single frame carried both.
+
+    Nothing is actually lost — `message` states the deadline and the elapsed
+    time in prose, which is what Hermes surfaces anyway, and A is the frame
+    that reaches it. Duplicating the nested object into B would put the same
+    numbers on a frame whose only reader is the text detector, which reads
+    `delta.content` and nothing else. But it is a choice, not an artifact.
+    """
     return [
         # A — choiceless. First, because it needs no accumulated content.
         {"error": {"message": message, "type": error_type, **detail},

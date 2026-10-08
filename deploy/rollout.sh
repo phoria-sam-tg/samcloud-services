@@ -389,9 +389,11 @@ fi
 # and which one depends on a question neither gate asks. Same inputs, different
 # verdicts, because they are bounding different things — which is this evening's
 # whole lesson, applied to the gates rather than to the numbers.
-if ! grep -q '_FAILURE_FINISH_REASON' "$DEPLOY_DIR/ollama/server.py" 2>/dev/null; then
-  verified="$verified; failure frames NOT checked ($(git -C "$DEPLOY_DIR" rev-parse --short HEAD) predates #43)"
-else
+# NO GREP DECIDES THIS. The check below is always invoked and reports exit 3
+# when `_FAILURE_FINISH_REASON` is not ASSIGNED, i.e. when the commit predates
+# #43 -- a structural test rather than a search for the symbol's name, which
+# prose in the same file can satisfy. See the comment at that exit.
+if true; then
   # `frames_out=$(...)` takes the substitution's exit status as its own, so
   # under `set -e` a FAILING check kills the script before `$?` can be read:
   # the gate would die at exit 1 with the bad commit still staged and no
@@ -417,14 +419,36 @@ tree = ast.parse(src)
 # the client's set below, not against a notion of what "looks like" success.
 # Rebinding it to "timeout" is the case that matters and the one the first
 # version of this check passed.
-reason_name, reason_val = "_FAILURE_FINISH_REASON", None
+reason_name, reason_val, reason_assigned = "_FAILURE_FINISH_REASON", None, False
 for n in ast.walk(tree):
     if isinstance(n, ast.Assign) and any(
             getattr(t, "id", "") == reason_name for t in n.targets):
+        reason_assigned = True
         try:
             reason_val = ast.literal_eval(n.value)
         except Exception:
             pass
+
+# THE SKIP DECISION IS MADE HERE, ON STRUCTURE, NOT BY A GREP IN THE SHELL.
+#
+# It was `grep -q '_FAILURE_FINISH_REASON' server.py` deciding whether the
+# commit predates #43. That is a source-text test, and this file is full of
+# prose quoting the names it documents -- the symbol appears once in a comment
+# today (server.py:1342, #47's replacement of the old heading) and twice in
+# code. So removing the symbol while leaving a comment that mentions it would
+# satisfy the grep, the gate would NOT skip, and the check below would then
+# refuse a commit it was built to let through: a FALSE REFUSAL blocking a
+# rollback, which is exactly the #41 failure the skip exists to prevent.
+#
+# Not live -- the code occurrences satisfy it anyway -- and reachable, in the
+# bad direction. Found by auditing my own files after samclaude-services
+# audited theirs for the split-literal vulnerability I had just reported, so
+# the audit is the fifth instance of the same move: ask the structure (is it
+# ASSIGNED) rather than the text (does the name appear).
+if not reason_assigned:
+    print(f"{reason_name} is not assigned in ollama/server.py -- this commit "
+          f"predates the detectable-frame work (#43).")
+    sys.exit(3)
 
 # THE CLIENT'S SET, and `in` it — not `not in` a list of success values.
 #
@@ -524,7 +548,14 @@ print(f"{len(frames)} failure frames detectable "
 sys.exit(0)
 FRAMECHECK
 ) || frames_rc=$?
-  if [ "$frames_rc" -ne 0 ]; then
+  if [ "$frames_rc" -eq 3 ]; then
+    # Skipped, not failed: a rollback target predating #43 must not be refused.
+    # Say what was DETERMINED, not the commonest cause of it. The check
+    # found no `_FAILURE_FINISH_REASON` assignment; usually that means the
+    # commit predates #43, but a rename would produce it too and "predates
+    # #43" would then be a wrong label on a right verdict.
+    verified="$verified; failure frames NOT checked (no _FAILURE_FINISH_REASON assignment at $(git -C "$DEPLOY_DIR" rev-parse --short HEAD); usually a pre-#43 commit)"
+  elif [ "$frames_rc" -ne 0 ]; then
     if [ "$frames_rc" -eq 2 ]; then
       say "FAILURE-FRAME CHECK COULD NOT RUN at $SHA — $frames_out"
     else
@@ -551,8 +582,9 @@ FRAMECHECK
     say "Re-check with:"
     say "  (cd $DEPLOY_DIR && .venv/bin/python -m ollama.test_stream_deadlines)"
     exit 8
+  else
+    verified="$verified; $frames_out"
   fi
-  verified="$verified; $frames_out"
 fi
 
 say "$DEPLOY_DIR is at $(git -C "$DEPLOY_DIR" rev-parse --short HEAD) (detached), venv synced"

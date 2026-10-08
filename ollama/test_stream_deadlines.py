@@ -547,10 +547,31 @@ def main():
           "the SUCCESS frame is untouched — the rule is about which value, "
           "not about removing the field")
     # The heading a skimmer reads must not contradict the code 250 lines down.
-    check("NEVER STAMP A `finish_reason` ON A FAILURE" not in srv_s,
-          "the stale heading is gone — it said never stamp one while the code "
-          "deliberately stamps \"error\", so a reader following it would "
-          "delete the field that makes the frame visible")
+    # Assert the HEADING LINE, not the absence of a string. The new comment
+    # quotes the old heading to explain why it was replaced, so an absence
+    # check fails on the fix — the prose trap again, this time inside the
+    # assertion written to catch it (claude-wafer-services' point 1, third
+    # time it has landed).
+    before = srv_s.split('_FAILURE_FINISH_REASON = "error"', 1)[0]
+    block = [l for l in before.rstrip().split("\n") if l.startswith("#")]
+    # the heading is the first line of the last contiguous comment run
+    run = []
+    for l in reversed(before.rstrip().split("\n")):
+        if l.startswith("#") or l.strip() == "":
+            run.append(l)
+        else:
+            break
+    heading = next((l for l in reversed(run) if l.startswith("# ")), "")
+    check("A FAILURE FRAME NEEDS A REASON" in heading,
+          f"the block LEADS with the conjunction rule. It used to lead with "
+          f"\"never stamp one on a failure\" while the code below "
+          f"deliberately stamps \"error\", so a reader following the heading "
+          f"would delete the field that makes the frame visible. "
+          f"Leading line: {heading[:60]!r}")
+    check(srv_s.count("used to read") >= 1
+          and "NEVER STAMP A `finish_reason` ON A FAILURE" in srv_s,
+          "...and the old heading survives only as a quoted correction, which "
+          "is why this asserts the leading line rather than an absence")
     check("CANNOT READ AS SUCCESS" in srv_s and "AND** TEXT" in srv_s,
           "...replaced by the conjunction, which is the final rule")
     check("was silent for the same number of weeks" in srv_s,

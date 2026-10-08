@@ -536,13 +536,38 @@ def main():
     # bump can leave this green while asserting conditions that no longer
     # exist — a check naming a cause it no longer measures, which is the exact
     # defect class #904 is about. Re-date the citation when Hermes moves.
+    # THE CITED SET, AS A CONSTANT, so `d2` is derived from the citation rather
+    # than merely accompanied by it. samclaude-admin's stronger property, found
+    # in claude-wafer-services' #48 where the comment quoted
+    # `{"error","error_finish"}` and the code twelve lines down tested
+    # `reason not in SUCCESSY` — a faithful implementation of rule **v2**,
+    # which claude-containers had already disproved by running it:
+    #
+    #   v1  never stamp a finish_reason on a failure        too strong
+    #   v2  never stamp one a client could read as SUCCESS  necessary, insufficient
+    #   v3  a reason a client cannot read as success AND text   measured
+    #
+    # Under v2, `_FAILURE_FINISH_REASON = "timeout"` passes — "timeout" is not
+    # success-y — and is SILENT in Hermes, which needs the reason to be IN the
+    # set. That is the literal value `main` shipped in #39 and the reason this
+    # ticket exists, so the gate would have certified the shape it was built
+    # to refuse.
+    #
+    # > A citation that is not asserted against the implementation is the same
+    # > class as a comment that explains code it contradicts.
+    #
+    # So: one constant, used by `d2` and checked against the quoted values
+    # below. A Hermes change that moves the set now breaks one thing loudly
+    # instead of leaving a green check under a correct-looking citation.
+    HERMES_ERROR_REASONS = {"error", "error_finish"}     # :60, cited above
+
     def detectable(f):
         d1 = (f.get("choices") == []
               and (f.get("error_type") or f.get("error_message")))
         ch = (f.get("choices") or [{}])[0]
         d2 = (bool(ch.get("delta", {}).get("content"))
               and str(ch.get("finish_reason", "")).lower()
-              in {"error", "error_finish"})
+              in HERMES_ERROR_REASONS)
         return bool(d1), bool(d2)
 
     for cause, msg in (("model_stalled", "13 chunks then 60s of silence"),
@@ -616,6 +641,21 @@ def main():
           "date they were read — they are a COPY of Hermes' guards, not a "
           "property of our code, and a client upgrade can leave this green "
           "while asserting conditions that no longer exist")
+    check(HERMES_ERROR_REASONS == {"error", "error_finish"},
+          f"the constant matches the set quoted in the citation "
+          f"({sorted(HERMES_ERROR_REASONS)}) — the citation is asserted "
+          f"AGAINST the implementation, not merely placed above it")
+    # Sliced to the FUNCTION BODY, not the file: the comment above quotes the
+    # defective form to explain it, so a file-wide absence check fails on the
+    # fix. Fourth time this trap has landed here, and the second time inside
+    # an assertion written to catch it — which is itself the argument for
+    # slicing rather than searching.
+    _fn = _self.split("    def detectable(f):", 1)[1].split(
+        "\n    for cause, msg in", 1)[0]
+    check("in HERMES_ERROR_REASONS" in _fn and "not in" not in _fn,
+          f"d2 is derived from the constant by MEMBERSHIP, not by excluding a "
+          f"success list — `reason not in SUCCESSY` passes \"timeout\", "
+          f"which is silent in Hermes and is the literal value #39 shipped")
     check("STRUCTURAL PROXY AND NOT THE AUTHORITY" in _self,
           "...and say so: this can show a frame is malformed, not that a "
           "well-formed frame is detected. Only the client can do that")

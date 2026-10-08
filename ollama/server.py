@@ -1334,25 +1334,32 @@ def _rate(count: int, duration_ns: int, unit: str,
     return f" = {r:.1f} {unit}"
 
 
-# NEVER STAMP A `finish_reason` ON A FAILURE (#904, samclaude-admin).
+# A FAILURE FRAME NEEDS A REASON A CLIENT CANNOT READ AS SUCCESS **AND** TEXT
+# TO GO WITH IT. On this path, either is useless alone (#904).
 #
-# The first version of #39's terminal frames carried
+# This heading used to read "NEVER STAMP A `finish_reason` ON A FAILURE", which
+# is wrong and dangerously so: the code 250 lines below deliberately stamps
+# `_FAILURE_FINISH_REASON = "error"`, and a reader following the old heading
+# would remove the one value that makes the frame visible. Replaced with the
+# final form, because a skimmer reads the heading
+# (samclaude-admin, who wrote the first version).
+#
+# THE WORKED EXAMPLE IS THIS REPO'S OWN HISTORY, which is why the conjunction
+# is stated rather than implied. #39's three frames were
 # `choices: [{"delta": {}, "finish_reason": "stalled"|"timeout"|"error"}]`.
-# That is the *exact shape of a normal final chunk*: `finish_reason` is the
-# field every OpenAI client trusts to mean "completed normally", and a
-# plausible-looking value there is worse than sending no frame at all — the
-# caller stops, believes it has a complete answer, and the nested `error`
-# object is never opened because nothing told it to look.
+# The first two failed on the reason. **The third had `"error"` — the correct
+# value — and an empty delta, and was silent for the same number of weeks**,
+# because the guard needs text too. samclaude-admin had that exact line in a
+# grep output and did not see what it meant; claude-containers' executable
+# gate did. So one frame of three satisfied the sharpened rule all along and
+# proved it insufficient.
 #
-# `claude-wafer-services` traced it precisely: the frame is not choiceless, so
-# Hermes' `_choiceless_chunk` never sees it. So "tell the caller" was satisfied
-# only from the gateway's side — the stream terminated, and a consumer read a
-# success. samclaude-admin reviewed those frames and called them correct on the
-# same half of the check.
+# Why `finish_reason` is the dangerous field: it is what every OpenAI client
+# trusts to mean "completed normally", and an UNRECOGNISED value degrades to
+# that reading. So those frames did not merely lie — they fell through to
+# success. Worse than sending no frame, because the caller stops and believes
+# it has a complete answer.
 #
-# So: `choices: []`, the cause at top level where the OpenAI shape puts it, and
-# the rich nested object kept for anything that wants the detail. Asserted by
-# `test_stream_deadlines`.
 # THE REFINED RULE, after samclaude-admin read Hermes' actual source:
 #
 #   never stamp a finish_reason A CLIENT COULD READ AS SUCCESS.
@@ -1429,7 +1436,20 @@ _FAILURE_FINISH_REASON = "error"
 # True on choices being non-empty. A manufactured success, with whatever tokens
 # had streamed becoming the reply and nothing saying the request was cut.
 def _failure_frames(error_type: str, message: str, detail: dict) -> list:
-    """The two SSE payloads for one failure, in detection order."""
+    """The two SSE payloads for one failure, in detection order.
+
+    A DELIBERATE TRADE, recorded so it does not read as an oversight later
+    (samclaude-admin, #904): frame **A** carries the nested `error` with
+    `deadline_s` / `elapsed_s` / `tokens_before_*`; frame **B** does not. So a
+    consumer that skips choiceless chunks gets the cause as TEXT and not as
+    structured numbers, where #43's single frame carried both.
+
+    Nothing is actually lost — `message` states the deadline and the elapsed
+    time in prose, which is what Hermes surfaces anyway, and A is the frame
+    that reaches it. Duplicating the nested object into B would put the same
+    numbers on a frame whose only reader is the text detector, which reads
+    `delta.content` and nothing else. But it is a choice, not an artifact.
+    """
     return [
         # A — choiceless. First, because it needs no accumulated content.
         {"error": {"message": message, "type": error_type, **detail},
@@ -1437,8 +1457,28 @@ def _failure_frames(error_type: str, message: str, detail: dict) -> list:
          "error_message": message,
          "choices": []},
         # B — populated, for the text detector and for other consumers.
-        # `delta.content` is NOT duplication of error_message: it is the only
-        # field that detector reads.
+        #
+        # `delta.content` is NOT duplication of error_message: with `choices`
+        # populated the flat pair is inert on this path, so this is half of
+        # what makes B visible at all. HISTORICAL once A is emitted first —
+        # A carries the cause, so B is no longer the load-bearing frame — but
+        # kept because B serves consumers that ignore choiceless chunks.
+        #
+        # AND B IS DETECTED BUT THIN. Measured by claude-containers against the
+        # installed client (#904): B's cause survives only as `raw_text`,
+        # because `_provider_stream_error_from_text` tries `full_content` as
+        # SSE and then as JSON, a prose cause matches neither, and it falls
+        # through to `if text.strip(): return _error({}, None)` — an empty
+        # payload. So through B a caller learns THAT it failed, not WHY:
+        #
+        #   B  error_type reaches the message: False   cause: False
+        #   A  error_type reaches the message: True    cause: True
+        #
+        # That is why A is not merely hardening: it closes #904's second
+        # requirement, which asked for the cause and not only the signal. It
+        # also dissolves the `error_type` collapse — through A the three
+        # distinct types arrive distinctly, where through B they all surface
+        # as a generic `provider_stream_error`.
         {"error_type": error_type,
          "error_message": message,
          "choices": [{"delta": {"content": message},

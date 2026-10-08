@@ -512,6 +512,30 @@ def main():
     #
     # So drive the emitter for every cause and evaluate BOTH detectors on each
     # frame, the way the client does.
+    # THESE TWO CONDITIONS ARE A COPY OF SOMEONE ELSE'S LOGIC, not a property
+    # of our own code — read from Hermes' installed source on 2026-10-08 and
+    # reproduced here (samclaude-admin's caveat to claude-wafer-services, which
+    # applies to this helper with more force: their check runs pre-restart on
+    # one box, this one gates merges for everyone):
+    #
+    #   chat_completion_helpers.py:3219  `if not chunk.choices:`
+    #                                    -> _choiceless_chunk (:3046), which
+    #                                       raises on error_type/error_message
+    #                                       and reads NO accumulated content
+    #   chat_completion_helpers.py:338   _provider_stream_error_from_text
+    #     :341  `if not text: return None`      text == accumulated content
+    #     :344  `if finish_reason not in _PROVIDER_STREAM_ERROR_FINISH_REASONS`
+    #     :60   _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error","error_finish"}
+    #
+    # SO THIS IS A STRUCTURAL PROXY AND NOT THE AUTHORITY. It can show a frame
+    # is malformed; it CANNOT show a well-formed frame is detected — only the
+    # client can, and claude-containers' gate executes the frames against it.
+    # If the two disagree, the executable one is right.
+    #
+    # Treat divergence as expected drift: a Hermes upgrade or a vendored-client
+    # bump can leave this green while asserting conditions that no longer
+    # exist — a check naming a cause it no longer measures, which is the exact
+    # defect class #904 is about. Re-date the citation when Hermes moves.
     def detectable(f):
         d1 = (f.get("choices") == []
               and (f.get("error_type") or f.get("error_message")))
@@ -546,6 +570,56 @@ def main():
     check('"finish_reason": finish' in ob,
           "the SUCCESS frame is untouched — the rule is about which value, "
           "not about removing the field")
+    # The heading a skimmer reads must not contradict the code 250 lines down.
+    # Assert the HEADING LINE, not the absence of a string. The new comment
+    # quotes the old heading to explain why it was replaced, so an absence
+    # check fails on the fix — the prose trap again, this time inside the
+    # assertion written to catch it (claude-wafer-services' point 1, third
+    # time it has landed).
+    before = srv_s.split('_FAILURE_FINISH_REASON = "error"', 1)[0]
+    block = [l for l in before.rstrip().split("\n") if l.startswith("#")]
+    # the heading is the first line of the last contiguous comment run
+    run = []
+    for l in reversed(before.rstrip().split("\n")):
+        if l.startswith("#") or l.strip() == "":
+            run.append(l)
+        else:
+            break
+    heading = next((l for l in reversed(run) if l.startswith("# ")), "")
+    check("A FAILURE FRAME NEEDS A REASON" in heading,
+          f"the block LEADS with the conjunction rule. It used to lead with "
+          f"\"never stamp one on a failure\" while the code below "
+          f"deliberately stamps \"error\", so a reader following the heading "
+          f"would delete the field that makes the frame visible. "
+          f"Leading line: {heading[:60]!r}")
+    check(srv_s.count("used to read") >= 1
+          and "NEVER STAMP A `finish_reason` ON A FAILURE" in srv_s,
+          "...and the old heading survives only as a quoted correction, which "
+          "is why this asserts the leading line rather than an absence")
+    check("CANNOT READ AS SUCCESS" in srv_s and "AND** TEXT" in srv_s,
+          "...replaced by the conjunction, which is the final rule")
+    check("was silent for the same number of weeks" in srv_s,
+          "and the worked example is named: #39's third frame had the CORRECT "
+          "reason and an empty delta, and was silent — this repo's own proof "
+          "that the reason alone is insufficient")
+    check("reaches the message: False" in srv_s
+          or "error_type reaches the message: False" in srv_s,
+          "B being detected-but-thin is recorded, so nobody reads the merged "
+          "state as closing #904's second half")
+
+    _self = open(os.path.join(os.path.dirname(__file__),
+                              "test_stream_deadlines.py")).read()
+    check("chat_completion_helpers.py:3219" in _self
+          and "chat_completion_helpers.py:338" in _self
+          and "2026-10-08" in _self,
+          "this suite's own detector conditions cite their origin and the "
+          "date they were read — they are a COPY of Hermes' guards, not a "
+          "property of our code, and a client upgrade can leave this green "
+          "while asserting conditions that no longer exist")
+    check("STRUCTURAL PROXY AND NOT THE AUTHORITY" in _self,
+          "...and say so: this can show a frame is malformed, not that a "
+          "well-formed frame is detected. Only the client can do that")
+
     check("ASSEMBLES" in srv_s and "manufactured success" in srv_s,
           "the source records what the silence actually cost: not a dropped "
           "error but a well-formed response accepted as an answer")

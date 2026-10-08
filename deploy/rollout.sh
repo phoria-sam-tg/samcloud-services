@@ -298,6 +298,248 @@ else
   verified="$verified (inline only — $(git -C "$DEPLOY_DIR" rev-parse --short HEAD) predates ollama/test_route_bindings)"
 fi
 
+# A CLONE THAT ROUTES IS NOT A CLONE WHOSE FAILURES ARE VISIBLE (#904).
+#
+# The gate above proves a request reaches the handler. It says nothing about
+# what the handler emits when a deadline fires, and that is a separate way to
+# be broken: #904's whole second half was a gateway that aborted a generation
+# and sent a terminal frame the caller read as a normal completion. Detection
+# needs, PER FRAME, either
+#
+#   choices: []  plus top-level error_type/error_message        (consumed in
+#                                                                the chunk loop)
+#   non-empty delta.content  AND  a finish_reason a client
+#                cannot read as success                          (the other
+#                                                                detector)
+#
+# and the conjunction in the second is the part that bites. `main` carried a
+# frame with `finish_reason: "error"` and `delta: {}` from #39 until #43 and it
+# was silent the whole time: the right reason, no text, invisible. Found by
+# claude-containers executing the frames against the real client; it had been
+# sitting in a posted grep output unnoticed.
+#
+# SO THIS CANNOT BE A COUNT. The repo's suite asserts the two halves as
+# separate totals, and two counts of three do not state that the three are the
+# same three (claude-wafer-services). Nor can it be a grep: a comment quoting
+# the old shape reads as the defect surviving, which this file has already been
+# defeated by once. It is an AST walk that evaluates both detectors on each
+# emitted frame and passes only if every frame is seen by at least one.
+#
+# THIS IS A PROXY, NOT THE AUTHORITY, and the distinction is load-bearing.
+# claude-containers' gate EXECUTES the frames against Hermes in the container;
+# that is the only check that can show a well-formed frame is actually
+# DETECTED. This one runs where that cannot — on every box, with no network and
+# no client — and it can only show a frame is MALFORMED. If the two ever
+# disagree, the executable one is right.
+#
+# AND IT WORKS BY REIMPLEMENTING SOMEBODY ELSE'S GUARDS, which is the risk in
+# it (samclaude-admin). The two conditions below are a COPY of Hermes' logic as
+# read on 2026-10-08, not a property of our own code:
+#
+#   chat_completion_helpers.py:3219  _choiceless_chunk
+#       reached when `not chunk.choices`; raises from the top-level
+#       error_type / error_message pair. Needs NO text.
+#   chat_completion_helpers.py:338   _provider_stream_error_from_text
+#       reached via :3428; needs NON-EMPTY text AND finish_reason in the set
+#       at :60 — which is HERMES_ERROR_REASONS below, NOT restated here.
+#       Two copies of a set is two things to drift; the constant is the only
+#       copy and the citation says where it came from (samclaude-admin asked
+#       for the constant and an assertion that it matches the comment; one
+#       copy removes the disagreement rather than detecting it).
+#
+# So a Hermes upgrade or a vendored-client bump can move them, and this check
+# would keep passing while asserting conditions that no longer exist — a green
+# check naming a cause it no longer measures, which is the exact defect class
+# #904 is about. Treat divergence as expected drift: when Hermes moves, re-read
+# those two functions and update the citation above with the new date. The
+# executable gate is what notices; this is what runs in between.
+#
+# SKIPPED WITH A NOTE when the commit predates `_FAILURE_FINISH_REASON` (#43) —
+# every commit before it either has no failure frames at all or has them in the
+# known-silent shape, so refusing would block a rollback to any of them. That
+# is #41's lesson and I have walked into it once already: a gate that cannot be
+# rolled back past is worse than the hole it closes.
+#
+# THIS DELIBERATELY DISAGREES WITH claude-containers' GATE, AND BOTH ARE RIGHT.
+# On a pre-#43 ref — `ebe28b5e`, say — theirs reports ALL SILENT and exits 1;
+# this one skips with a note and exits 0. Measured, not assumed.
+#
+# The gates answer different questions. Theirs is a go/no-go on handing the
+# Hermes seat's reporting to the gateway, so a ref whose frames are silent is
+# exactly what it must refuse. This one decides whether a deploy may be left
+# staged, and the operator reaching for a pre-#43 commit is usually rolling
+# back from something worse — refusing would be the #41 failure again.
+#
+# So do not "harmonise" them. Aligning the two would make one of them wrong,
+# and which one depends on a question neither gate asks. Same inputs, different
+# verdicts, because they are bounding different things — which is this evening's
+# whole lesson, applied to the gates rather than to the numbers.
+if ! grep -q '_FAILURE_FINISH_REASON' "$DEPLOY_DIR/ollama/server.py" 2>/dev/null; then
+  verified="$verified; failure frames NOT checked ($(git -C "$DEPLOY_DIR" rev-parse --short HEAD) predates #43)"
+else
+  # `frames_out=$(...)` takes the substitution's exit status as its own, so
+  # under `set -e` a FAILING check kills the script before `$?` can be read:
+  # the gate would die at exit 1 with the bad commit still staged and no
+  # restore — the precise outcome it exists to prevent. Caught by running the
+  # refusal path rather than only the passing one. `|| frames_rc=$?` puts the
+  # assignment in a list, which `set -e` does not act on.
+  frames_rc=0
+  frames_out=$(cd "$DEPLOY_DIR" && .venv/bin/python - <<'FRAMECHECK' 2>&1
+import ast, sys
+
+# The date the two Hermes guards below were read, cited in the comment above.
+# It is PRINTED on every rollout rather than only written here: a provenance
+# note that nothing reads can rot to a stale comment silently, and this file
+# has no test harness to assert it (samclaude-services guards theirs with two
+# checks in test_stream_deadlines). Putting it in the operator's output makes
+# staleness visible where someone is acting on it.
+GUARDS_READ = "2026-10-08"
+
+src = open("ollama/server.py").read()
+tree = ast.parse(src)
+
+# The sentinel's VALUE from the source, never assumed — and checked against
+# the client's set below, not against a notion of what "looks like" success.
+# Rebinding it to "timeout" is the case that matters and the one the first
+# version of this check passed.
+reason_name, reason_val = "_FAILURE_FINISH_REASON", None
+for n in ast.walk(tree):
+    if isinstance(n, ast.Assign) and any(
+            getattr(t, "id", "") == reason_name for t in n.targets):
+        try:
+            reason_val = ast.literal_eval(n.value)
+        except Exception:
+            pass
+
+# THE CLIENT'S SET, and `in` it — not `not in` a list of success values.
+#
+# This was `reason not in SUCCESSY` (a success-value blocklist) and that was
+# WRONG, found by samclaude-admin and measured through Hermes by
+# claude-containers. The two tests diverge on everything outside both sets:
+#
+#   sentinel   Hermes detector 2   old check   new check
+#   "error"    detects             passes      passes
+#   "timeout"  SILENT              passes      refuses
+#   "stalled"  SILENT              passes      refuses
+#   "aborted"  SILENT              passes      refuses
+#   "stop"     SILENT              refuses     refuses
+#
+# `"timeout"` is not hypothetical: it is the literal value main shipped in #39
+# and the reason this ticket exists. The old check would have put
+# `2 failure frames detectable` in the rollout output for it.
+#
+# Why it was wrong is worth keeping, because the code was not careless — it was
+# a faithful implementation of a rule that had been superseded hours earlier:
+#
+#   v1  never stamp a finish_reason on a failure        (too strong)
+#   v2  never stamp one a client could read as SUCCESS  (necessary, insufficient)
+#   v3  a reason the client's set contains, AND text    (measured; this)
+#
+# `not in SUCCESSY` is v2. v2 was disproved by main's own third frame, which
+# carried "error" — not success-y — with an empty delta and was silent for
+# weeks. The rule moved and the code did not.
+#
+# The gate's question is "will a caller see this failure", and only the
+# client's own condition answers that. A superset cannot.
+HERMES_ERROR_REASONS = {"error", "error_finish"}   # chat_completion_helpers.py:60
+
+frames = []
+for n in ast.walk(tree):
+    if not isinstance(n, ast.Dict):
+        continue
+    keys = [k.value for k in n.keys if isinstance(k, ast.Constant)]
+    if "choices" not in keys:
+        continue
+    # An error key is what marks this as a FAILURE frame rather than a
+    # success one. The success path legitimately carries `delta: {}`.
+    if not ({"error", "error_type", "error_message"} & set(keys)):
+        continue
+    ch = n.values[keys.index("choices")]
+    flat = "error_type" in keys and "error_message" in keys
+    choiceless = isinstance(ch, ast.List) and not ch.elts
+
+    has_text = False
+    reason = "<none>"
+    if isinstance(ch, ast.List) and ch.elts and isinstance(ch.elts[0], ast.Dict):
+        d = ch.elts[0]
+        dk = [k.value for k in d.keys if isinstance(k, ast.Constant)]
+        if "delta" in dk:
+            dv = d.values[dk.index("delta")]
+            if isinstance(dv, ast.Dict):
+                dvk = [k.value for k in dv.keys if isinstance(k, ast.Constant)]
+                if "content" in dvk:
+                    cv = dv.values[dvk.index("content")]
+                    # A literal empty string is not text. An f-string or a
+                    # name is, and `f"{type(e).__name__}: {e}"` cannot be
+                    # empty even for a bare TimeoutError.
+                    has_text = not (isinstance(cv, ast.Constant)
+                                    and not cv.value)
+        if "finish_reason" in dk:
+            fv = d.values[dk.index("finish_reason")]
+            if isinstance(fv, ast.Name):
+                reason = reason_val if fv.id == reason_name else f"<{fv.id}>"
+            elif isinstance(fv, ast.Constant):
+                reason = fv.value
+
+    d1 = choiceless and flat
+    d2 = has_text and reason in HERMES_ERROR_REASONS
+    frames.append((n.lineno, choiceless, flat, has_text, reason, d1, d2))
+
+# ZERO FRAMES IS A FAILURE, NOT A PASS. If the emitter is restructured so this
+# walk stops finding its subject, that must be loud — a check that cannot see
+# what it checks has to say so rather than report health (claude-containers).
+if not frames:
+    print("found NO failure frames to check — the extractor is blind, "
+          "not the code clean")
+    sys.exit(2)
+
+bad = []
+for ln, cl, fl, tx, rs, d1, d2 in frames:
+    if not (d1 or d2):
+        bad.append(f"line {ln}: choiceless={cl} flat_pair={fl} "
+                   f"has_text={tx} finish_reason={rs!r} -> SILENT")
+if bad:
+    print(f"{len(bad)} of {len(frames)} failure frames are invisible to a caller:")
+    for b in bad:
+        print("  " + b)
+    sys.exit(1)
+
+print(f"{len(frames)} failure frames detectable "
+      f"(Hermes guards as read {GUARDS_READ})")
+sys.exit(0)
+FRAMECHECK
+) || frames_rc=$?
+  if [ "$frames_rc" -ne 0 ]; then
+    if [ "$frames_rc" -eq 2 ]; then
+      say "FAILURE-FRAME CHECK COULD NOT RUN at $SHA — $frames_out"
+    else
+      say "FAILURE FRAMES NOT DETECTABLE at $SHA (#904):"
+      printf '%s\n' "$frames_out" | sed 's/^/rollout:   /' >&2
+    fi
+    if [ -n "${PREV:-}" ] && [ "$PREV" != "$SHA" ]; then
+      git -C "$DEPLOY_DIR" checkout --quiet --detach "$PREV"
+      git -C "$DEPLOY_DIR" reset --hard --quiet "$PREV"
+      say "code restored to $(git -C "$DEPLOY_DIR" rev-parse --short HEAD) (where it was)"
+    else
+      say "code left at $SHA — there was no earlier commit to restore"
+    fi
+    # SCOPE, stated precisely (claude-containers). Since #46 the emitter sends
+    # the choiceless frame FIRST, and its detection does not depend on the
+    # sentinel — so one silent frame does not mean Hermes is blind today. What
+    # it means is that the frame is invisible to any consumer that does not
+    # read choiceless chunks, which is the whole reason the second frame
+    # exists. Saying "the caller would see a completed answer" would be the
+    # thread's own error: a claim about one frame stated as a claim about the
+    # client.
+    say "DO NOT RESTART. A frame listed above is invisible to any consumer that"
+    say "does not read choiceless chunks — which is what that frame is for."
+    say "Re-check with:"
+    say "  (cd $DEPLOY_DIR && .venv/bin/python -m ollama.test_stream_deadlines)"
+    exit 8
+  fi
+  verified="$verified; $frames_out"
+fi
+
 say "$DEPLOY_DIR is at $(git -C "$DEPLOY_DIR" rev-parse --short HEAD) (detached), venv synced"
 say "$verified"
 say "nothing restarted — that is restart-when-idle's step"

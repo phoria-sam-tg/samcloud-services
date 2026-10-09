@@ -2,6 +2,46 @@
 
 Project history and current state. This is a living document.
 
+## 2026-10-09 — A short ring is not an outage: the tier declines through the capacity model (#870, #33)
+
+- **`think` was advertised as resident for 22 hours with nothing placed.** Measured
+  on slice 2026-09-30, ring short, no instance: `/models` carried
+  `"think": {backend: "exo", idle_seconds: 80238}` under `resident`, and
+  `/v1/models` listed it. The cause was the authority: `resolve_exo_tier`
+  registers the tier with `managed=False` and nothing ever removes it, so the
+  offer read residency out of `self.models`. For every other backend residency
+  *is* ours to know, because we started it; the pool is the one we neither start
+  nor place. The tier's residency now comes from the pool's own state.
+- **`/v1/models` omits the tier when it cannot serve**, the same convention a
+  capacity-blocked model already got, and **still performs no pool read** — the
+  property that endpoint was built to have, so a wedged pool cannot make
+  discovery hang. `pool_watch_loop` polls on a timer and `offering()` consults
+  its snapshot. A snapshot too stale to trust leaves the tier **listed**: not
+  having looked is a fact about us, and a dead loop must not delete a configured
+  route.
+- **`pool_ring_short` is a distinct code from `pool_unavailable`,** with
+  `transient: true` and `operator_action_required: false`. One of the pool's two
+  nodes is a laptop, so the one cause that is *normal* must not arrive looking
+  like the one that needs a person. No substitution, ever (Sam, 2026-09-30): the
+  decline carries `alternatives` as information and swaps in nothing, because a
+  caller that asked for `think` and silently received another model has been told
+  something untrue.
+- **`EXO_RING_MIN_NODES` has no default, and that is the whole mechanism.**
+  `nodeIdentities` looks like the way to tell a short ring from a small one and is
+  cleared by `APIState.reset`. Read live on slice at 00:24Z on 2026-09-30, 17
+  minutes after its own node restarted with wafer genuinely away: `topology.nodes`
+  and `nodeIdentities` both held slice alone, so the subtraction called a short
+  ring **whole** and the decline said *"the ring is whole and no model is placed on
+  it"* — confidently wrong, in the one sentence a caller reads. Unset, the reason
+  falls back and the message says the ring's wholeness is *not established*, which
+  is what makes merged-and-unset a safe state. Same shape as `FOREIGN_IDLE_MB`: a
+  guessed value produces a confident wrong answer rather than a missing one.
+- Two follow-ups from the merge review, neither blocking: **#917**
+  (`_pool_unavailable_503` reaches `mgr.offering()` from the event loop thread,
+  where the file's three other call sites wrap it in `asyncio.to_thread`) and a
+  test whose verdict depended on what this box happened to hold — fixed here by
+  filtering the assertion to the tier, and found again in `test_prompt_size`.
+
 ## 2026-10-08 — The inter-token bound was my own regression, found live (#904)
 
 - **I shipped 60s and it aborted a third of real traffic.** Within six minutes

@@ -128,6 +128,32 @@ SC_RESOURCE_ID = _env("SC_RESOURCE_ID", f"{SC_DEVICE}/gpu-0")
 SC_VERIFY_URL = _env("SC_VERIFY_URL", f"{SC_BASE}/auth/verify")
 SC_REQUIRED_SCOPE = _env("SC_REQUIRED_SCOPE", f"device:{SC_DEVICE}")
 AUTH_ENABLED = _env_bool("AUTH_ENABLED", True)
+# Say it once at startup as well as on every refusal (#914). The middleware
+# returns 503 per request, which the caller sees; this line is for the operator
+# reading a box that has started and is refusing everything, so the cause sits
+# at the top of the log instead of being inferred from a pattern of 503s.
+#
+# Guarded on AUTH_ENABLED because an empty scope with auth OFF is not a defect:
+# `AUTH_ENABLED=false` is the documented off-switch, and the scope is then unused
+# rather than unusable. Logging an error there would fire on the normal path of a
+# supported configuration, which teaches its reader to skip the line.
+#
+# NOT REACHABLE THROUGH `_env` TODAY, and deliberately still guarded. `_env`
+# returns its default for any falsy value, so `SC_REQUIRED_SCOPE=` yields
+# `device:<dev>` and ` ` yields ` ` — measured, both non-empty, so a scope
+# question is asked either way. It becomes reachable the moment a helper strips
+# without re-coalescing: `(v or default).strip()` turns ` ` into ``, which is
+# #916's one-line change if written the naive way. (#55's `_env_id` is the safe
+# shape — it strips and then coalesces — so it does not reach this.) A guard
+# costing one comparison should not wait for its own reachability.
+if AUTH_ENABLED and not SC_REQUIRED_SCOPE:
+    log.error(
+        "SC_REQUIRED_SCOPE is empty while AUTH_ENABLED is on. This gateway has "
+        "no authorization policy, so it refuses every caller (503) rather than "
+        "admitting every valid token on the plane, which is what an empty scope "
+        "asks /auth/verify for (#914). Set it in this box's own env file, or set "
+        "AUTH_ENABLED=false if this gateway is deliberately open."
+    )
 AUTH_CACHE_TTL = _env_int("AUTH_CACHE_TTL", 300)
 
 # --- http server ---

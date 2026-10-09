@@ -85,6 +85,7 @@ python -m ollama.test_lease_reconcile    # The lease says what the model actuall
 python -m ollama.test_num_ctx            # The served window: pinned, clamped, published (no network)
 python -m ollama.test_stream_deadlines   # Silence is bounded, elapsed time is not (no network)
 python -m ollama.test_route_bindings     # Every path resolves to its own handler (no network)
+python -m ollama.test_gate_safety        # No gate starts the app's lifespan (no network)
 
 # Older tests, from inside ollama/ — these lease and load for real.
 cd ollama && python test_lifecycle.py   # Full lease cycle
@@ -316,6 +317,10 @@ restarting.
   real speech and the absolute rates are a floor. Re-measure on a real walkthrough
   before changing the default on the strength of these.
 - **Three pillars** — SAMcloud provides routing, resources, and auth
+- **`git add -A` is not safe in a shared clone** (ticket #905) — stage by path, or branch in a worktree of your own. Two seats in one checkout will carry each other's uncommitted files across a branch switch, and `-A` will commit them under your message. Measured 2026-10-09: PR #54, titled after a test fix, was pushed carrying another seat's `#914` auth change — a 503-on-empty-scope refusal closing a fail-open. Correct code, wrong PR, wrong title, and the review it deserved as an auth change is the thing that nearly did not happen.
+- **The gates do not bound the diff** (ticket #905, `samclaude-admin`) — **all 24 checks passed** on that PR. They would: the stray change was correct, broke nothing, and no gate on this repo asks "is this file in this PR on purpose". So *"the gates are green"* does not establish *"this commit contains what it claims"*. Before pushing, read the file list against what you actually changed — `git show --stat HEAD` is the whole check. Every other verification discipline here is about whether a number means what it says; this is the same question about a commit, and it is the one case where the instrument is silent rather than wrong
+- **An instrument must not disturb what it measures, and that is checked rather than remembered** (ticket #905) — `with TestClient(app)` runs the app's lifespan, and this app's startup **adopts** whatever Ollama holds while its shutdown **unloads** it. Running the #905 gate on a live box took the resident 27b from `keep_alive=-1` to an `expires_at` three minutes in the past, mid-service, while the real gateway held a 118,272-token request. Every assertion in that file passed; nothing it asserted was wrong. `test_gate_safety` now walks the AST of every `test_*.py` and fails on any lifespan-starting context manager (`TestClient`, `LifespanManager`). Nine of the ten gates were already safe and **none of them was safe on purpose** — `claude-containers` audited their own instruments on the same ticket and found the same thing: *"it is the absence of a lifespan that saves it, and it was not a decision I made deliberately."* Construct `TestClient` bare and stub `mgr`, which that same startup builds
+- **A scanner reporting "0 problems" is indistinguishable from a scanner that cannot see** (ticket #905) — so `test_gate_safety` runs its detector against six synthetic *violations* and six clean cases before trusting it to say the package is clean, and asserts the file glob matched something. Three checks passed vacuously in one day before this rule was applied: an undrained `StreamingResponse` that never constructed a client, an empty `seen` list that satisfied every loop over it, and a `body.get(..., "absent") is not None` that a 401 payload satisfied. Assert the negative case, and assert the fixture is non-empty
 
 ## Current State
 

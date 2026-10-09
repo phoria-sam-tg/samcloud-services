@@ -214,8 +214,8 @@ samcloud registry + the `claude-services-slice` device.
 | `SC_DEVICE` | `claude-services-slice` | Device identity |
 | `SERVICE_PORT` | `8800` | Server listen port |
 | `SC_VERIFY_URL` | `${SC_BASE}/auth/verify` | SAMcloud auth endpoint |
-| `SC_REQUIRED_SCOPE` | `device:${SC_DEVICE}` | Required scope for callers |
-| `AUTH_ENABLED` | `true` | Set `false` to disable auth (development only) |
+| `SC_REQUIRED_SCOPE` | `device:${SC_DEVICE}` | Required scope for callers. **Empty is refused, not open** — with `AUTH_ENABLED` on, an empty scope makes the gateway 503 every request (`no_auth_policy`) rather than admit every valid token on the plane (#914). To run without auth, use `AUTH_ENABLED=false` |
+| `AUTH_ENABLED` | `true` | Set `false` to disable auth (development only). This is the only off-switch; clearing `SC_REQUIRED_SCOPE` does not open the gateway |
 | `OLLAMA_NUM_CTX` | unset | Served context window for every Ollama model, in tokens. Unset = Ollama derives one from free VRAM |
 | `OLLAMA_NUM_CTX_MODELS` | unset | Per-model override: `qwen3.8:27b-mlx=262144,qwen3:1.7b=40960`. Wins over `OLLAMA_NUM_CTX` |
 | `OLLAMA_GENERATE_TIMEOUT` | `1800` | Whole streaming request, seconds. Enforced in-process, not by aiohttp |

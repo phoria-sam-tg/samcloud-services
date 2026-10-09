@@ -116,6 +116,54 @@ class SamcloudAuthMiddleware(BaseHTTPMiddleware):
         if not AUTH_ENABLED or request.url.path in AUTH_EXEMPT_PATHS:
             return await call_next(request)
 
+        # NO SCOPE POLICY MEANS REFUSE, NOT ADMIT (#914).
+        #
+        # `?scope=` is appended below only `if self.required_scope`, so an empty
+        # one asks /auth/verify no scope question at all and EVERY valid token on
+        # the plane is admitted. The widening is total rather than merely wider
+        # than intended, and the config that produces it reads as a *narrowing* —
+        # someone clearing a scope they thought too strict gets the opposite of
+        # what they asked for.
+        #
+        # It is the one path here that failed open. The rest of this method
+        # already refuses on every other unknown: an unreachable registry is 502,
+        # an invalid token 401, an out-of-scope token 403. "No policy configured"
+        # was 200.
+        #
+        # BEFORE THE CACHE READ, not at the URL-building site below. A guard
+        # there would sit after `_get_cached`, so a box that had already cached a
+        # caller would refuse new tokens and keep admitting cached ones — a
+        # half-closed door that reads as closed. Asserted by
+        # test_no_auth_policy [5], which primes the cache and still expects 503.
+        #
+        # 503 WITH ITS OWN `error` KEY, not the 403 below. A missing policy and
+        # an out-of-scope token are different failures with different owners: the
+        # 403 sends the next reader to audit a caller's scopes, when the defect
+        # is in this box's own env (samclaude-admin, #914). 503 because nothing
+        # errored — the process is up and declining because it holds no policy to
+        # apply, which is a readiness state rather than a fault (#866 point 3).
+        # No `Retry-After`: it resolves when an operator acts, never by waiting.
+        #
+        # The variable is named in the RESPONSE and not only the log. On slice
+        # `server.log` is 0600 to the service account and answered nobody for a
+        # day (#866); a refusal whose cause is only in a log the caller cannot
+        # read is a refusal nobody can act on.
+        if not self.required_scope:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": (
+                        "This gateway has no authorization policy: "
+                        "SC_REQUIRED_SCOPE is empty while AUTH_ENABLED is on, "
+                        "so it refuses every caller rather than admitting every "
+                        "valid token on the plane. Set SC_REQUIRED_SCOPE in this "
+                        "box's own env file, or set AUTH_ENABLED=false if this "
+                        "gateway is deliberately open."
+                    ),
+                    "error": "no_auth_policy",
+                },
+            )
+
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             return JSONResponse(

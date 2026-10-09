@@ -66,6 +66,41 @@ log = logging.getLogger(__name__)
 _CACHE: dict = {}
 
 
+# The one method whose number is the model's own count. `count()` returns the
+# method as its second element and `PromptTooLarge` carries it, but until #906
+# a caller had to PARSE that prose to learn whether the figure was exact — so
+# every consumer either assumed exact or ignored the field.
+EXACT_METHOD = "chat template"
+
+
+def is_exact(method: str) -> bool:
+    """True only for the tokenizer path. Everything else is a guess upward."""
+    return bool(method) and method.startswith(EXACT_METHOD)
+
+
+# WHY AN ESTIMATE HERE IS ALWAYS CONSERVATIVE, AND BY ROUGHLY HOW MUCH
+#
+# The estimate divides characters by `chars_per_token`, default 1.5. That is
+# BELOW the densest content ever measured on these boxes — `[GIN]` access-log
+# lines at 1.56 chars/token, against ordinary conversation at 3.74-3.95
+# (measured 2026-10-09, `claude-wafer-services` and the 83-pair sweep on #906).
+# So the estimate over-counts for every content type anyone has measured, and
+# the refusal errs toward refusing work the host could have done.
+#
+# Measured over 83 completed requests on slice, estimate against the model's
+# own `prompt_eval_count`:
+#
+#     estimate / real     2.45 - 2.81     median ~2.61
+#
+# AND THAT FACTOR IS NOT TRANSFERABLE, which is the whole lesson of #906: it is
+# a property of the content and of the tokenizer, not of this host. The figures
+# above are the Ollama path's model on this seat's conversations; the exo path
+# serves a different model through a different tokenizer. So the refusal states
+# the DIRECTION, which follows from 1.5 being below every measured density, and
+# does not publish a correction factor for a caller to divide by. A consumer
+# that needs its own factor measures it by running its own estimator against a
+# real count — nothing else is valid.
+
 class PromptTooLarge(Exception):
     """A prompt that this host cannot be asked to prefill.
 
@@ -98,11 +133,27 @@ class PromptTooLarge(Exception):
                 f"{self.completion_budget} more tokens to the same KV cache; the limit "
                 f"is set low enough to leave room for that. Send less, or split the "
                 f"work across turns."
+                + ("" if is_exact(self.method) else (
+                    f" NOTE: {self.tokens} is an ESTIMATE, not this model's own "
+                    f"count — no tokenizer was available for {self.model} on "
+                    f"this host. The estimate divides characters by a figure "
+                    f"below the densest content ever measured here, so it "
+                    f"over-counts and this refusal is conservative: the real "
+                    f"token count is lower, possibly by more than 2x. The "
+                    f"limit itself is in real tokens, measured against peak "
+                    f"host memory. Do not derive a correction factor from this "
+                    f"message — measure your own by running your estimator "
+                    f"against a real count."))
             ),
             "limit_tokens": self.limit,
             "measured_tokens": self.tokens,
             "completion_budget_tokens": self.completion_budget,
             "counted_with": self.method,
+            # STRUCTURAL, so a caller does not have to parse `counted_with`
+            # (#906). A refusal whose number is a guess is a different fact
+            # from one whose number is the model's own count, and the caller
+            # cannot tell from the token figure alone.
+            "count_is_exact": is_exact(self.method),
             "resource_id": self.resource_id,
             "model": self.model,
             # The note is part of the contract, not decoration: a caller that reads

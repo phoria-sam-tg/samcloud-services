@@ -42,6 +42,37 @@ Project history and current state. This is a living document.
   test whose verdict depended on what this box happened to hold — fixed here by
   filtering the assertion to the tier, and found again in `test_prompt_size`.
 
+## 2026-10-09 — A 413 now says whether its count was exact (#906)
+
+- **The limit is in real tokens; the figure compared against it was often an
+  estimate, and nothing said so.** `EXO_MAX_PROMPT_TOKENS = 12288` was derived
+  from peak host memory measured against prompt length in *real* tokens — the
+  curve that put the panic level near 19,000. But `prompt_size.check()` compares
+  it to whatever `count()` returns, which falls to `estimate at 1.5
+  chars/token` whenever a model has no `tokenizer.json` on the host.
+- **The estimate over-counts for every content type anyone has measured.** 1.5
+  chars/token is below the densest content ever measured on these boxes —
+  `[GIN]` access-log lines at 1.56, against ordinary conversation at 3.74–3.95.
+  Measured over 83 completed requests on slice, estimate against the model's own
+  `prompt_eval_count`: **2.45–2.81x, median ~2.61**. So the refusal errs toward
+  refusing work the host could have done, and a caller told only "too long"
+  could not know which way to act.
+- `PromptTooLarge.as_dict()` now carries **`count_is_exact`** (a bool, so it
+  cannot be misread as a token figure) and, only when the count is not exact,
+  a message that names it an estimate, states the **direction** — the real count
+  is lower, so the refusal is conservative — and says the limit is in real
+  tokens. `prompt_size.is_exact()` is the one predicate; the tokenizer path is
+  the only exact one.
+- **No correction factor is published, and the gate asserts that it is not.**
+  The 2.61 was measured on a different model's tokenizer against this seat's
+  conversations, so it is a property of the content and not of this host —
+  transferring it is the error that cost #906 four retracted density figures. A
+  consumer that needs its own factor measures it by running its own estimator
+  against a real count.
+- 17 checks added to `test_prompt_size` as step 9. The 4 pre-existing failures
+  in that gate are unchanged and fail identically on `main`: they are the
+  exact-count path being inert until a restart, which is the rest of #906.
+
 ## 2026-10-08 — The inter-token bound was my own regression, found live (#904)
 
 - **I shipped 60s and it aborted a third of real traffic.** Within six minutes

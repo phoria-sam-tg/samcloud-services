@@ -42,6 +42,44 @@ Project history and current state. This is a living document.
   test whose verdict depended on what this box happened to hold — fixed here by
   filtering the assertion to the tier, and found again in `test_prompt_size`.
 
+## 2026-10-09 — a generation now holds `in_flight`, so the cooldown cannot cut it (#907)
+
+- **18 unloads on 2026-10-08, every one 300-355s into an in-flight request.**
+  `check_cooldowns` respects `in_flight`; the flag was claimed on the
+  transcription path only. `touch()` stamps `last_used` once before the work, so
+  a 549s prefill reads as 549s idle and the model is unloaded under the request.
+- **Why it never bit before, and the coincidence is exact.** `COOLDOWN_SECONDS`
+  is 300 and the old `aiohttp ClientTimeout(total=300)` was 300. The timeout
+  killed every Ollama request at precisely the moment the cooldown first became
+  eligible, so nothing on that path ever survived to be reached. **#904's fix is
+  what exposed this** — which is why all 18 instances are dated the day it
+  shipped rather than spread over weeks. `claude-wafer-services` found both the
+  cause and the fix, one grep from the symptom.
+- **What it cost.** The unload releases the capacity lease and zeroes `own_mb`
+  while `device_inuse_mb` is unchanged, because Ollama will not evict a busy
+  runner. `foreign_mb = device_inuse - own` then reports the gateway's own model
+  as a stranger: 19,492 MB of phantom foreign tenant, measured. Requests still
+  completed, so it was never an outage — but another caller's placement decision
+  in that window sees a free pool that is not free.
+- **`ModelManager.serving()`** holds the claim and **re-stamps `last_used` at
+  release**, because a 549s request otherwise leaves the model eligible on the
+  very next tick — a model that just finished serving is the least idle thing on
+  the box. It deliberately does not touch `request_count`: relocating `touch()`
+  would change counting semantics, and :1306 stamps a failed request on purpose.
+- **Wrapped at the iterator, not inside the generator.** `_held_async` and
+  `_held_sync`. The handler returns the instant `StreamingResponse` is
+  constructed and the prefill has not begun, so a claim scoped to the handler is
+  released before the work starts. Wrapping the iterator also avoids
+  re-indenting the long try/except that emits #43's failure frames — and a first
+  attempt at that produced a 2-space body, valid Python and a trap for the next
+  editor, which is why it was reverted.
+- `ollama/test_in_flight.py`, 22 checks, no network. Every check advances a clock
+  and runs the real `check_cooldowns` against a generation that has not
+  finished — including that the bug reproduces without the claim, that a raising
+  generation does not leak it, that nesting counts, and that foreign work still
+  wins (admin's policy: work wins, but cutting a live request needs a measured
+  grace period, which is C2).
+
 ## 2026-10-09 — /status says which commit it imported (#905)
 
 - **The gap #904 exposed.** The misbinding reached `main` and the staged deploy

@@ -83,6 +83,39 @@ AUTH_ENABLED = config.AUTH_ENABLED
 AUTH_EXEMPT_PATHS = {"/health", "/service-docs", "/warm"}
 
 
+async def _held_async(model_name: str, gen):
+    """Hold `in_flight` across an async generator's whole life (#907).
+
+    Wrapped at the iterator rather than inside the generator body. Two reasons,
+    and the second is why this exists as a function instead of a `with`:
+
+    - **Scope.** The handler returns the instant `StreamingResponse` is
+      constructed, before the prefill has begun, so a claim scoped to the
+      handler would be released before the work started. Iteration is the thing
+      the claim has to span.
+    - **Blast radius.** The generator bodies are long try/except blocks that
+      emit the two failure frames #43 added. Adding a `with` means re-indenting
+      them, and re-indenting code to attach a lifetime is how a 2-space body
+      gets committed — valid Python and a trap for the next editor.
+
+    `ModelManager.serving()` carries the reasoning and the measurement.
+    """
+    with mgr.serving(model_name):
+        async for item in gen:
+            yield item
+
+
+def _held_sync(model_name: str, gen):
+    """`_held_async` for the blocking collection loop. Same claim, same reason.
+
+    The non-streaming path blocks for the generation's whole length — up to
+    549s of measured prefill on this box, well past COOLDOWN_SECONDS.
+    """
+    with mgr.serving(model_name):
+        for item in gen:
+            yield item
+
+
 def _read_loaded_commit() -> str | None:
     """The commit this process IMPORTED, read once at import. None if unknowable.
 
@@ -1882,13 +1915,16 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                     ):
                         yield "data: " + json.dumps(frame) + "\n\n"
                     yield "data: [DONE]\n\n"
-            return StreamingResponse(stream(), media_type="text/event-stream")
+            return StreamingResponse(_held_async(mm.name, stream()),
+                                     media_type="text/event-stream")
         else:
             # Non-streaming: collect full response via native API
             full_content = ""
             tool_calls = None
             usage = {}
-            for chunk in mgr.ollama.chat(mm.name, ollama_messages, **ollama_kwargs):
+            for chunk in _held_sync(
+                    mm.name,
+                    mgr.ollama.chat(mm.name, ollama_messages, **ollama_kwargs)):
                 if "message" in chunk:
                     full_content += chunk["message"].get("content", "")
                     if chunk["message"].get("tool_calls"):

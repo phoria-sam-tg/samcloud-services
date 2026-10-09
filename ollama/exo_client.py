@@ -405,6 +405,52 @@ class ExoClient:
             "unavailable_reason": reason,
         }
 
+    def placement_available(self, model_id: str) -> Optional[bool]:
+        """Could exo place `model_id` right now? True / False / **None for unknown**.
+
+        READ-ONLY: a GET at exo's own placement planner. This asks the question a
+        consumer actually has -- *can this be served* -- which `resident_model()`
+        cannot answer for a model that is not resident but could be.
+
+        THREE-VALUED ON PURPOSE, and that is the whole point of the signature. A
+        probe that fails returns `None`, never `False`: `False` would mean "exo
+        says there is no room" while the truth is "we did not find out", and a
+        consumer cannot tell those apart once they are the same value.
+
+        Only ONE 400 is an answer. `No cycles found with sufficient memory` is a
+        capacity verdict, so that is a real `False`; any other 400 is a question
+        we asked wrong, which is not the same as "no".
+
+        MEASURED 2026-10-10 on slice, with the 120B pool resident and 9,156 MB
+        free -- the pair matters, because the first reading alone reads as
+        "placement is impossible while the pool is resident" and that is false:
+
+            gpt-oss-120b-MXFP4-Q8        -> 400 No cycles found ...  -> False
+            Qwen2.5-VL-7B-Instruct-4bit  -> 200 {MlxRingInstance...} -> True
+
+        So a 400 here is a verdict about THIS model's footprint against the room
+        that is left, not a property of the pool being busy. Ported from PR #68
+        by services@1770, whose three-valued signature this keeps.
+        """
+        try:
+            r = self._http.get("/instance/placement",
+                               params={"model_id": model_id},
+                               timeout=config.EXO_PLACEMENT_TIMEOUT_S)
+        except Exception:
+            return None
+        if r.status_code == 200:
+            try:
+                return bool(r.json())
+            except Exception:
+                return None
+        if r.status_code == 400:
+            try:
+                msg = (r.json().get("error") or {}).get("message") or ""
+            except Exception:
+                return None
+            return False if "sufficient memory" in msg.lower() else None
+        return None
+
     def resident_model(self) -> Optional[str]:
         """The model the pool is holding and ready to serve, or None.
 

@@ -353,6 +353,10 @@ class ModelManager:
     # reader either gets the old tuple or the new one, never half of either.
     _pool_view: Optional[tuple] = field(default=None, repr=False)
     _pool_watch_task: Optional[asyncio.Task] = field(default=None, repr=False)
+    # `(monotonic_ts, model_id_or_None)` -- what the pool's RESOURCE RECORD says
+    # should be resident, cached because it changes about never and the watch
+    # loop would otherwise hit the registry every poll. See `_pool_desired_model`.
+    _pool_desired: Optional[tuple] = field(default=None, repr=False)
     # Trailing window of capacity readings, `(monotonic_ts, reading)`, oldest
     # first. The offer is computed over this rather than over one sample — see
     # `offer_reading`. Appended by every read, so it fills from ordinary
@@ -868,6 +872,55 @@ class ModelManager:
             },
         }
 
+    def _pool_desired_model(self) -> Optional[str]:
+        """Which model the pool is MEANT to hold, from its resource record.
+
+        WHY THE RECORD AND NOT WHAT WE LAST SAW RESIDENT. The obvious source is
+        the last model observed in `/state`, and it is wrong in exactly the case
+        this is for: after a restart with nothing placed, there is no last model,
+        so placeability could not be probed at all -- the cold on-demand case
+        (#801 criterion 1) is the one where process memory is empty. The record
+        survives us, and since #791 it is also the single statement of this fact:
+        the placement guard reads the same field, so gateway and guard cannot
+        drift the way the record and `placement.conf` did on 2026-10-09.
+
+        `None` means we could not find out -- an unreadable registry or a record
+        with no `model` -- and callers must not read that as "no model wanted".
+        Cached for `EXO_POOL_VIEW_MAX_AGE_S`; a changed record is picked up on
+        the next expiry rather than instantly, which is the right trade for a
+        field edited by hand about once a month.
+        """
+        cached = self._pool_desired
+        if cached is not None and (time.monotonic() - cached[0]) < config.EXO_POOL_VIEW_MAX_AGE_S:
+            return cached[1]
+        model = None
+        try:
+            record = self.sc.get_resource(config.EXO_RESOURCE_ID) or {}
+            # `in` rather than `.get() or` -- an absent key and a null value are
+            # both "no answer" here, but a *present* empty string is a record
+            # deliberately naming nothing, and only `in` can see the difference.
+            if "model" in record and isinstance(record["model"], str):
+                model = record["model"].strip() or None
+        except Exception as e:
+            log.debug(f"pool desired model unreadable: {type(e).__name__}: {e}")
+            model = None
+        self._pool_desired = (time.monotonic(), model)
+        return model
+
+    def _probe_placeable(self) -> tuple:
+        """`(placeable, model, reason)` for a pool that is not currently resident.
+
+        `placeable` is True / False / None, and None is a state. Returns early
+        without touching exo when there is nothing to ask about, so a missing
+        record does not read as a refused placement.
+        """
+        if not config.EXO_PLACEMENT_PROBE:
+            return (None, None, "placement_probe_disabled")
+        model = self._pool_desired_model()
+        if not model:
+            return (None, None, "desired_model_unknown")
+        return (self.exo.placement_available(model), model, None)
+
     async def pool_watch_loop(self):
         """Keep the offer's view of the pool current, off the request path (#870).
 
@@ -885,6 +938,15 @@ class ModelManager:
         while True:
             try:
                 status = await asyncio.to_thread(self.exo.pool_status)
+                if not status.get("ready"):
+                    # Only when it is NOT servable: while the pool is resident
+                    # the planner is being asked whether a SECOND copy fits,
+                    # which is a different question and always answers no on a
+                    # pool this size. Probing then would record `unplaceable`
+                    # for a tier that is serving perfectly well.
+                    placeable, want, why = await asyncio.to_thread(self._probe_placeable)
+                    status = {**status, "placeable": placeable,
+                              "desired_model": want, "placeable_reason": why}
                 self._pool_view = (time.monotonic(), status)
             except Exception as e:
                 # Reachability is data, not an error: record it as a view rather
@@ -902,8 +964,16 @@ class ModelManager:
         """How the pool tier appears in the offer, or None when EXO is off.
 
         `{"name", "backend", "state", "reason", "detail"}` where `state` is
-        `resident` (it can serve now), `blocked` (it cannot) or `unknown` (the
-        snapshot is too old to say).
+        `resident` (it can serve now), `placeable` (not resident, and exo says a
+        ring cycle has room for it -- #801 criterion 3), `blocked` (it cannot) or
+        `unknown` (the snapshot is too old to say).
+
+        FOUR STATES BECAUSE NOT-RESIDENT IS THREE ANSWERS. `blocked` alone is a
+        true statement about now and a silent one about whether a request could
+        make the tier serve, and that is precisely what on-demand placement turns
+        on. The three are kept apart in `reason`: `pool_unplaceable` (exo says no
+        room), `pool_placement_unknown` (we did not find out), and the original
+        per-reason codes for a pool that is unreachable or ring-short.
 
         NO `need_mb`, and that is not an omission. Every other entry in the offer
         carries what it would cost this box to start it, because this box would
@@ -936,8 +1006,39 @@ class ModelManager:
                     "busy": bool(status.get("busy")),
                     "detail": f"the pool is holding {status.get('resident_model')}"}
         reason = status.get("unavailable_reason") or "not_ready"
-        return {**entry, "state": "blocked", "reason": f"pool_{reason}",
-                "detail": self._pool_block_detail(reason, status)}
+        blocked = {**entry, "state": "blocked", "reason": f"pool_{reason}",
+                   "detail": self._pool_block_detail(reason, status)}
+        # #801 criterion 3: "resident OR CAN BE PLACED", so not-resident is three
+        # answers and not one. `blocked` used to carry all three, which is a true
+        # statement about NOW and a silent one about whether a request could make
+        # it serve -- the distinction on-demand placement turns on.
+        #
+        # `in` rather than `.get()`: the key is absent whenever the pool WAS
+        # ready at the last poll, and absent must not collapse into the `None`
+        # that means "we probed and could not tell".
+        if "placeable" not in status:
+            return blocked
+        placeable = status["placeable"]
+        if placeable is True:
+            return {**entry, "state": "placeable", "reason": None,
+                    "model": status.get("desired_model"),
+                    "busy": False,
+                    "detail": (f"the pool is not holding {status.get('desired_model')} "
+                               "but exo can place it; a request for this tier has "
+                               "to wait for that placement")}
+        if placeable is False:
+            return {**blocked, "reason": "pool_unplaceable",
+                    "detail": (f"the pool is not holding {status.get('desired_model')} "
+                               "and exo finds no ring cycle with room for it: "
+                               + self._pool_block_detail(reason, status))}
+        # None -- we asked and could not tell, or had nothing to ask about. The
+        # tier is still a configured route, so this says so rather than claiming
+        # a verdict we do not have.
+        return {**blocked, "reason": "pool_placement_unknown",
+                "detail": ("the pool is not holding this tier's model and whether "
+                           "it could be placed was not established "
+                           f"({status.get('placeable_reason') or 'probe failed'}); "
+                           + self._pool_block_detail(reason, status))}
 
     def _pool_block_detail(self, reason: str, status: dict) -> str:
         """Why the tier cannot serve, in a sentence a caller can act on.

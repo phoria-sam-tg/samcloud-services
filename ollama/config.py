@@ -1238,6 +1238,20 @@ EXO_POOL_WATCH_S = _env_int("EXO_POOL_WATCH_S", 15)
 # the default.
 EXO_POOL_VIEW_MAX_AGE_S = _env_int("EXO_POOL_VIEW_MAX_AGE_S", 60)
 
+# How long the background watcher waits on exo's PLACEMENT PLANNER (#801 step 1).
+#
+# Separate from the 15s client timeout because this is not a lookup: exo computes
+# ring cycles to answer it. Measured on slice 2026-10-10 it returned in well under
+# a second for both a placeable 7B and a refused 120B, but a planner under load is
+# not a dict read, and this runs in `pool_watch_loop` where the only cost of
+# waiting is a later view -- never a caller blocked.
+EXO_PLACEMENT_TIMEOUT_S = _env_int("EXO_PLACEMENT_TIMEOUT_S", 20)
+
+# Probe placeability at all? Off makes the tier read `blocked` when it is not
+# resident, which is main's pre-#801 behaviour -- a true statement about now and
+# a silent one about whether it could be placed.
+EXO_PLACEMENT_PROBE = _env_bool("EXO_PLACEMENT_PROBE", True)
+
 # Gap between the two `busy` samples the wedge guard takes before it declines.
 # One sample is an observation of a moving state; two a short interval apart
 # distinguish "a generation just finished" from "the slot is occupied and is

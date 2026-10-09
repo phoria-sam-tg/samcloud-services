@@ -203,10 +203,17 @@ _PREFILL = {
              measured="2026-10-08/09", source="seat"),
         # 52,000 - 60,000: no cold observation yet. Every request the seat has
         # sent in that range hit the prefix cache.
-        dict(prompt_tokens=62777, prefill_seconds=718.7, n=1,
-             tok_per_s=87.3, tok_per_s_range=[87.3, 87.3],
-             measured="2026-10-09", source="seat"),
-        # Above 62,777 there is no seat traffic yet, and the seat is walking
+        dict(prompt_tokens=63722, prefill_seconds=734.67, n=3,
+             tok_per_s=86.7, tok_per_s_range=[86.7, 87.3],
+             measured="2026-10-09/10", source="seat"),
+        # The three observations behind that n=3, because they are the
+        # tightest agreement anywhere in this set and that is worth being able
+        # to check: 62,777 @ 718.70s (87.3 tok/s), 62,992 @ 723.05 (87.1),
+        # 63,722 @ 734.67 (86.7) — all cold seat traffic, within 0.7% of each
+        # other on seconds-per-token. The published point is the slowest of the
+        # three per token, per this file's rule.
+        #
+        # Above 63,722 there is no seat traffic yet, and the seat is walking
         # into this region on its own — these two will be superseded by real
         # ones. Both are probe requests with EXACTLY counted prompts (chat
         # template, #906), marked `probe` because they carry a real time

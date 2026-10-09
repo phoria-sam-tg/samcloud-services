@@ -85,6 +85,7 @@ python -m ollama.test_lease_reconcile    # The lease says what the model actuall
 python -m ollama.test_num_ctx            # The served window: pinned, clamped, published (no network)
 python -m ollama.test_stream_deadlines   # Silence is bounded, elapsed time is not (no network)
 python -m ollama.test_route_bindings     # Every path resolves to its own handler (no network)
+python -m ollama.test_proxy_bounds       # Every httpx proxy call is bounded, in shape (no network)
 
 # Older tests, from inside ollama/ — these lease and load for real.
 cd ollama && python test_lifecycle.py   # Full lease cycle
@@ -303,6 +304,8 @@ restarting.
   real speech and the absolute rates are a floor. Re-measure on a real walkthrough
   before changing the default on the strength of these.
 - **Three pillars** — SAMcloud provides routing, resources, and auth
+- **An httpx `read` is a SILENCE bound, and a prefill is silent** (ticket #911) — so `httpx.AsyncClient(timeout=300)` sets connect/read/write/pool all to 300s and a non-streaming request, which produces no bytes until the generation completes, has its whole generation inside one read. That aborted legitimate replies at 300s: this box's own cold prefills measure 718.7s at 62,777 real tokens, 918.0s at 75,776 and 1,691.0s at 112,682, each emitting nothing. The seven proxy call sites carried the two *opposite* defects — three streams at `timeout=None` (no bound at all, so the caller's bound is the only one and the gateway emits no frame) and four non-streams at `timeout=300` — and one of the four hid inside a `stream: true` branch where the VLM tools path collapses to a non-streaming upstream call. All seven now go through `server._proxy_timeout()`: `read` is the whole-request ceiling, because anything tighter needs a prompt-scaled rate and these paths have no exact token count (`prompt_size.count` falls to an estimate without a `tokenizer.json`, #906); `connect` carries the tight bound as the only one not waiting on inference, being a 127.0.0.1 child this gateway started. A bare number for a timeout is the bug — the gate asserts a `Timeout` object
+- **Assert a bound by mutating it, not by grepping for it** (ticket #911) — `server.py` now contains the strings `timeout=None` and `timeout=300` in the docstring explaining why they are gone, so a grep-based check would fail against the fix and pass against the defect. `test_proxy_bounds` replaces `_proxy_timeout` with a sentinel and asserts all seven call sites follow it, which no comment can satisfy, and asserts the count is **seven** so a new unbounded site cannot be added quietly. This is the same trap that let three assertions in `test_stream_deadlines` be satisfied by their own explanatory comments
 
 ## Current State
 

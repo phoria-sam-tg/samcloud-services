@@ -1490,6 +1490,31 @@ _FAILURE_FINISH_REASON = "error"
 # (:3427), choices is built populated (:3442), and `validate_response` returns
 # True on choices being non-empty. A manufactured success, with whatever tokens
 # had streamed becoming the reply and nothing saying the request was cut.
+def _proxy_timeout() -> "httpx.Timeout":
+    """The bound for every httpx proxy call — llama-server and mlx-vlm (#911).
+
+    ONE function rather than a literal at each of the seven call sites, because
+    the seven were not consistent with each other and nothing made that visible:
+    three streams carried `timeout=None` (no bound at all) and four non-streams
+    carried `timeout=300` (#904's defect on a different transport). A reader had
+    to find all seven to notice.
+
+    `read` is a per-read-operation bound, so it is a SILENCE bound, and a
+    prefill emits no bytes — the whole prefill sits inside one read. That is why
+    300 aborted legitimate replies and why anything tighter cannot be chosen
+    without a prompt-scaled rate these paths have no exact count for. See
+    `config.OLLAMA_PROXY_CONNECT_S` for the measured prefill times that rule it
+    out. So `read` is the whole-request ceiling and `connect` carries the tight
+    bound, being the only one not waiting on inference.
+    """
+    return httpx.Timeout(
+        connect=config.OLLAMA_PROXY_CONNECT_S,
+        read=config.OLLAMA_GENERATE_TIMEOUT,
+        write=config.OLLAMA_PROXY_WRITE_S,
+        pool=config.OLLAMA_PROXY_WRITE_S,
+    )
+
+
 def _failure_frames(error_type: str, message: str, detail: dict) -> list:
     """The two SSE payloads for one failure, in detection order.
 
@@ -2112,7 +2137,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                         "POST",
                         f"http://127.0.0.1:{mm.port}/v1/chat/completions",
                         json=payload,
-                        timeout=None,
+                        timeout=_proxy_timeout(),
                     ) as resp:
                         async for line in resp.aiter_lines():
                             # blank lines are forwarded: they terminate SSE events
@@ -2125,7 +2150,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                 resp = await client.post(
                     f"http://127.0.0.1:{mm.port}/v1/chat/completions",
                     json=payload,
-                    timeout=300,
+                    timeout=_proxy_timeout(),
                 )
                 return resp.json()
 
@@ -2161,7 +2186,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                     resp = await client.post(
                         f"http://127.0.0.1:{mm.port}/v1/chat/completions",
                         json={**payload, "stream": False},
-                        timeout=300,
+                        timeout=_proxy_timeout(),
                     )
                     data = resp.json()
                     content = data["choices"][0]["message"].get("content", "")
@@ -2186,7 +2211,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                             "POST",
                             f"http://127.0.0.1:{mm.port}/v1/chat/completions",
                             json=payload,
-                            timeout=None,
+                            timeout=_proxy_timeout(),
                         ) as resp:
                             async for line in resp.aiter_lines():
                                 # blank lines are forwarded: they terminate SSE events
@@ -2199,7 +2224,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                 resp = await client.post(
                     f"http://127.0.0.1:{mm.port}/v1/chat/completions",
                     json=payload,
-                    timeout=300,
+                    timeout=_proxy_timeout(),
                 )
                 data = resp.json()
                 # Parse Gemma tool calls from content
@@ -2264,7 +2289,7 @@ async def completions(req: CompletionRequest):
                         "POST",
                         f"http://127.0.0.1:{mm.port}/v1/completions",
                         json=payload,
-                        timeout=None,
+                        timeout=_proxy_timeout(),
                     ) as resp:
                         async for line in resp.aiter_lines():
                             # blank lines are forwarded: they terminate SSE events
@@ -2277,7 +2302,7 @@ async def completions(req: CompletionRequest):
                 resp = await client.post(
                     f"http://127.0.0.1:{mm.port}/v1/completions",
                     json=payload,
-                    timeout=300,
+                    timeout=_proxy_timeout(),
                 )
                 return resp.json()
 

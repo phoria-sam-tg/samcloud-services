@@ -236,6 +236,42 @@ restarting.
   prefill memory grows faster than linearly with prompt length, so 4x the tokens
   cost 7x the memory and an intuited limit lands in the wrong place. It is a
   property of the boxes and the placement: re-measure when either changes.
+- **A short ring is not an outage, and the tier says so through the capacity model**
+  (ticket #870) — one of the pool's two nodes is a **laptop**, so the ring spends
+  part of every day short. Sam, 2026-09-30: the tier exists to be a multi-device
+  model, so while the ring is short `think` is **unavailable the way any model is
+  unavailable while the capacity it needs is taken**, and it returns when the
+  capacity does. **No one-node placement and no substitution** — a caller that
+  asked for `think` and silently received another model has been told something
+  untrue, so the decline carries `alternatives` as *information* and swaps in
+  nothing. `pool_ring_short` is a distinct error code from `pool_unavailable`,
+  with `transient: true` and `operator_action_required: false`, because the one
+  cause that is normal must not arrive looking like the one that needs a person.
+- **The tier's residency comes from the pool, never from `self.models`**
+  (ticket #870) — `resolve_exo_tier` registers `think` with `managed=False` and
+  nothing removes it, so the offer read it as resident for the life of the
+  process: measured on slice 2026-09-30 with the ring short and nothing placed,
+  `/models` advertised `think` resident with `idle_seconds: 80238`. For every
+  other backend residency *is* ours to know, because we started it. `/v1/models`
+  now omits the tier when it cannot serve, the same convention as a model blocked
+  for capacity, and **still performs no pool read** — `pool_watch_loop` polls on a
+  timer and `offering()` reads its snapshot, so a wedged pool cannot make
+  discovery hang. A snapshot too stale to trust leaves the tier **listed**: not
+  having looked is a fact about us, and a dead loop must not delete a configured
+  route.
+- **`nodeIdentities` is not a ring size** (ticket #870) — it is the one per-node
+  map `apply_node_timed_out` does not filter, so it remembers a departed node and
+  looks like the way to tell a short ring from a small one. It is also emptied by
+  an API-state reset plus an event-log rotation, which **every exo restart
+  performs**. Read live on slice at 00:24Z on 2026-09-30, 17 minutes after its own
+  node restarted and with wafer genuinely away: `topology.nodes` and
+  `nodeIdentities` both held slice alone, so the subtraction said the ring was
+  whole while a node was missing — and the decline then told a caller "the ring is
+  whole and no model is placed on it". `EXO_RING_MIN_NODES` has **no default**,
+  and setting it is what arms `pool_ring_short`; unset, the reason falls back and
+  the message says in terms that whether the ring is whole is *not established*.
+  Same shape as `FOREIGN_IDLE_MB`: a guessed value produces a confident wrong
+  answer rather than a missing one.
 - **Speech to text is a child process, not an import** (ticket #858) —
   `Backend.WHISPER` is owned exactly as mlx-vlm is: `load_whisper_model` spawns
   `ollama/whisper_server.py` under `WHISPER_PYTHON`, leases, polls `/health`, and

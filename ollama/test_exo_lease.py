@@ -9,6 +9,7 @@ API index documents — the two differ, and that difference is the point.
 Run: cd ollama && python test_exo_lease.py
 """
 
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ from ollama import capacity, config                         # noqa: E402
 
 # The wedge guard sleeps between its two samples; keep the suite quick.
 import ollama.manager as _mgr_mod                            # noqa: E402
+import ollama.manager as manager_mod                          # noqa: E402
 _mgr_mod.EXO_WEDGE_RECHECK_S = 0.01
 from ollama.samcloud import SamcloudClient                  # noqa: E402
 
@@ -1458,6 +1460,367 @@ def test_observed_openai_fields_are_not_silently_dropped():
     check("omitted reasoning_effort is None", bare.reasoning_effort, None)
     check("omitted stream_options is None", bare.stream_options, None)
     check("omitted response_format is None", bare.response_format, None)
+
+
+# --- a short ring is not an outage (#870) ---------------------------------
+#
+# wafer is a laptop. Sam, 2026-09-30: the tier exists to be a multi-device
+# model, so while the ring is short it is UNAVAILABLE the way any model is
+# unavailable while the capacity it needs is taken, and it returns when the
+# capacity does. No one-node placement and no substitution. These cases assert
+# the three places a caller meets that: the offer, discovery, and the decline.
+
+def _tier_in(entries) -> list:
+    """The tier's own `(name, reason)` from a bucket, ignoring everything else.
+
+    A CASE ABOUT THE TIER MUST NOT ASSERT THE WHOLE BUCKET. `want
+    [("think", "pool_ring_short")]` against all of `blocked` is a claim that
+    nothing else on this box is blocked — which is a claim about the box, not
+    about the tier. It passed on slice on 2026-09-30 and failed there on
+    2026-10-09, unchanged, because a `gemma-4` VLM became installed in between
+    and reads `insufficient_capacity`. The behaviour under test was correct both
+    times; the assertion could not tell. Filter, then assert.
+    """
+    return [(e["name"], e["reason"]) for e in entries if e.get("name") == "think"]
+
+
+@contextlib.contextmanager
+def _only_the_tier():
+    """A manager whose offer contains the tier and nothing the box happens to hold.
+
+    `offering()` walks four catalogues. Stubbing `catalogue_mb` and `llama`
+    covers two; `VLM_MODELS` and `WHISPER_MODELS` are iterated against
+    `hf_model_installed`, which reads this box — the leak above. `capacity.collect`
+    is pinned for the same reason: the tier's state comes from `_pool_view` and
+    never from memory, so a case about it should not be able to fail on a
+    hardware reading either.
+    """
+    m = mgr()
+    m.catalogue_mb = lambda: {}
+    m.llama = type("L", (), {"available_models": lambda self: []})()
+    real_installed = manager_mod.hf_model_installed
+    real_collect = capacity.collect
+    manager_mod.hf_model_installed = lambda repo_id: False
+    capacity.collect = lambda: {
+        "memory_total_mb": 65536, "memory_used_mb": 5536,
+        "memory_available_mb": 60000, "memory_device_inuse_mb": 500,
+        "compute_pct": 0.0, "load_avg_1m": 0.0,
+    }
+    try:
+        yield m
+    finally:
+        manager_mod.hf_model_installed = real_installed
+        capacity.collect = real_collect
+
+
+def _view(**kw) -> dict:
+    """A pool_status snapshot. Defaults are the real shape, so a case names only
+    what it is about and cannot accidentally assert a key it did not set."""
+    v = {"resident_model": None, "ready": False, "busy": False, "instances": [],
+         "nodes_live": 1, "nodes_known": 2, "nodes_expected": 2,
+         "ring_short": True, "ring_basis": "configured",
+         "unavailable_reason": "ring_short"}
+    v.update(kw)
+    return v
+
+
+def test_pool_status_reads_the_ring():
+    """`ring_short` is live nodes against remembered ones, and nothing else."""
+    def state_with(nodes, identities, instances=None):
+        c = ExoClient()
+        c.state = lambda: {"topology": {"nodes": nodes},
+                           "nodeIdentities": identities,
+                           "instances": instances or {},
+                           "runners": {}}
+        return c.pool_status()
+
+    s = state_with(["ffff"], {"ffff": {}, "1111": {}})
+    check("one of two live -> ring_short", s["ring_short"], True)
+    check("...and that is the reason", s["unavailable_reason"], "ring_short")
+    check("...counts reported", (s["nodes_live"], s["nodes_known"]), (1, 2))
+
+    # The case that must NOT read as a short ring: nodeIdentities is emptied by
+    # an API-state reset plus an event-log rotation (measured null on wafer,
+    # 2026-09-30), so a just-restarted node knows only itself. "I remember no
+    # peer" is not "the ring is whole", and it is certainly not "a node left".
+    s = state_with(["ffff"], {"ffff": {}})
+    check("identities know only this node -> NOT ring_short", s["ring_short"], False)
+    check("...reason is no_instance, not ring_short",
+          s["unavailable_reason"], "no_instance")
+    check("...and the basis is flagged as inferred", s["ring_basis"], "identities")
+
+    # THE CASE ABOVE IS A REAL SHORT RING READ AS WHOLE, and it was measured, not
+    # imagined: slice at 00:24Z on 2026-09-30, 17 minutes after its own node
+    # restarted, held one node known and one live while wafer was away. An exo
+    # restart resets the API state and rotates the event log, so the inference is
+    # sound only until the surviving node restarts -- which is routine. That is
+    # what EXO_RING_MIN_NODES is for, and with it set the same /state is correct.
+    real_expected = config.EXO_RING_MIN_NODES
+    config.EXO_RING_MIN_NODES = 2
+    try:
+        s = state_with(["ffff"], {"ffff": {}})
+        check("configured ring size -> the real short ring is seen",
+              s["ring_short"], True)
+        check("...reason corrected", s["unavailable_reason"], "ring_short")
+        check("...basis says it was established", s["ring_basis"], "configured")
+        check("...and it reports what it expected", s["nodes_expected"], 2)
+        s = state_with(["ffff", "1111"], {"ffff": {}, "1111": {}})
+        check("configured and whole -> not short", s["ring_short"], False)
+    finally:
+        config.EXO_RING_MIN_NODES = real_expected
+
+    # nodeIdentities absent entirely (wafer returned null for it).
+    s = state_with(["ffff"], None)
+    check("null identities -> not ring_short", s["ring_short"], False)
+    check("...and nodes_known is 0, not a crash", s["nodes_known"], 0)
+
+    # A whole ring with an instance whose runners cannot serve is mid-swap, and
+    # must not be reported as a short ring either.
+    s = state_with(["ffff", "1111"], {"ffff": {}, "1111": {}},
+                   instances={"i0": {"MlxRingInstance": {"shardAssignments": {
+                       "modelId": "m", "nodeToRunner": {"n": "r"}}}}})
+    check("whole ring, unserviceable instance -> not_ready",
+          s["unavailable_reason"], "not_ready")
+
+
+def test_ring_short_blocks_the_tier_in_the_offer():
+    """`/warm` and `/status` must say the tier cannot serve, and why."""
+    import time as _t
+    m = mgr()
+    m._pool_view = (_t.monotonic(), _view())
+    pool = m.pool_offer()
+    check("tier is blocked", pool["state"], "blocked")
+    check("reason names the ring", pool["reason"], "pool_ring_short")
+    check("detail says it returns on its own",
+          "returns on its own" in pool["detail"], True)
+    check("detail says there is nothing to do",
+          "nothing to do" in pool["detail"], True)
+    # It carries no need_mb: the pool is not ours to size, and a figure here
+    # would double-count pages this box's capacity gate already sees.
+    check("no need_mb on the tier", "need_mb" in pool, False)
+
+
+def test_a_down_pool_is_never_reported_resident():
+    """The 22-hour bug: `self.models` is the wrong authority for the tier.
+
+    `resolve_exo_tier` registers `think` with managed=False and nothing removes
+    it, so before this the offer read it as resident for the life of the
+    process. Measured on slice 2026-09-30 with the ring short and nothing
+    placed: `/models` advertised `think` resident with idle_seconds 80238.
+    """
+    import time as _t
+    from ollama.manager import ManagedModel
+    with _only_the_tier() as m:
+        m.models["think"] = ManagedModel(
+            name="mlx-community/GLM-4.7-Flash-6bit", backend=Backend.EXO,
+            memory_mb=0, lease_id=None, port=0, loaded_at=_t.time() - 80238,
+            last_used=_t.time() - 80238, managed=False, tier="think",
+        )
+        m._pool_view = (_t.monotonic(), _view())
+        off = m.offering()
+        check("stale registry entry is not resident",
+              [e["name"] for e in off["resident"] if e.get("name") == "think"], [])
+        check("the tier is blocked instead",
+              _tier_in(off["blocked"]), [("think", "pool_ring_short")])
+
+        # And the opposite direction: a pool that IS serving reports resident, from
+        # the pool rather than from the registry.
+        m._pool_view = (_t.monotonic(), _view(
+            ready=True, resident_model="mlx-community/GLM-4.7-Flash-6bit",
+            ring_short=False, unavailable_reason=None, nodes_live=2))
+        off = m.offering()
+        tier = next((e for e in off["resident"] if e["name"] == "think"), None)
+        check("a serving pool is resident", tier is not None, True)
+        check("...naming the model it holds",
+              tier and tier["model"], "mlx-community/GLM-4.7-Flash-6bit")
+        check("...and the tier is not also blocked", _tier_in(off["blocked"]), [])
+
+
+def test_the_tier_never_lands_in_loadable():
+    """`loadable` means "this box can start it right now", and the pool is never that.
+
+    A draft of this work put the `unknown` tier entry in `loadable` and two suites
+    caught it at once: `test_elastic_offering` raised `KeyError: need_mb` reading
+    the bucket, because every other entry carries one and the pool has none to
+    give, and `test_work_gate` asserts `loadable == []` while another tenant holds
+    the device — a thing the pool is unaffected by, since we neither start nor size
+    it. Asserted here in its own right so the bucket cannot be borrowed again.
+    """
+    import time as _t
+    m = mgr()
+    m.catalogue_mb = lambda: {}
+    m.llama = type("L", (), {"available_models": lambda self: []})()
+
+    for label, view in (("blocked", _view()),
+                        ("resident", _view(ready=True, ring_short=False,
+                                           resident_model="m", nodes_live=2,
+                                           unavailable_reason=None)),
+                        ("unknown", None)):
+        m._pool_view = None if view is None else (_t.monotonic(), view)
+        off = m.offering()
+        check(f"{label}: tier absent from loadable",
+              [e for e in off["loadable"] if e.get("backend") == "exo"], [])
+        check(f"{label}: every loadable entry still carries need_mb",
+              all("need_mb" in e for e in off["loadable"]), True)
+        check(f"{label}: the verdict is on the pool key",
+              off["pool"]["state"], "unknown" if view is None
+              else view["unavailable_reason"] and "blocked" or "resident")
+
+    # And `unknown` is in NO bucket: not blocked, because we cannot say that, and
+    # not resident. It is still discoverable, which is `/v1/models`'s business.
+    m._pool_view = None
+    off = m.offering()
+    check("unknown: in neither bucket",
+          ([e for e in off["resident"] if e.get("backend") == "exo"],
+           [e for e in off["blocked"] if e.get("backend") == "exo"]), ([], []))
+
+
+def test_a_stale_pool_view_lists_the_tier_rather_than_hiding_it():
+    """Not having looked is a fact about us, not about the pool.
+
+    A dead watcher must not delete a configured route from discovery, so past
+    EXO_POOL_VIEW_MAX_AGE_S the tier is listed with a reason rather than
+    omitted. The opposite default would take `think` out of every caller's
+    catalogue because a loop raised.
+    """
+    import time as _t
+    m = mgr()
+    check("no snapshot at all -> listed as unknown",
+          m.pool_offer()["state"], "unknown")
+    check("...with a reason a reader can act on",
+          m.pool_offer()["reason"], "pool_view_stale")
+    m._pool_view = (_t.monotonic() - (config.EXO_POOL_VIEW_MAX_AGE_S + 1), _view())
+    check("an expired snapshot -> unknown, not blocked",
+          m.pool_offer()["state"], "unknown")
+    m._pool_view = (_t.monotonic(), _view())
+    check("a fresh snapshot is trusted", m.pool_offer()["state"], "blocked")
+
+
+def test_ring_short_omits_the_tier_from_v1_models():
+    """Discovery lists what can serve now — the tier included, when it cannot.
+
+    Same convention as a model blocked for capacity, which `/v1/models` already
+    omits. The whole picture with reasons is on `/models` and `/warm`.
+    """
+    import asyncio
+    import time as _t
+    import ollama.server as srv
+    from ollama import capacity, manager as manager_mod
+    from ollama.manager import ModelManager
+    from ollama.samcloud import SamcloudClient
+
+    class ExplodingExo:
+        def pool_status(self, *a, **k):
+            raise AssertionError("/v1/models must not read the pool")
+        def pool_status_cached(self, *a, **k):
+            raise AssertionError("/v1/models must not read the pool")
+
+    class FakeOllama:
+        def list_models(self):
+            return [{"name": "qwen3.8:27b-mlx", "size": 17500 * 1024 * 1024}]
+        def memory_estimate_mb(self, name):
+            return 17500
+
+    real, real_collect = getattr(srv, "mgr", None), capacity.collect
+    real_installed = manager_mod.hf_model_installed
+    capacity.collect = lambda: {
+        "memory_total_mb": 65536, "memory_used_mb": 5536,
+        "memory_available_mb": 60000, "memory_device_inuse_mb": 500,
+        "compute_pct": 0.0, "load_avg_1m": 0.0,
+    }
+    manager_mod.hf_model_installed = lambda repo_id: False
+    srv.mgr = ModelManager(sc=SamcloudClient(token="test"), ollama=FakeOllama(),
+                           llama=type("L", (), {"available_models": lambda s: []})(),
+                           exo=ExplodingExo())
+    try:
+        srv.mgr._pool_view = (_t.monotonic(), _view())
+        short = asyncio.run(srv.list_models_openai())
+        srv.mgr._pool_view = (_t.monotonic(), _view(
+            ready=True, resident_model="mlx-community/GLM-4.7-Flash-6bit",
+            ring_short=False, unavailable_reason=None, nodes_live=2))
+        whole = asyncio.run(srv.list_models_openai())
+    finally:
+        srv.mgr, capacity.collect = real, real_collect
+        manager_mod.hf_model_installed = real_installed
+
+    short_ids = [m["id"] for m in short["data"]]
+    whole_ids = [m["id"] for m in whole["data"]]
+    check("ring short -> tier omitted", "think" in short_ids, False)
+    check("...and the rest of the catalogue is unaffected",
+          "qwen3.8:27b-mlx" in short_ids, True)
+    check("ring whole -> tier listed", "think" in whole_ids, True)
+    check("...still owned_by exo and status tier",
+          [(m["owned_by"], m["status"]) for m in whole["data"]
+           if m["id"] == "think"], [("exo", "tier")])
+    # The property the old unconditional listing existed to protect: no pool
+    # read on this path. ExplodingExo asserts it in both directions above.
+
+
+def test_ring_short_decline_names_the_cause_and_substitutes_nothing():
+    """`pool_ring_short`, not `pool_unavailable` — and no model swapped in.
+
+    A short ring resolves itself with nobody acting, so the decline must not
+    arrive looking like the outage `pool_unavailable` describes. Alternatives
+    are information: a caller falls back by its own choice, in a second request.
+    """
+    import time as _t
+    import ollama.server as srv
+    from ollama.manager import ModelManager
+    from ollama.samcloud import SamcloudClient
+
+    class FakeOllama:
+        def list_models(self):
+            return [{"name": "qwen3.8:27b-mlx", "size": 17500 * 1024 * 1024}]
+        def memory_estimate_mb(self, name):
+            return 17500
+
+    from ollama import capacity, manager as manager_mod
+    real, real_collect = getattr(srv, "mgr", None), capacity.collect
+    real_installed = manager_mod.hf_model_installed
+    capacity.collect = lambda: {
+        "memory_total_mb": 65536, "memory_used_mb": 5536,
+        "memory_available_mb": 60000, "memory_device_inuse_mb": 500,
+        "compute_pct": 0.0, "load_avg_1m": 0.0,
+    }
+    manager_mod.hf_model_installed = lambda repo_id: False
+    srv.mgr = ModelManager(sc=SamcloudClient(token="test"), ollama=FakeOllama(),
+                           llama=type("L", (), {"available_models": lambda s: []})(),
+                           exo=_IdleExo())
+    try:
+        srv.mgr._pool_view = (_t.monotonic(), _view())
+        exc = srv._pool_unavailable_503(ExoUnavailable("no model resident"))
+        d = exc.detail
+        # A pool that is simply unplaced keeps the old code, so the new one is
+        # not just "every decline renamed".
+        srv.mgr._pool_view = (_t.monotonic(), _view(
+            ring_short=False, nodes_live=2, unavailable_reason="no_instance",
+            ring_basis="identities"))
+        unplaced = srv._pool_unavailable_503(ExoUnavailable("nothing placed")).detail
+    finally:
+        srv.mgr, capacity.collect = real, real_collect
+        manager_mod.hf_model_installed = real_installed
+
+    check("status is still 503", exc.status_code, 503)
+    check("the cause is named", d["error"], "pool_ring_short")
+    check("flagged transient for a machine", d["transient"], True)
+    check("no operator action claimed", d["operator_action_required"], False)
+    check("the note explains rather than instructs",
+          "returns on its own" in d["note"], True)
+    check("alternatives are offered", "qwen3.8:27b-mlx" in d["alternatives"], True)
+    check("the tier is never among them", "think" in d["alternatives"], False)
+    check("and they are explicitly not substituted",
+          "nothing is substituted" in d["alternatives_note"], True)
+    check("an unplaced pool is a different code",
+          unplaced["error"], "pool_no_instance")
+    check("...and claims no transience",
+          "transient" in unplaced, False)
+    # And on the inferred basis it must NOT claim the ring is whole -- that claim
+    # is what made slice's real short ring read as "nothing is placed".
+    check("inferred basis does not assert a whole ring",
+          "the ring is whole" in unplaced["note"], False)
+    check("...and says so, naming the knob that would settle it",
+          "NOT established" in unplaced["note"]
+          and "EXO_RING_MIN_NODES" in unplaced["note"], True)
 
 
 if __name__ == "__main__":

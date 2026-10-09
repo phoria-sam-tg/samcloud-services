@@ -9,6 +9,7 @@ API index documents — the two differ, and that difference is the point.
 Run: cd ollama && python test_exo_lease.py
 """
 
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ from ollama import capacity, config                         # noqa: E402
 
 # The wedge guard sleeps between its two samples; keep the suite quick.
 import ollama.manager as _mgr_mod                            # noqa: E402
+import ollama.manager as manager_mod                          # noqa: E402
 _mgr_mod.EXO_WEDGE_RECHECK_S = 0.01
 from ollama.samcloud import SamcloudClient                  # noqa: E402
 
@@ -1468,6 +1470,49 @@ def test_observed_openai_fields_are_not_silently_dropped():
 # capacity does. No one-node placement and no substitution. These cases assert
 # the three places a caller meets that: the offer, discovery, and the decline.
 
+def _tier_in(entries) -> list:
+    """The tier's own `(name, reason)` from a bucket, ignoring everything else.
+
+    A CASE ABOUT THE TIER MUST NOT ASSERT THE WHOLE BUCKET. `want
+    [("think", "pool_ring_short")]` against all of `blocked` is a claim that
+    nothing else on this box is blocked — which is a claim about the box, not
+    about the tier. It passed on slice on 2026-09-30 and failed there on
+    2026-10-09, unchanged, because a `gemma-4` VLM became installed in between
+    and reads `insufficient_capacity`. The behaviour under test was correct both
+    times; the assertion could not tell. Filter, then assert.
+    """
+    return [(e["name"], e["reason"]) for e in entries if e.get("name") == "think"]
+
+
+@contextlib.contextmanager
+def _only_the_tier():
+    """A manager whose offer contains the tier and nothing the box happens to hold.
+
+    `offering()` walks four catalogues. Stubbing `catalogue_mb` and `llama`
+    covers two; `VLM_MODELS` and `WHISPER_MODELS` are iterated against
+    `hf_model_installed`, which reads this box — the leak above. `capacity.collect`
+    is pinned for the same reason: the tier's state comes from `_pool_view` and
+    never from memory, so a case about it should not be able to fail on a
+    hardware reading either.
+    """
+    m = mgr()
+    m.catalogue_mb = lambda: {}
+    m.llama = type("L", (), {"available_models": lambda self: []})()
+    real_installed = manager_mod.hf_model_installed
+    real_collect = capacity.collect
+    manager_mod.hf_model_installed = lambda repo_id: False
+    capacity.collect = lambda: {
+        "memory_total_mb": 65536, "memory_used_mb": 5536,
+        "memory_available_mb": 60000, "memory_device_inuse_mb": 500,
+        "compute_pct": 0.0, "load_avg_1m": 0.0,
+    }
+    try:
+        yield m
+    finally:
+        manager_mod.hf_model_installed = real_installed
+        capacity.collect = real_collect
+
+
 def _view(**kw) -> dict:
     """A pool_status snapshot. Defaults are the real shape, so a case names only
     what it is about and cannot accidentally assert a key it did not set."""
@@ -1565,32 +1610,30 @@ def test_a_down_pool_is_never_reported_resident():
     """
     import time as _t
     from ollama.manager import ManagedModel
-    m = mgr()
-    m.models["think"] = ManagedModel(
-        name="mlx-community/GLM-4.7-Flash-6bit", backend=Backend.EXO,
-        memory_mb=0, lease_id=None, port=0, loaded_at=_t.time() - 80238,
-        last_used=_t.time() - 80238, managed=False, tier="think",
-    )
-    m._pool_view = (_t.monotonic(), _view())
-    m.catalogue_mb = lambda: {}
-    m.llama = type("L", (), {"available_models": lambda self: []})()
-    off = m.offering()
-    check("stale registry entry is not resident",
-          [e["name"] for e in off["resident"]], [])
-    check("the tier is blocked instead",
-          [(e["name"], e["reason"]) for e in off["blocked"]],
-          [("think", "pool_ring_short")])
+    with _only_the_tier() as m:
+        m.models["think"] = ManagedModel(
+            name="mlx-community/GLM-4.7-Flash-6bit", backend=Backend.EXO,
+            memory_mb=0, lease_id=None, port=0, loaded_at=_t.time() - 80238,
+            last_used=_t.time() - 80238, managed=False, tier="think",
+        )
+        m._pool_view = (_t.monotonic(), _view())
+        off = m.offering()
+        check("stale registry entry is not resident",
+              [e["name"] for e in off["resident"] if e.get("name") == "think"], [])
+        check("the tier is blocked instead",
+              _tier_in(off["blocked"]), [("think", "pool_ring_short")])
 
-    # And the opposite direction: a pool that IS serving reports resident, from
-    # the pool rather than from the registry.
-    m._pool_view = (_t.monotonic(), _view(
-        ready=True, resident_model="mlx-community/GLM-4.7-Flash-6bit",
-        ring_short=False, unavailable_reason=None, nodes_live=2))
-    off = m.offering()
-    check("a serving pool is resident", [e["name"] for e in off["resident"]], ["think"])
-    check("...naming the model it holds",
-          off["resident"][0]["model"], "mlx-community/GLM-4.7-Flash-6bit")
-    check("...and nothing blocked", off["blocked"], [])
+        # And the opposite direction: a pool that IS serving reports resident, from
+        # the pool rather than from the registry.
+        m._pool_view = (_t.monotonic(), _view(
+            ready=True, resident_model="mlx-community/GLM-4.7-Flash-6bit",
+            ring_short=False, unavailable_reason=None, nodes_live=2))
+        off = m.offering()
+        tier = next((e for e in off["resident"] if e["name"] == "think"), None)
+        check("a serving pool is resident", tier is not None, True)
+        check("...naming the model it holds",
+              tier and tier["model"], "mlx-community/GLM-4.7-Flash-6bit")
+        check("...and the tier is not also blocked", _tier_in(off["blocked"]), [])
 
 
 def test_the_tier_never_lands_in_loadable():

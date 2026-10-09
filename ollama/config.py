@@ -635,6 +635,40 @@ OLLAMA_GENERATE_TIMEOUT = _env_int("OLLAMA_GENERATE_TIMEOUT", 1800)
 # operation.
 OLLAMA_STALL_TIMEOUT = _env_int("OLLAMA_STALL_TIMEOUT", 300)
 
+# #911: the httpx proxy paths (llama-server, mlx-vlm) carry the two OPPOSITE
+# defects #904 fixed on the owned path — `timeout=None` on every stream and
+# `timeout=300` on every non-stream — and they are bounded with the same SHAPE
+# as the owned path rather than the same numbers.
+#
+# WHY `read` IS THE WHOLE-REQUEST CEILING AND NOT SOMETHING TIGHTER
+#
+# httpx `read` is a per-read-operation bound, so it is a SILENCE bound. A
+# prefill emits no bytes, so the whole prefill sits inside one read — which is
+# why `timeout=300` aborted a legitimate reply at 300s, and why a bound tight
+# enough to catch a wedge is tight enough to kill a long prefill. That trap
+# killed `sock_read` on #904 for a measured reason and it is the same trap here.
+#
+# Measured on this box, cold prefills with no bytes emitted:
+#
+#     62,777 real tokens    718.7s     seat traffic
+#     75,776               918.0s      probe
+#    112,682             1,691.0s      probe
+#
+# So any silence bound below ~1,700s cuts work this box demonstrably completes,
+# and choosing one tighter needs a prompt-scaled rate — which needs an exact
+# token count, which these paths do not have (`prompt_size.count` falls to an
+# estimate at 1.5 chars/token without a `tokenizer.json`, #906). The arming rule
+# applies: a deadline arms on a measurement, not a default, and on an exact
+# count, not an estimated one. So `read` is the whole-request ceiling: a wedged
+# upstream is bounded at OLLAMA_GENERATE_TIMEOUT instead of never, and no
+# request the owned path would permit is cut by the transport.
+#
+# `connect` IS the bound that can be tight, because it is the only one not
+# waiting on inference: these are 127.0.0.1 proxies to a child this gateway
+# started, so a connect that takes 10s is a dead process rather than a busy one.
+OLLAMA_PROXY_CONNECT_S = _env_int("OLLAMA_PROXY_CONNECT_S", 10)
+OLLAMA_PROXY_WRITE_S = _env_int("OLLAMA_PROXY_WRITE_S", 30)
+
 # The first-token deadline, as a function of the prompt. Scales with the prompt
 # because prompt length is the only thing that predicts how long the silence
 # before token 1 should last.

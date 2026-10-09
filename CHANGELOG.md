@@ -42,6 +42,32 @@ Project history and current state. This is a living document.
   test whose verdict depended on what this box happened to hold — fixed here by
   filtering the assertion to the tier, and found again in `test_prompt_size`.
 
+## 2026-10-09 — Two of step 8's assertions were already vacuous (#904, #905)
+
+- **`test_stream_deadlines` step 8 asserted over source TEXT, and two of its six
+  checks passed on comments alone.** `ollama_client.py:392-394` contains the
+  strings `total=None`, `OLLAMA_GENERATE_TIMEOUT` and `wait_for` in prose, so
+  `"total=None" in src` and `"OLLAMA_GENERATE_TIMEOUT" in src and "wait_for" in
+  src` would have survived deleting the code they describe.
+- **Demonstrated rather than argued.** Reintroducing the original defect —
+  `ClientTimeout(total=300)`, comments untouched — makes the new AST checks fail
+  correctly, while the old `"total=None" in src` still returns True. The
+  assertion was not merely fragile; it was *wrong on the exact mutation it
+  existed to catch*.
+- **A third was one word from failing the other way.** The comment at `:311`
+  says "transcribing this `300` into aiohttp's `total=`"; tidying that into
+  "the old `total=300`" would have made `"total=300" not in src` report the
+  defect as present while it is absent.
+- All six are now read off the AST: `ClientTimeout` counted as *calls*, `total`
+  and `sock_connect` read as kwarg literals, the httpx `Timeout` asserted
+  per-kwarg (so reformatting cannot break it and quoting cannot satisfy it), and
+  `OLLAMA_GENERATE_TIMEOUT` / `wait_for` resolved as identifiers. 115 checks,
+  was 113.
+- **The general form, which is `claude-containers`'** (#905): a well-commented
+  fix quotes the defect it removes, so a grep assertion is least reliable
+  exactly where the code is best documented. Five instances across two seats.
+  It is a class to sweep, not a list to work through.
+
 ## 2026-10-08 — The inter-token bound was my own regression, found live (#904)
 
 - **I shipped 60s and it aborted a third of real traffic.** Within six minutes

@@ -397,31 +397,105 @@ def main():
           "that fires on the normal path teaches its reader to skip it")
 
     step(8, "structural: the elapsed-time cap is gone, and cannot come back")
-    src = open(os.path.join(os.path.dirname(__file__),
-                            "ollama_client.py")).read()
-    check("total=300" not in src,
-          "no `total=300` anywhere in the client")
-    check("total=None" in src,
-          "aiohttp is given total=None — our budget is enforced in the loop so "
-          "it can be told apart from a stall")
-    check(src.count("ClientTimeout(") == 1,
-          f"exactly one ClientTimeout construction "
-          f"({src.count('ClientTimeout(')}) — a second would be a second "
-          f"policy nobody is reading")
-    check("sock_connect=10" in src,
-          "connecting to a dead Ollama is still bounded; that is neither a "
-          "stall nor a long generation")
+
+    # OVER THE AST, NOT THE TEXT, AND THE REASON IS MEASURED (#905).
+    #
+    # Two of the six assertions this replaces were ALREADY VACUOUS: the
+    # comments at ollama_client.py:392-394 contain the strings `total=None`,
+    # `OLLAMA_GENERATE_TIMEOUT` and `wait_for`, so `"total=None" in src` and
+    # `"OLLAMA_GENERATE_TIMEOUT" in src and "wait_for" in src` passed on prose
+    # alone — they would have survived deleting the code they describe. A third
+    # was one word from breaking the other way: the comment at :311 says
+    # "transcribing this `300` into aiohttp's `total=`", and the next person to
+    # tidy that into "the old `total=300`" would have made
+    # `"total=300" not in src` report the defect as PRESENT while it is absent.
+    #
+    # That is the causal shape `claude-containers` named on #905: a
+    # well-commented fix quotes the defect it removes in order to explain it, so
+    # the defect's textual signature survives in the file that eliminated it —
+    # and a grep assertion is therefore LEAST reliable exactly where the code is
+    # best documented. Three assertions in this file were already fixed for this
+    # once; these six are the rest of the class in it.
+    #
+    # The AST carries no comments and no docstrings, so none of that can reach
+    # these checks.
+    import ast as _ast
+
+    _client_src = open(os.path.join(os.path.dirname(__file__),
+                                    "ollama_client.py")).read()
+    _tree = _ast.parse(_client_src)
+
+    def _calls(name):
+        """Every call whose callee is named `name`, by attribute or bare."""
+        out = []
+        for node in _ast.walk(_tree):
+            if isinstance(node, _ast.Call):
+                f = node.func
+                got = (f.attr if isinstance(f, _ast.Attribute)
+                       else f.id if isinstance(f, _ast.Name) else None)
+                if got == name:
+                    out.append(node)
+        return out
+
+    def _kw(call, key):
+        """The kwarg's literal value, or the sentinel if absent/not literal."""
+        for k in call.keywords:
+            if k.arg == key:
+                try:
+                    return _ast.literal_eval(k.value)
+                except (ValueError, TypeError, SyntaxError):
+                    return "<non-literal>"
+        return "<absent>"
+
+    def _names():
+        return {n.id for n in _ast.walk(_tree) if isinstance(n, _ast.Name)} | \
+               {n.attr for n in _ast.walk(_tree) if isinstance(n, _ast.Attribute)}
+
+    _cts = _calls("ClientTimeout")
+    check(len(_cts) == 1,
+          f"exactly one ClientTimeout CONSTRUCTION ({len(_cts)}) — a second "
+          f"would be a second policy nobody is reading. Counted as calls, so a "
+          f"comment quoting `ClientTimeout(` cannot inflate it")
+    if _cts:
+        ct = _cts[0]
+        check(_kw(ct, "total") is None,
+              "aiohttp is given total=None — our budget is enforced in the "
+              "loop so it can be told apart from a stall. Read off the kwarg, "
+              "so the comment at :392 that also says `total=None` is not what "
+              "satisfies this")
+        check(_kw(ct, "total") != 300,
+              "and `total` is NOT 300 — the elapsed-time cap that aborted a "
+              "third of real traffic. An absent-or-changed kwarg fails here; "
+              "prose about it cannot pass it")
+        check(_kw(ct, "sock_connect") == 10,
+              "connecting to a dead Ollama is still bounded at 10s; that is "
+              "neither a stall nor a long generation")
+
     # The httpx read timeout is a DIFFERENT shape (per-read, i.e. already
     # silence) and must not be collapsed onto the inter-token budget, which
     # would cut a prefill on the non-streaming collect paths.
-    check("httpx.Timeout(connect=10, read=300, write=10, pool=10)" in src,
-          "the SYNC path is untouched: httpx `read` is a per-chunk idle bound, "
-          "so it was always the right shape. The bug was transcribing this "
-          "300 into aiohttp's wall-clock `total=` — the intent was always "
-          "'300s of silence' and the shape was lost in the translation")
-    check("OLLAMA_GENERATE_TIMEOUT" in src and "wait_for" in src,
-          "the whole-request ceiling still exists and is enforced in-process; "
-          "total=None is not 'no ceiling' (#97: the single inference slot)")
+    _httpx_ts = [c for c in _calls("Timeout") if _kw(c, "read") != "<absent>"]
+    check(len(_httpx_ts) == 1,
+          f"one httpx.Timeout on the sync path ({len(_httpx_ts)})")
+    if _httpx_ts:
+        t = _httpx_ts[0]
+        check((_kw(t, "connect"), _kw(t, "read"),
+               _kw(t, "write"), _kw(t, "pool")) == (10, 300, 10, 10),
+              "the SYNC path is untouched: httpx `read` is a per-chunk idle "
+              "bound, so it was always the right shape. The bug was "
+              "transcribing this 300 into aiohttp's wall-clock `total=` — the "
+              "intent was always '300s of silence' and the shape was lost in "
+              "the translation. Asserted per-kwarg, so reformatting the call "
+              "cannot break it and quoting it cannot satisfy it")
+
+    _n = _names()
+    check("OLLAMA_GENERATE_TIMEOUT" in _n,
+          "the whole-request ceiling is REFERENCED IN CODE, not merely "
+          "described: total=None is not 'no ceiling' (#97, the single "
+          "inference slot)")
+    check("wait_for" in _n,
+          "and it is enforced in-process via wait_for — read as an identifier, "
+          "so the three comments that mention `wait_for` cannot stand in for it")
 
     step(9, "structural: no terminal path leaves the caller without [DONE]")
     srv = open(os.path.join(os.path.dirname(__file__), "server.py")).read()

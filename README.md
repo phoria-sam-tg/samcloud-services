@@ -205,16 +205,18 @@ Request arrives
 ### Environment Variables
 
 All defaults are env-driven via `ollama/config.py` and target the production
-samcloud registry + the `claude-services-slice` device.
+samcloud registry. They do **not** name a device: `SC_DEVICE` is required and
+has no default, because a default here named a real peer and every other box
+inherited the wrong identity in silence (#865).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SC_TOKEN` | — | SAMcloud agent token (**required**) |
 | `SC_BASE` | `https://cloud.samtg.xyz/api/v1` | SAMcloud registry base URL |
-| `SC_DEVICE` | `claude-services-slice` | Device identity |
+| `SC_DEVICE` | — | Device identity (**required**; no default — it may never name a peer) |
 | `SERVICE_PORT` | `8800` | Server listen port |
 | `SC_VERIFY_URL` | `${SC_BASE}/auth/verify` | SAMcloud auth endpoint |
-| `SC_REQUIRED_SCOPE` | `device:${SC_DEVICE}` | Required scope for callers |
+| `SC_REQUIRED_SCOPE` | `device:${SC_DEVICE}` | Required scope for callers. With no `SC_DEVICE`, `device:SC_DEVICE-is-unset` — never empty, which would admit every valid token |
 | `AUTH_ENABLED` | `true` | Set `false` to disable auth (development only) |
 | `OLLAMA_NUM_CTX` | unset | Served context window for every Ollama model, in tokens. Unset = Ollama derives one from free VRAM |
 | `OLLAMA_NUM_CTX_MODELS` | unset | Per-model override: `qwen3.8:27b-mlx=262144,qwen3:1.7b=40960`. Wins over `OLLAMA_NUM_CTX` |

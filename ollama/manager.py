@@ -2169,6 +2169,54 @@ class ModelManager:
             self.models[model_name].last_used = time.time()
             self.models[model_name].request_count += 1
 
+    @contextmanager
+    def serving(self, model_name: str):
+        """Hold `in_flight` for the length of a generation, and re-stamp at the end.
+
+        `check_cooldowns` already respects `in_flight` — the comment above it says
+        so — but until #907 the flag was claimed on the TRANSCRIPTION path only.
+        `touch()` stamps `last_used` once, BEFORE the work, so a long generation
+        looks progressively more idle while it runs. Measured on slice 2026-10-08:
+        **18 unloads, every one 300-355s into an in-flight request**, releasing the
+        capacity lease while Ollama kept the weights because its runner was busy.
+        That is #907's phantom `foreign_mb` — the gateway disclaiming a model it
+        was still using.
+
+        WHY IT NEVER BIT BEFORE, which is `claude-wafer-services`' finding and is
+        the whole reason it arrived as a surprise:
+
+            COOLDOWN_SECONDS                  300
+            the old aiohttp ClientTimeout     300
+
+        The same number. The timeout killed every Ollama request at exactly the
+        moment the cooldown first became eligible, so no request on this path ever
+        survived long enough to be reached. **#904's fix is what exposed this**,
+        which is why the 18 instances are all dated the day it shipped and not
+        spread over weeks. The whisper comment had already named the condition —
+        *"the first backend here whose single request outlives the idle cooldown"* —
+        and #904 made this the second.
+
+        RE-STAMPING AT RELEASE is deliberate and is not the same change as moving
+        `touch()`. A 549s prefill leaves `last_used` 549s stale the instant the
+        request ends, so the model is eligible for unload on the very next tick —
+        a model that just finished serving is the least idle thing on the box.
+        This does NOT touch `request_count`: relocating `touch()` would change
+        counting semantics, and :1306 deliberately stamps a failed request too.
+
+        Nothing here needs a lock: `in_flight` is mutated only from the event
+        loop, and a load runs in a thread but never touches it.
+        """
+        mm = self.models.get(model_name)
+        if mm is None:
+            yield
+            return
+        mm.in_flight += 1
+        try:
+            yield
+        finally:
+            mm.in_flight -= 1
+            mm.last_used = time.time()
+
     def ensure_running(self, model_name: str) -> bool:
         """Check if an Ollama model is actually running. Reload if dropped."""
         if model_name not in self.models:

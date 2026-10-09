@@ -1763,6 +1763,7 @@ def test_ring_short_decline_names_the_cause_and_substitutes_nothing():
     arrive looking like the outage `pool_unavailable` describes. Alternatives
     are information: a caller falls back by its own choice, in a second request.
     """
+    import asyncio
     import time as _t
     import ollama.server as srv
     from ollama.manager import ModelManager
@@ -1788,14 +1789,15 @@ def test_ring_short_decline_names_the_cause_and_substitutes_nothing():
                            exo=_IdleExo())
     try:
         srv.mgr._pool_view = (_t.monotonic(), _view())
-        exc = srv._pool_unavailable_503(ExoUnavailable("no model resident"))
+        exc = asyncio.run(srv._pool_unavailable_503(ExoUnavailable("no model resident")))
         d = exc.detail
         # A pool that is simply unplaced keeps the old code, so the new one is
         # not just "every decline renamed".
         srv.mgr._pool_view = (_t.monotonic(), _view(
             ring_short=False, nodes_live=2, unavailable_reason="no_instance",
             ring_basis="identities"))
-        unplaced = srv._pool_unavailable_503(ExoUnavailable("nothing placed")).detail
+        unplaced = asyncio.run(
+            srv._pool_unavailable_503(ExoUnavailable("nothing placed"))).detail
     finally:
         srv.mgr, capacity.collect = real, real_collect
         manager_mod.hf_model_installed = real_installed
@@ -1821,6 +1823,56 @@ def test_ring_short_decline_names_the_cause_and_substitutes_nothing():
     check("...and says so, naming the knob that would settle it",
           "NOT established" in unplaced["note"]
           and "EXO_RING_MIN_NODES" in unplaced["note"], True)
+
+
+def test_the_decline_does_its_capacity_read_off_the_event_loop():
+    """#917: the decline classified itself with a blocking call on the loop.
+
+    `_pool_unavailable_503` reads `mgr.offering()` to build `alternatives`, and
+    `offering()` goes through `offer_reading()` -> `_collect_stats()` -- three
+    subprocesses, ~15ms measured on wafer -- whenever the last sample is older
+    than `OFFER_MIN_SAMPLE_INTERVAL_S`. The file's three other call sites wrap it
+    in `asyncio.to_thread`; this one did not, and its callers are all `async`.
+
+    Small, and on the error path that is hot exactly when the pool is dark, which
+    is the state this ticket exists for -- and `pool_ring_short` invites retries.
+
+    The reading is NOT dropped: `loadable` is defined by it, so a cheaper
+    `alternatives` would have to name models that cannot load, which is an
+    over-promise inside a decline. This asserts WHERE the work runs, not what is
+    said -- the body is asserted by the case above, which now has to `await`.
+    """
+    import inspect
+    import ollama.server as srv
+    src = inspect.getsource(srv)
+
+    check("the helper is a coroutine function",
+          inspect.iscoroutinefunction(srv._pool_unavailable_503), True)
+
+    # Every `mgr.offering()` in the module goes to a thread. Asserted over the
+    # SOURCE rather than at the one site, so a fourth unwrapped call cannot
+    # appear quietly -- the same shape as test_num_ctx asserting each path
+    # routes through `_with_num_ctx`.
+    bare = [ln.strip() for ln in src.splitlines()
+            if "mgr.offering(" in ln and "asyncio.to_thread" not in ln]
+    check("no mgr.offering() call is left on the event loop", bare, [])
+
+    # And nobody calls the helper without awaiting it. Un-awaited it returns a
+    # coroutine, so `raise` would fail with "exceptions must derive from
+    # BaseException" -- a hard error, but only on the path that is already an
+    # error, which is the worst place to discover it.
+    unawaited = [ln.strip() for ln in src.splitlines()
+                 if "_pool_unavailable_503(" in ln
+                 and "await " not in ln
+                 and not ln.strip().startswith(("async def", "def", "#"))]
+    check("every call site awaits it", unawaited, [])
+    # Count the CALL sites, which means excluding the `async def` that defines it
+    # -- the bare substring is 4 and three of those are raises. Assert a count so
+    # a fourth site cannot be added without this case noticing.
+    calls = [ln for ln in src.splitlines()
+             if "_pool_unavailable_503(" in ln and "def _pool_unavailable_503(" not in ln]
+    check("...and there are exactly three call sites", len(calls), 3)
+    check("...all of them raises", sum(1 for ln in calls if "raise " in ln), 3)
 
 
 if __name__ == "__main__":

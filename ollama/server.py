@@ -914,7 +914,7 @@ def _exo_completion_budget(model_id: str, requested: Optional[int]) -> int:
     return min(requested, cap) if requested else cap
 
 
-def _pool_unavailable_503(e: Exception) -> HTTPException:
+async def _pool_unavailable_503(e: Exception) -> HTTPException:
     """The pool is not there — distinct from it being busy.
 
     Deliberately not a 404: the tier is configured and real, so "no such model"
@@ -948,7 +948,20 @@ def _pool_unavailable_503(e: Exception) -> HTTPException:
             if pool and pool.get("reason"):
                 reason = pool["reason"]
                 note = pool.get("detail")
-            offer = mgr.offering()
+            # OFF THE EVENT LOOP (#917). `pool_offer()` above is a dict read off
+            # `_pool_view` and costs nothing, but `offering()` goes through
+            # `offer_reading()`, which calls `_collect_stats()` -- three
+            # subprocesses, ~15ms measured on wafer -- whenever the last sample
+            # is older than `OFFER_MIN_SAMPLE_INTERVAL_S`. The file's three other
+            # call sites wrap it (:353, :612, :736) and this one did not.
+            #
+            # The reading STAYS rather than being dropped from `alternatives`:
+            # `loadable` is defined by it (`capacity.fits(need, avail)`), so
+            # without a sample there is no fit boundary and the only cheaper
+            # answer is to name models that cannot load -- an over-promise inside
+            # a decline, which is #861's lesson in the one message a refused
+            # caller reads. This fixes where the work runs, not what is said.
+            offer = await asyncio.to_thread(mgr.offering)
             alternatives = [
                 m["name"] for m in offer["resident"] + offer["loadable"]
                 if m.get("backend") != Backend.EXO.value
@@ -1040,7 +1053,7 @@ async def load_model(req: LoadRequest):
     except capacity.PoolBusy as e:
         raise _busy_503(e)
     except ExoUnavailable as e:
-        raise _pool_unavailable_503(e)
+        raise await _pool_unavailable_503(e)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
@@ -1209,7 +1222,7 @@ async def _resolve_model(model_name: str):
                 mgr.resolve_exo_tier, model_name.strip().lower()
             )
         except ExoUnavailable as e:
-            raise _pool_unavailable_503(e)
+            raise await _pool_unavailable_503(e)
 
     # Check already-loaded models (exact then partial match)
     matched_name = None
@@ -1243,7 +1256,7 @@ async def _resolve_model(model_name: str):
             # attempting anyway. For the pool there is nothing to reload: False
             # means it is unreachable or mid-swap, and proxying into that
             # produces a 500 several minutes later instead of an answer now.
-            raise _pool_unavailable_503(
+            raise await _pool_unavailable_503(
                 ExoUnavailable(
                     f"the pool is not ready to serve tier '{matched_name}'"
                 )

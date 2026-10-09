@@ -216,6 +216,19 @@ def main():
         cc = load(**kw)
         check(f"non-empty with {label}", bool(cc.SC_REQUIRED_SCOPE),
               repr(cc.SC_REQUIRED_SCOPE))
+    # THE #914/#916 INTERACTION, pinned here because this PR introduces the
+    # strip that could break it. `_env_id` strips and THEN coalesces, so a
+    # whitespace-only scope falls back to the default. The unsafe shape --
+    # `(v if v is not None else default).strip()` -- would yield '' and reach
+    # the middleware's fail-open, turning a diagnosability fix into an auth
+    # widening (samclaude-services, #914). Driven through the real `_env_id`,
+    # not a constructed middleware, because the env path is the claim.
+    for raw in ("", " ", "\t\n  ", "   "):
+        for dev in ("testbox", None):
+            cc = load(SC_DEVICE=dev, SC_REQUIRED_SCOPE=raw)
+            check(f"scope non-empty for {raw!r} with device={dev!r}",
+                  bool(cc.SC_REQUIRED_SCOPE), repr(cc.SC_REQUIRED_SCOPE))
+
     c = load(SC_DEVICE=None)
     check("unset device demands a scope naming no real device",
           c.SC_REQUIRED_SCOPE == "device:SC_DEVICE-is-unset", c.SC_REQUIRED_SCOPE)
@@ -250,15 +263,51 @@ def main():
     # Count, not presence: a second _env default reintroducing the peer would
     # hide behind a presence check that the first one satisfied.
     peer_defaults = re.findall(
-        r'_env\(\s*"[A-Z0-9_]+"\s*,\s*[^)]*' + re.escape(OLD_DEFAULT), src)
+        r'_env(?:_id)?\(\s*"[A-Z0-9_]+"\s*,\s*[^)]*' + re.escape(OLD_DEFAULT), src)
     check(f"zero _env defaults mention {OLD_DEFAULT}",
           len(peer_defaults) == 0, str(peer_defaults))
     sc_device_lines = re.findall(r'^SC_DEVICE = .*$', src, re.M)
     check("exactly one SC_DEVICE assignment", len(sc_device_lines) == 1,
           str(sc_device_lines))
     check("and it defaults to empty",
-          sc_device_lines and sc_device_lines[0] == 'SC_DEVICE = _env("SC_DEVICE", "")',
+          sc_device_lines and sc_device_lines[0] == 'SC_DEVICE = _env_id("SC_DEVICE", "")',
           str(sc_device_lines))
+
+    print("  [8] a padded identity is stripped, so the source cannot lie")
+    # `_env` does not strip and " " is TRUTHY, so without _env_id a whitespace
+    # device passes the unset guard and SC_DEVICE_SOURCE reports `environment`
+    # -- the field added to separate configured from inherited would assert a
+    # human chose it (samclaude-services, reviewing #865).
+    c = load(SC_DEVICE="wafer-services ")
+    check("a trailing space is stripped off the device",
+          c.SC_DEVICE == "wafer-services", repr(c.SC_DEVICE))
+    check("so the derivations do not carry it",
+          c.SC_SERVICE_ID == "wafer-services/model-service", repr(c.SC_SERVICE_ID))
+    check("nor does the scope",
+          c.SC_REQUIRED_SCOPE == "device:wafer-services", repr(c.SC_REQUIRED_SCOPE))
+
+    c = load(SC_DEVICE="  \t\n  ")
+    check("a WHITESPACE-ONLY device is unset, not configured",
+          c.SC_DEVICE == "", repr(c.SC_DEVICE))
+    check("and the source says NOT SET rather than environment",
+          attr(c, "SC_DEVICE_SOURCE") == "NOT SET", attr(c, "SC_DEVICE_SOURCE"))
+    check("so the derivations refuse to compose",
+          (c.SC_SERVICE_ID, c.SC_RESOURCE_ID, c.EXO_RESOURCE_ID) == ("", "", ""),
+          f"{c.SC_SERVICE_ID!r} {c.SC_RESOURCE_ID!r} {c.EXO_RESOURCE_ID!r}")
+    check("and the scope still fails closed",
+          c.SC_REQUIRED_SCOPE == "device:SC_DEVICE-is-unset", c.SC_REQUIRED_SCOPE)
+
+    c = load(SC_DEVICE=None, SC_RESOURCE_ID=" wafer-services/gpu-metal\n")
+    check("an independently set resource is stripped too",
+          c.SC_RESOURCE_ID == "wafer-services/gpu-metal", repr(c.SC_RESOURCE_ID))
+
+    # Control: stripping must not touch a value that was already clean, or the
+    # checks above would pass on a helper that mangles every id.
+    c = load(SC_DEVICE="wafer-services", SC_SERVICE_NAME="model-service")
+    check("control: a clean identity is returned unchanged",
+          (c.SC_DEVICE, c.SC_SERVICE_ID) == ("wafer-services",
+                                             "wafer-services/model-service"),
+          f"{c.SC_DEVICE!r} {c.SC_SERVICE_ID!r}")
 
     print()
     if failed:

@@ -19,6 +19,36 @@ def _env(name: str, default: str) -> str:
     return v if v else default
 
 
+def _env_id(name: str, default: str) -> str:
+    """An IDENTITY from the environment, stripped.
+
+    Whitespace is never part of a device, service, resource or scope id, and
+    `_env` does not strip, so `SC_DEVICE=" "` is TRUTHY: it passes the unset
+    guard below, and `SC_DEVICE_SOURCE` then reports `environment` — the one
+    field added to separate a configured identity from an inherited one would
+    be asserting a human chose this. `SC_DEVICE="wafer-services "` composes
+    `wafer-services /model-service`, which is the shape this module refuses to
+    compose from an empty device, arriving by another route
+    (samclaude-services, reviewing #865).
+
+    It is diagnosability rather than exposure: a padded id fails closed on the
+    plane rather than colliding with the peer — `/resources/wafer-services%20/
+    gpu-metal` 404s against a 200 control on the real id — so no row naming
+    another machine is written either way. What it costs is the operator
+    getting a 404 on an odd id instead of the startup error naming SC_DEVICE.
+
+    Only the identities are stripped here, not `_env` itself. None of this
+    module's 21 string keys could legitimately want surrounding whitespace, so
+    stripping in `_env` is the fuller fix, but it reaches keys this ticket is
+    not about -- #916.
+    Asserted by test_device_identity [8].
+    """
+    v = os.environ.get(name)
+    if v is not None:
+        v = v.strip()
+    return v if v else default
+
+
 def _env_int(name: str, default: int) -> int:
     v = os.environ.get(name)
     try:
@@ -142,7 +172,7 @@ if SC_TOKEN_SOURCE == "NOT FOUND":
 #
 # A mislabelled row from a script is also harder to trace than one from a
 # service, because there is no process left to inspect (samclaude-services).
-SC_DEVICE = _env("SC_DEVICE", "")
+SC_DEVICE = _env_id("SC_DEVICE", "")
 # Which source won, for the reason SC_TOKEN_SOURCE exists: "the identity is
 # configured" and "the identity was inherited from a default" were
 # indistinguishable before, and on slice they still resolve to the same string.
@@ -158,7 +188,7 @@ if not SC_DEVICE:
         "claude-services-slice instead of saying so (#865)."
     )
 
-SC_SERVICE_NAME = _env("SC_SERVICE_NAME", "model-service")
+SC_SERVICE_NAME = _env_id("SC_SERVICE_NAME", "model-service")
 # The derivations REFUSE to compose from an unknown device rather than
 # composing a half-formed one. `/model-service` and `<device>/gpu-0` with an
 # empty device are worse than empty: they are wrong in a shape that still looks
@@ -167,7 +197,7 @@ SC_SERVICE_NAME = _env("SC_SERVICE_NAME", "model-service")
 # but neither falls back to a composed one when the device is unknown.
 # Asserted by test_device_identity [3] and [4].
 SC_SERVICE_ID = f"{SC_DEVICE}/{SC_SERVICE_NAME}" if SC_DEVICE else ""
-SC_RESOURCE_ID = _env("SC_RESOURCE_ID", f"{SC_DEVICE}/gpu-0" if SC_DEVICE else "")
+SC_RESOURCE_ID = _env_id("SC_RESOURCE_ID", f"{SC_DEVICE}/gpu-0" if SC_DEVICE else "")
 
 # --- auth middleware ---
 SC_VERIFY_URL = _env("SC_VERIFY_URL", f"{SC_BASE}/auth/verify")
@@ -178,14 +208,45 @@ SC_VERIFY_URL = _env("SC_VERIFY_URL", f"{SC_BASE}/auth/verify")
 # is admitted. An unconfigured device must refuse callers, not admit all of
 # them, so this derivation keeps a value when the others go empty.
 #
-# The value is a scope no caller can hold: the plane matches scopes by exact
-# string (`AuthContext.has_scope`, registry/main.py), and resolves a
-# `device:<id>` scope through group membership on a device that must exist, so
-# a scope naming no device is granted to nobody and verify returns 403. It is
+# WHY THIS IS REFUSED, which is not the reason an earlier version of this
+# comment gave. It said "a scope no caller can hold", argued from
+# `AuthContext.has_scope` being an exact match. The refusal is real; that
+# ground was wider than its evidence and also the weaker of the two available
+# (samclaude-services and claude-wafer-services, reviewing #865).
+#
+# `verify_token_endpoint` tries three things in order, and the sentinel is a
+# `device:` scope, so it reaches the second:
+#
+#   1. exact match / `*`                     -- nobody holds this string
+#   2. `can_manage_device("SC_DEVICE-is-unset")` -- THE GROUND TO CITE. It
+#      resolves a `device:` scope through `group_devices` rows, and no row can
+#      reference a device that does not exist, so this refuses STRUCTURALLY:
+#      a property of the schema, true for every token and every fleet, and
+#      true whether or not #915 is ever fixed.
+#   3. the prefix loop, `requested.startswith(held)` with no delimiter
+#      boundary -- a held SHORT scope grants every longer one extending it
+#      (#915). Direction pinned from both sides live: a token holding
+#      `group:services` is admitted to `group:servicesXXXXX`, while a token
+#      holding `device:wafer-services` is refused `device:w`.
+#
+# Two exceptions, named because "nobody" is where the next reader will stop:
+# an ADMIN token skips the check entirely (`if scope and not
+# auth.is_admin()`), and a token holding a prefix of this string -- `device:`,
+# `device:SC` -- would be admitted by (3). No path for a non-admin to obtain
+# such a scope was established; the shape is flagged, not a claim.
+#
+# Measured, each with a control so that 403-on-everything is ruled out:
+#
+#     device:SC_DEVICE-is-unset  -> 403      <- the sentinel
+#     device:wafer-services      -> 200      <- control, a held device scope
+#     group:services             -> 200      <- control, a held group scope
+#     device:  /  device:SC      -> 403
+#
+# The sentinel is
 # worded as a sentence because it is what a reader sees in the 403 and in the
 # verify URL in a log, where it has to explain itself.
 # Asserted by test_device_identity [5] and [6].
-SC_REQUIRED_SCOPE = _env(
+SC_REQUIRED_SCOPE = _env_id(
     "SC_REQUIRED_SCOPE",
     f"device:{SC_DEVICE}" if SC_DEVICE else "device:SC_DEVICE-is-unset",
 )
@@ -975,7 +1036,7 @@ EXO_ENABLED = _env_bool("EXO_ENABLED", True)
 # Composed from SC_DEVICE, so it refuses to compose when the device is unknown
 # for the same reason SC_RESOURCE_ID does (#865). An unset device here used to
 # make every box's pool resolve to slice's.
-EXO_RESOURCE_ID = _env(
+EXO_RESOURCE_ID = _env_id(
     "EXO_RESOURCE_ID", f"{SC_DEVICE}/exo-pool" if SC_DEVICE else ""
 )
 

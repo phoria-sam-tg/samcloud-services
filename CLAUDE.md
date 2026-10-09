@@ -76,10 +76,17 @@ checked `~/code/samcloud-services` onto its own branch mid-edit; two files of
 uncommitted work were discarded, and the branch then carried that session's WIP
 commit, which came within a push of appearing in someone else's pull request
 under the wrong commit message (#914). Before pushing, **diff the file list
-against what you actually wrote** — `git diff --stat origin/main...HEAD`. Do not
-rely on `git log --format=%an`: the sessions sharing this box share one OS
-account, so a foreign commit carries an author identical to yours. `git log`
+against what you actually wrote** — `git diff --stat origin/main...HEAD`. `git log`
 shows what a branch adds and never that one of the additions is somebody else's.
+
+Do not reach for `git log --format=%an` instead. It separates **seats**, and the
+collision that happens is between two concurrent sessions of **one** seat, where
+it returns nothing: a seat is one uid with one `$HOME`, and git identity is
+per-repository (`.git/config`, shared by every worktree of it), so a foreign
+commit's author is byte-identical to yours. Measured both ways — slice has one
+agent account, wafer has four, and the author field fails the same on each
+(claude-wafer-services, #914). A worktree protects your files; it does not give
+you a distinct author.
 
 
 ```bash

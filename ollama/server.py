@@ -47,6 +47,7 @@ from typing import Optional
 
 from . import capacity
 from . import config
+from . import deadline_points
 from . import prompt_size
 from .manager import (
     ModelManager, Backend, VLM_PORT, VLM_MODELS, hf_model_installed,
@@ -607,6 +608,18 @@ async def list_models_openai():
                 entry["memory_mb"] = memory_mb
             if context_length is not None:
                 entry["context_length"] = context_length
+            # #908. On EVERY entry, including unmeasured ones, where the point
+            # sets come back empty. `/v1/models/{id}` promises "the same entry
+            # shape" and reuses this builder, so publishing on one and not the
+            # other would make the two disagree about what a model is.
+            #
+            # `context_length` above and this block answer DIFFERENT questions
+            # and a consumer that conflates them builds an unserveable prompt:
+            # the window is what the weights allow (262,144 here), the points
+            # are what has been measured to prefill inside the deadline. The
+            # ratio on slice is about 3x.
+            entry["deadlines"] = deadline_points.for_model(
+                model_id, config.OLLAMA_GENERATE_TIMEOUT)
             data.append(entry)
 
     offering = (await asyncio.to_thread(mgr.offering) if mgr

@@ -1027,10 +1027,25 @@ class ModelManager:
                                "but exo can place it; a request for this tier has "
                                "to wait for that placement")}
         if placeable is False:
+            # Name the tenant, not the planner's phrasing. "No cycles found with
+            # sufficient memory" is true and tells a caller nothing it can act
+            # on; "the 27b is resident" tells it what has to clear and that the
+            # clearance is coming (#801 criterion 3, Sam 2026-10-09: unavailable
+            # "with the reason (27b resident)").
+            phrase = self._blockers_phrase()
+            if phrase:
+                why = (f"{phrase}, and exo finds no ring cycle with room for "
+                       f"{status.get('desired_model')} beside it. This tier "
+                       f"becomes available when that clears — it is the box's "
+                       f"capacity being taken, not a fault, and nothing to report.")
+            else:
+                why = (f"nothing of ours is resident and exo still finds no ring "
+                       f"cycle with room for {status.get('desired_model')}, so the "
+                       f"shortfall is the ring's own memory rather than a tenant "
+                       f"to wait for: "
+                       + self._pool_block_detail(reason, status))
             return {**blocked, "reason": "pool_unplaceable",
-                    "detail": (f"the pool is not holding {status.get('desired_model')} "
-                               "and exo finds no ring cycle with room for it: "
-                               + self._pool_block_detail(reason, status))}
+                    "blockers": self._pool_blockers(), "detail": why}
         # None -- we asked and could not tell, or had nothing to ask about. The
         # tier is still a configured route, so this says so rather than claiming
         # a verdict we do not have.
@@ -1039,6 +1054,48 @@ class ModelManager:
                            "it could be placed was not established "
                            f"({status.get('placeable_reason') or 'probe failed'}); "
                            + self._pool_block_detail(reason, status))}
+
+    def _pool_blockers(self) -> list:
+        """The models THIS box is holding that a pool placement has to wait for.
+
+        `#801` criterion 3: the listing should say `think` is unavailable with a
+        reason, and "no cycles found with sufficient memory" is the planner's
+        answer rather than the operator's. The gateway knows the actual answer,
+        because on slice it is the only thing that loads a model (verified
+        2026-10-09: every `qwen3.8:27b-mlx` load arrives as an authenticated
+        request through this process, and nothing else holds a connection to
+        ollama's port). So the reason can name the tenant.
+
+        EXO IS EXCLUDED, for the same reason `offering()` excludes it: the tier
+        is registered on first use and never removed, so it would list itself as
+        the thing blocking itself. Sorted largest first — the caller's question
+        is what has to clear, and the biggest tenant is the answer to it.
+        """
+        out = [
+            {"name": name, "memory_mb": mm.memory_mb,
+             "idle_seconds": int(time.time() - mm.last_used)}
+            for name, mm in self.models.items()
+            if mm.backend != Backend.EXO
+        ]
+        return sorted(out, key=lambda m: -(m["memory_mb"] or 0))
+
+    def _blockers_phrase(self) -> Optional[str]:
+        """`"qwen3.8:27b-mlx is resident (17,530 MB, idle 42s)"`, or None.
+
+        None when this box holds nothing — which is a real answer and a
+        different one from "something is resident": if nothing of ours is in the
+        way and the planner still refuses, the shortfall is the ring's own
+        memory and not a tenant to wait for. Saying "nothing of ours" there is
+        what stops a caller waiting for a clearance that will never come.
+        """
+        blockers = self._pool_blockers()
+        if not blockers:
+            return None
+        parts = [f"{b['name']} ({b['memory_mb']:,} MB, idle {b['idle_seconds']}s)"
+                 for b in blockers]
+        if len(parts) == 1:
+            return f"{parts[0]} is resident"
+        return ", ".join(parts[:-1]) + f" and {parts[-1]} are resident"
 
     def _pool_block_detail(self, reason: str, status: dict) -> str:
         """Why the tier cannot serve, in a sentence a caller can act on.

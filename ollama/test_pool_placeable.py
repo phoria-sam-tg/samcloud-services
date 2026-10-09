@@ -226,6 +226,74 @@ def main():
     check("placement_available: a transport failure -> None, never False",
           c.placement_available(WANT) is None)
 
+    # --- criterion 3: the reason names the tenant, not the planner -------
+    # "No cycles found with sufficient memory" is the planner's answer and a
+    # caller can do nothing with it. On slice the gateway is the only thing that
+    # loads a model, so it knows what has to clear and can say so.
+    from ollama.manager import ManagedModel, Backend
+    import time as _time
+
+    def with_resident(*specs):
+        m = mgr(record={"model": WANT}, placeable=False)
+        for name, mb, idle in specs:
+            m.models[name] = ManagedModel(
+                name=name, backend=Backend.OLLAMA, memory_mb=mb, lease_id="l",
+                port=11434, loaded_at=_time.time() - 600,
+                last_used=_time.time() - idle, request_count=3)
+        view(m, {**NOT_READY, "placeable": False, "desired_model": WANT,
+                 "placeable_reason": None})
+        return m, m.pool_offer()
+
+    m, o = with_resident(("qwen3.8:27b-mlx", 17530, 42))
+    check("64. the reason NAMES the resident model, not just 'no room'",
+          "qwen3.8:27b-mlx" in o["detail"], o["detail"][:160])
+    check("64. ...with its size, so a caller can see what has to clear",
+          "17,530 MB" in o["detail"], o["detail"][:160])
+    check("64. ...and says the tier returns when it clears, not that it is a fault",
+          "becomes available when that clears" in o["detail"]
+          and "nothing to report" in o["detail"], o["detail"][:200])
+    check("64. ...and the blockers are machine-readable too",
+          [b["name"] for b in o.get("blockers") or []] == ["qwen3.8:27b-mlx"],
+          str(o.get("blockers")))
+    check("64. ...while the reason code stays pool_unplaceable",
+          o["reason"] == "pool_unplaceable" and o["state"] == "blocked", str(o))
+
+    m, o = with_resident(("small", 1200, 5), ("qwen3.8:27b-mlx", 17530, 42))
+    check("65. several residents -> largest first, which is what has to clear",
+          [b["name"] for b in o["blockers"]] == ["qwen3.8:27b-mlx", "small"],
+          str(o["blockers"]))
+    check("65. ...and both are named in the sentence",
+          "qwen3.8:27b-mlx" in o["detail"] and "small" in o["detail"]
+          and "are resident" in o["detail"], o["detail"][:200])
+
+    # NOTHING of ours resident, and the planner still refuses. A different fact:
+    # there is no clearance coming, so a caller must not wait for one. This is
+    # the case measured on slice 2026-10-09T22:17Z — pool cleared by hand, 0
+    # instances, and the 120b still unplaceable because the ring was 14 GiB short.
+    m = mgr(record={"model": WANT}, placeable=False)
+    view(m, {**NOT_READY, "placeable": False, "desired_model": WANT,
+             "placeable_reason": None})
+    o = m.pool_offer()
+    check("66. nothing of ours resident -> says the shortfall is the RING's",
+          "nothing of ours is resident" in o["detail"]
+          and "rather than a tenant to wait for" in o["detail"], o["detail"][:200])
+    check("66. ...and does not invent a blocker",
+          o.get("blockers") == [], str(o.get("blockers")))
+
+    # The tier must never list itself as its own blocker — `resolve_exo_tier`
+    # registers it on first use and nothing removes it.
+    m = mgr(record={"model": WANT}, placeable=False)
+    m.models[TIER] = ManagedModel(name=TIER, backend=Backend.EXO, memory_mb=0,
+                                  lease_id=None, port=52415,
+                                  loaded_at=_time.time(), last_used=_time.time(),
+                                  request_count=1, managed=False)
+    view(m, {**NOT_READY, "placeable": False, "desired_model": WANT,
+             "placeable_reason": None})
+    o = m.pool_offer()
+    check("67. the exo tier is never its own blocker",
+          o.get("blockers") == [] and "nothing of ours is resident" in o["detail"],
+          str(o.get("blockers")) + " / " + o["detail"][:120])
+
     print(f"\n  {'all checks passed' if not FAIL else 'FAILED'}: "
           f"{PASS} passed, {FAIL} failed\n")
     return 1 if FAIL else 0

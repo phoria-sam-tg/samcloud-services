@@ -70,6 +70,24 @@ The gateway runs from `~/var/samcloud-services-deploy`, a deploy clone held on a
 detached HEAD at a named commit — not from your checkout. `deploy/README.md` has
 the why, `deploy/rollout.sh` fills it, and nothing restarts on a merge.
 
+**More than one agent works on this box, so work in a `git worktree`, not in the
+shared checkout: it can change branch under you.** On 2026-10-09 another session
+checked `~/code/samcloud-services` onto its own branch mid-edit; two files of
+uncommitted work were discarded, and the branch then carried that session's WIP
+commit, which came within a push of appearing in someone else's pull request
+under the wrong commit message (#914). Before pushing, **diff the file list
+against what you actually wrote** — `git diff --stat origin/main...HEAD`. `git log`
+shows what a branch adds and never that one of the additions is somebody else's.
+
+Do not reach for `git log --format=%an` instead. It separates **seats**, and the
+collision that happens is between two concurrent sessions of **one** seat, where
+it returns nothing: a seat is one uid with one `$HOME`, and git identity is
+per-repository (`.git/config`, shared by every worktree of it), so a foreign
+commit's author is byte-identical to yours. Measured both ways — slice has one
+agent account, wafer has four, and the author field fails the same on each
+(claude-wafer-services, #914). A worktree protects your files; it does not give
+you a distinct author.
+
 
 ```bash
 SC_TOKEN=<token> python -m uvicorn ollama.server:app --host 0.0.0.0 --port 8800

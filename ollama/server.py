@@ -231,6 +231,19 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             identity = f"unverified ({type(e).__name__})"
     log.info(f"SC_TOKEN source: {config.SC_TOKEN_SOURCE}, identity {identity}")
+    # WHICH BOX THIS PROCESS THINKS IT IS, and whether anyone told it (#865).
+    # The device is printed with its source for the same reason the token is:
+    # on slice the configured value and the old default were the same string,
+    # so the resolved value alone cannot show that an identity was actually
+    # configured. `NOT SET` here is the whole failure, visible in one line, in
+    # place of a process quietly leasing and registering as another machine.
+    log.info(
+        f"SC_DEVICE: {config.SC_DEVICE or '(none)'} "
+        f"(source: {config.SC_DEVICE_SOURCE}), "
+        f"service_id {config.SC_SERVICE_ID or '(none)'}, "
+        f"resource {config.SC_RESOURCE_ID or '(none)'}, "
+        f"callers must hold {config.SC_REQUIRED_SCOPE}"
+    )
     log.info(f"Model Service ready - managing {len(mgr.models)} models")
 
     yield

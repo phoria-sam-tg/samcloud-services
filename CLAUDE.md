@@ -22,16 +22,21 @@ headless under their box's services account (`claude-services` on slice,
 
 Every identity is env-driven via `ollama/config.py`. **This runs on more than one
 box — the values below are the code's fallbacks, not a description of production.**
-They happen to spell out `claude-services-slice`, so an agent reading them on any
-other box is reading the wrong box's identity. Read the box's own env file
-(`~/.config/samcloud-services/env`, 600, sourced by the start script) before
-assuming any of them.
+Read the box's own env file (`~/.config/samcloud-services/env`, 600, sourced by
+the start script) before assuming any of them.
+
+**`SC_DEVICE` HAS NO FALLBACK, and that is deliberate (#865).** It used to spell
+out `claude-services-slice` — a real peer — so on every box but one it resolved
+to somebody else's identity, and the three ids derived from it followed. A
+default may name yourself or the plane; it may never name a peer. Unset now
+means unset: the derivations go empty, startup says `SC_DEVICE: (none) (source:
+NOT SET)`, and callers are refused rather than served under a peer's name.
 
 | | `config.py` fallback | wafer-services runs | claude-services-slice runs |
 |---|---|---|---|
-| `SC_DEVICE` | `claude-services-slice` | `wafer-services` | `claude-services-slice` |
-| `SC_RESOURCE_ID` | `<device>/gpu-0` | `wafer-services/gpu-metal` | `claude-services-slice/gpu-0` |
-| `SC_REQUIRED_SCOPE` | `device:<device>` | `group:services` | `group:services` |
+| `SC_DEVICE` | **none — must be set** | `wafer-services` | `claude-services-slice` |
+| `SC_RESOURCE_ID` | `<device>/gpu-0`, or empty with no device | `wafer-services/gpu-metal` | `claude-services-slice/gpu-0` |
+| `SC_REQUIRED_SCOPE` | `device:<device>`, or `device:SC_DEVICE-is-unset` | `group:services` | `group:services` |
 | `SC_BASE` | `https://cloud.samtg.xyz/api/v1` | same | same |
 | `SC_SERVICE_NAME` | `model-service` | same | same |
 
@@ -39,6 +44,13 @@ assuming any of them.
 middleware checks every caller's token against, so the fallback describes a
 narrower access policy than either gateway actually enforces — read it as a safe
 default for a new box, not as a description of this one.
+
+It is also the one derivation that must never be EMPTY, rather than merely
+correct. The middleware appends `?scope=` to the verify URL only `if
+self.required_scope`, so an empty value asks `/auth/verify` no scope question
+and admits every valid token on the plane. That is why an unset `SC_DEVICE`
+yields `device:SC_DEVICE-is-unset` — a scope nobody can hold — where the other
+derivations are allowed to go empty (`test_device_identity` [5], [6]).
 
 **Token**: always via `SC_TOKEN` env — never hardcode; a hardcoded copy is what
 silently 401'd a box for fourteen days after a rotation (#760). It need not be a
@@ -85,6 +97,7 @@ python -m ollama.test_lease_reconcile    # The lease says what the model actuall
 python -m ollama.test_num_ctx            # The served window: pinned, clamped, published (no network)
 python -m ollama.test_stream_deadlines   # Silence is bounded, elapsed time is not (no network)
 python -m ollama.test_route_bindings     # Every path resolves to its own handler (no network)
+python -m ollama.test_device_identity    # Identity comes from env or nowhere, never a peer (no network)
 
 # Older tests, from inside ollama/ — these lease and load for real.
 cd ollama && python test_lifecycle.py   # Full lease cycle

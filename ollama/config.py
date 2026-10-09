@@ -1,8 +1,9 @@
 """Environment-driven configuration.
 
 All values that used to be hardcoded to slice-test/stg live here now.
-Defaults target the production samcloud registry and the
-claude-services-slice device.
+Defaults target the production samcloud registry. They do NOT name a device:
+`SC_DEVICE` has no default on purpose, because a default here named a real
+peer and every box but one inherited the wrong identity in silence (#865).
 """
 
 import logging
@@ -119,14 +120,75 @@ if SC_TOKEN_SOURCE == "NOT FOUND":
            "~/.samcloud/token is not a fallback for a service identity (#845)")
         + ". Every registry call will fail 401."
     )
-SC_DEVICE = _env("SC_DEVICE", "claude-services-slice")
+# THERE IS DELIBERATELY NO DEFAULT, for the reason SC_TOKEN_FILE has none.
+#
+# This was `claude-services-slice`, which is a REAL PEER. A default that names
+# a peer resolves, on every box but one, to a plausible identity belonging to
+# somebody else — and it never showed a symptom precisely because the one box
+# it is correct on is the box it was written on (#865).
+#
+# The rule that falls out of the audit, and the one to apply to any new default
+# here: A DEFAULT MAY NAME YOURSELF OR THE PLANE; IT MAY NEVER NAME A PEER.
+# `OLLAMA_BASE`, `VLM_HOST` and `WHISPER_HOST` (localhost) are selves and
+# `SC_BASE` is the plane, so those are safe by construction. This one was
+# neither, and it was the root: three more identities derive from it below.
+#
+# The population that actually hits this is not gateways. A gateway has an env
+# file; a one-off probe, a diagnostic, or a test harness run outside one does
+# not, and those import this module, compose a peer's `service_id` and write
+# registry rows naming a machine that had nothing to do with them. That is not
+# hypothetical: it happened on wafer on 2026-09-29, in a probe written by the
+# agent who had just finished enumerating this defect (claude-wafer-services).
+#
+# A mislabelled row from a script is also harder to trace than one from a
+# service, because there is no process left to inspect (samclaude-services).
+SC_DEVICE = _env("SC_DEVICE", "")
+# Which source won, for the reason SC_TOKEN_SOURCE exists: "the identity is
+# configured" and "the identity was inherited from a default" were
+# indistinguishable before, and on slice they still resolve to the same string.
+# The source is the only field that separates them, so startup can say which.
+SC_DEVICE_SOURCE = "environment" if SC_DEVICE else "NOT SET"
+if not SC_DEVICE:
+    log.error(
+        "SC_DEVICE is not set and there is no default: this process has no "
+        "device identity. Set it in THIS box's own env file "
+        "(~/.config/samcloud-services/env) — never to another box's name. "
+        "Until then every registry call fails and every caller is refused, "
+        "which is the point: the previous default made this process act as "
+        "claude-services-slice instead of saying so (#865)."
+    )
+
 SC_SERVICE_NAME = _env("SC_SERVICE_NAME", "model-service")
-SC_SERVICE_ID = f"{SC_DEVICE}/{SC_SERVICE_NAME}"
-SC_RESOURCE_ID = _env("SC_RESOURCE_ID", f"{SC_DEVICE}/gpu-0")
+# The derivations REFUSE to compose from an unknown device rather than
+# composing a half-formed one. `/model-service` and `<device>/gpu-0` with an
+# empty device are worse than empty: they are wrong in a shape that still looks
+# like a value, and the registry would accept them as names. The two that take
+# their own env var still honour it — a box may name its resource directly —
+# but neither falls back to a composed one when the device is unknown.
+# Asserted by test_device_identity [3] and [4].
+SC_SERVICE_ID = f"{SC_DEVICE}/{SC_SERVICE_NAME}" if SC_DEVICE else ""
+SC_RESOURCE_ID = _env("SC_RESOURCE_ID", f"{SC_DEVICE}/gpu-0" if SC_DEVICE else "")
 
 # --- auth middleware ---
 SC_VERIFY_URL = _env("SC_VERIFY_URL", f"{SC_BASE}/auth/verify")
-SC_REQUIRED_SCOPE = _env("SC_REQUIRED_SCOPE", f"device:{SC_DEVICE}")
+# SC_REQUIRED_SCOPE IS THE ONE DERIVATION THAT MUST NOT GO EMPTY, and the
+# reason is a fail-open in the middleware that reads it. `server.py` appends
+# `?scope=` to the verify URL only `if self.required_scope`, so an empty value
+# asks /auth/verify no scope question at all and EVERY valid token on the plane
+# is admitted. An unconfigured device must refuse callers, not admit all of
+# them, so this derivation keeps a value when the others go empty.
+#
+# The value is a scope no caller can hold: the plane matches scopes by exact
+# string (`AuthContext.has_scope`, registry/main.py), and resolves a
+# `device:<id>` scope through group membership on a device that must exist, so
+# a scope naming no device is granted to nobody and verify returns 403. It is
+# worded as a sentence because it is what a reader sees in the 403 and in the
+# verify URL in a log, where it has to explain itself.
+# Asserted by test_device_identity [5] and [6].
+SC_REQUIRED_SCOPE = _env(
+    "SC_REQUIRED_SCOPE",
+    f"device:{SC_DEVICE}" if SC_DEVICE else "device:SC_DEVICE-is-unset",
+)
 AUTH_ENABLED = _env_bool("AUTH_ENABLED", True)
 AUTH_CACHE_TTL = _env_int("AUTH_CACHE_TTL", 300)
 
@@ -910,7 +972,12 @@ AUTO_EVICT = _env_bool("AUTO_EVICT", False)
 # incomplete replica for up to a minute (#806).
 EXO_BASE = _env("EXO_BASE", "http://localhost:52415")
 EXO_ENABLED = _env_bool("EXO_ENABLED", True)
-EXO_RESOURCE_ID = _env("EXO_RESOURCE_ID", f"{SC_DEVICE}/exo-pool")
+# Composed from SC_DEVICE, so it refuses to compose when the device is unknown
+# for the same reason SC_RESOURCE_ID does (#865). An unset device here used to
+# make every box's pool resolve to slice's.
+EXO_RESOURCE_ID = _env(
+    "EXO_RESOURCE_ID", f"{SC_DEVICE}/exo-pool" if SC_DEVICE else ""
+)
 
 # Tier names that route to the pool. Callers ask for a tier, not a model:
 # swapping the resident model costs 30s-10min, so the model is a property of

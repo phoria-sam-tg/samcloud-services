@@ -367,6 +367,47 @@ class ExoClient:
         """
         return self.pool_status()["resident_model"]
 
+    def placement_available(self, model_id: str) -> Optional[bool]:
+        """Could exo place `model_id` right now? True / False / None for unknown.
+
+        READ-ONLY. A GET against exo's own placement planner (#801 step 1). This
+        asks the question a consumer actually has — *can this be served* — which
+        `resident_model()` cannot answer for a model that is not resident but
+        could be.
+
+        THREE-VALUED ON PURPOSE, and this is the whole point of the signature.
+        A probe that fails returns **None**, never False: tonight's #903 review
+        found four separate places where a missing lookup had become a value,
+        and `False` here would mean "exo says it cannot be placed" while the
+        truthful answer is "we did not find out". The caller must be able to
+        tell those apart, so `unknown` is a state and not a default.
+
+        exo answers 400 `No cycles found with sufficient memory` when no
+        placement exists — a capacity verdict rather than a transport failure,
+        so that one is a real `False`. Anything else we cannot interpret is
+        None.
+        """
+        try:
+            r = self._http.get("/instance/placement",
+                               params={"model_id": model_id},
+                               timeout=config.EXO_PLACEMENT_TIMEOUT_S)
+        except Exception:
+            return None
+        if r.status_code == 200:
+            try:
+                return bool(r.json())
+            except Exception:
+                return None
+        if r.status_code == 400:
+            try:
+                msg = (r.json().get("error") or {}).get("message") or ""
+            except Exception:
+                return None
+            # Only THIS message is a capacity answer. Another 400 is a question
+            # we asked wrong, which is not the same as "no".
+            return False if "sufficient memory" in msg.lower() else None
+        return None
+
     def list_models(self) -> list[dict]:
         """exo's model *catalogue* — everything it could run, not what is resident.
 

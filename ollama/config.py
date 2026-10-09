@@ -1188,6 +1188,20 @@ EXO_CHARS_PER_TOKEN = float(_env("EXO_CHARS_PER_TOKEN", "1.5"))
 # resident model.
 EXO_STATUS_CACHE_S = _env_int("EXO_STATUS_CACHE_S", 5)
 
+# #801 step 1. The placement probe runs in a BACKGROUND loop and never on a
+# request path, so its timeout is about not wedging that loop rather than about
+# a caller waiting. exo computes cycles to answer it; measured on slice it
+# returned in well under a second, but it is a planner and not a lookup.
+#
+# The interval is deliberately slack. This view exists so discovery can say
+# whether a tier is servable WITHOUT reading exo inline — `list_models_openai`
+# documents "No pool read at all, so a wedged pool cannot make discovery hang",
+# and a cache with a miss path would reintroduce exactly that. A background
+# value that is up to a minute stale is the right trade; a request that blocks
+# on a planner is not.
+EXO_PLACEMENT_TIMEOUT_S = _env_int("EXO_PLACEMENT_TIMEOUT_S", 20)
+EXO_POOL_STATE_INTERVAL_S = _env_int("EXO_POOL_STATE_INTERVAL_S", 60)
+
 # Gap between the two `busy` samples the wedge guard takes before it declines.
 # One sample is an observation of a moving state; two a short interval apart
 # distinguish "a generation just finished" from "the slot is occupied and is

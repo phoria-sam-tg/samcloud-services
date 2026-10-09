@@ -85,6 +85,7 @@ python -m ollama.test_lease_reconcile    # The lease says what the model actuall
 python -m ollama.test_num_ctx            # The served window: pinned, clamped, published (no network)
 python -m ollama.test_stream_deadlines   # Silence is bounded, elapsed time is not (no network)
 python -m ollama.test_route_bindings     # Every path resolves to its own handler (no network)
+python -m ollama.test_pool_state         # exo pool state: 3-valued, never guesses (no network)
 
 # Older tests, from inside ollama/ — these lease and load for real.
 cd ollama && python test_lifecycle.py   # Full lease cycle
@@ -267,6 +268,8 @@ restarting.
   real speech and the absolute rates are a floor. Re-measure on a real walkthrough
   before changing the default on the strength of these.
 - **Three pillars** — SAMcloud provides routing, resources, and auth
+- **A failed lookup must not become a verdict** (task #801 step 1, ticket #903) — `ModelManager.pool_state()` is three-valued (`resident` / `placeable` / `unplaceable` / `unknown`) and `unknown` is a **state, not a default**. A placement probe that times out, 500s, or returns an uninterpretable 400 reports `unknown`; only exo's own `400 No cycles found with sufficient memory` is a real `unplaceable`. The distinction is load-bearing because a consumer reads `unplaceable` as "the pool says no" when the truth is "we did not find out". Four instances of a missing lookup becoming a value were found in one evening on #903 — `context_length: null` on an **absent** key, `host`/`base_url` nulls read as a scope policy, five unresolved log callers printed as `None` (which reads as *unauthenticated*), and a task's `detail` read as 0 chars because the query used `description`. None was found by its author, and the last would have reported another seat as having destroyed a task. The mechanical fix, which catches all four: **`"x" in payload`, never `.get()`, when the question is whether a field exists**
+- **Publish a figure's freshness in the figure** (ticket #903) — `/status` carried `measured_over_s: 60` in the same object as `device_inuse_mb` all evening and four seats still read a windowed maximum as an instant, then built falsifiers on it that would have fired on a complete success. `offer_reading()` reports the **minimum** available and the **maximum** device-in-use over `OFFER_WINDOW_S`, so both memory figures lag in whichever direction is least convenient. `pool_state()` therefore returns `age_s` computed at read time rather than a timestamp a caller has to subtract. The only fresh indicators on this box are the process table and `vm_stat`; everything the gateway reports about memory is windowed
 
 ## Current State
 

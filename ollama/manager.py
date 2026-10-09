@@ -355,6 +355,9 @@ class ModelManager:
     # (`queued` or `conflict`), never a transport error. See
     # `config.LEASE_CONTENTION_TTL_S` for why the distinction is load-bearing.
     _lease_contended_at: Optional[float] = field(default=None, repr=False)
+    _pool_state: Optional[dict] = field(default=None, repr=False)
+    _pool_last_model: Optional[str] = field(default=None, repr=False)
+    _pool_state_task: Optional[object] = field(default=None, repr=False)
     _readings: list = field(default_factory=list, repr=False)
     _readings_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -2520,6 +2523,109 @@ class ModelManager:
         except Exception as e:
             log.warning(f"Failed to apply offering:{tier}: {e}")
 
+    def pool_state(self) -> dict:
+        """What the background loop last learned about the exo pool (#801 step 1).
+
+        NO NETWORK. This is the whole reason the view exists: discovery needs to
+        know whether a tier can be served, and `list_models_openai` promises
+        "No pool read at all, so a wedged pool cannot make discovery hang".
+        `pool_status_cached` cannot be used there — a cache MISS still fetches
+        a few hundred KB of `/state` inline — so the value is maintained out of
+        band and read from memory.
+
+        `state` is one of:
+
+            resident     the pool holds this tier's model and can serve now
+            placeable    not resident, and exo says a placement exists
+            unplaceable  not resident, and exo says no cycle has room
+            unknown      WE DID NOT FIND OUT
+
+        `unknown` is a state rather than a default, and that distinction is the
+        one this file has been bitten by: a probe that fails must not resolve to
+        `unplaceable`, because a consumer would read "cannot be served" where
+        the truth is "not measured". Four instances of a missing lookup becoming
+        a value were found on #903 in one evening.
+
+        Carries `checked_at` and `age_s` for the same reason `/status` carries
+        `measured_over_s`: a figure whose freshness is not published gets read as
+        an instant. Nobody on that ticket read the field that said otherwise, so
+        this one says it in the name.
+        """
+        if self._pool_state is None:
+            return {"state": "unknown", "reason": "not yet probed",
+                    "checked_at": None, "age_s": None}
+        out = dict(self._pool_state)
+        out["age_s"] = round(time.time() - out["checked_at"], 1)
+        return out
+
+    def refresh_pool_state(self) -> dict:
+        """One probe. READ-ONLY — a GET at exo, and nothing else.
+
+        Deliberately cannot place or release anything. #801's criterion 2 (free
+        the memory after X idle) is gated on criterion 1 (a request places it),
+        and nobody owns the create path yet, so a view that could act would be
+        the ratchet `claude-containers` and `claude-wafer-services` both argued
+        against: release without rebuild.
+        """
+        now = time.time()
+        if not config.EXO_ENABLED or not self.exo:
+            self._pool_state = {"state": "unknown", "reason": "exo not enabled",
+                                "checked_at": now}
+            return self.pool_state()
+        try:
+            status = self.exo.pool_status()
+            resident = status.get("resident_model")
+            if resident and status.get("ready"):
+                self._pool_last_model = resident
+                self._pool_state = {
+                    "state": "resident", "model": resident,
+                    "busy": status.get("busy"), "checked_at": now}
+                return self.pool_state()
+        except Exception as e:
+            # The pool is unreachable. NOT `unplaceable` — we learned nothing
+            # about placement, only that we could not ask.
+            self._pool_state = {"state": "unknown",
+                                "reason": f"pool unreachable: {type(e).__name__}",
+                                "checked_at": now}
+            return self.pool_state()
+
+        # Not resident. Ask whether the model we LAST saw resident could be
+        # placed again.
+        #
+        # Deliberately not a new config key. Which model a tier should place is
+        # a policy question that lives in the resource record (task 791 — "the
+        # placement guard reads its model from the resource record"), not in
+        # this gateway, and inventing `EXO_PLACEMENT_MODEL` here would be taking
+        # that decision by writing a default. Until the tier->model mapping is
+        # read from where it lives, the honest probe is "the last thing we saw",
+        # and having seen nothing is `unknown` rather than a guess.
+        model = self._pool_last_model
+        if not model:
+            self._pool_state = {
+                "state": "unknown",
+                "reason": "not resident, and no model seen resident yet, so "
+                          "there is nothing to ask placement about",
+                "checked_at": now}
+            return self.pool_state()
+        avail = self.exo.placement_available(model)
+        self._pool_state = {
+            "state": {True: "placeable", False: "unplaceable",
+                      None: "unknown"}[avail],
+            "model": model,
+            "reason": None if avail is not None else "placement probe failed",
+            "checked_at": now,
+        }
+        return self.pool_state()
+
+    async def pool_state_loop(self):
+        """Keep `pool_state()` fresh out of band. Read-only; never serves."""
+        while True:
+            try:
+                await asyncio.to_thread(self.refresh_pool_state)
+            except Exception as e:
+                log.debug(f"pool_state refresh failed: {e}")
+            await asyncio.sleep(config.EXO_POOL_STATE_INTERVAL_S)
+
     async def offering_loop(self):
         """Stage-1 capacity offering (doc #8): recompute the offering tier from
         live resource pressure and advertise it via the service's capabilities.
@@ -2924,7 +3030,15 @@ class ModelManager:
             self._stats_task = asyncio.create_task(self.stats_loop())
         if config.OFFERING_ENABLED and (self._offering_task is None or self._offering_task.done()):
             self._offering_task = asyncio.create_task(self.offering_loop())
-        log.info("Background tasks started (cooldown, health, lease renewal, POOL lease renewal, stats, offering)")
+        # #801 step 1. Read-only, and gated on EXO_ENABLED because a box with no
+        # pool has nothing to probe — wafer runs this same gateway with
+        # EXO_ENABLED=0 and must not acquire a loop that polls a pool it does
+        # not front.
+        if config.EXO_ENABLED and (self._pool_state_task is None
+                                   or self._pool_state_task.done()):
+            self._pool_state_task = asyncio.create_task(self.pool_state_loop())
+        log.info("Background tasks started (cooldown, health, lease renewal, "
+                 "POOL lease renewal, stats, offering, pool state)")
 
     def shutdown(self) -> list[dict]:
         """Release all leases. Only stop processes we started (managed=True)."""

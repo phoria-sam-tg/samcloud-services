@@ -768,6 +768,12 @@ async def _exo_pool_view() -> dict:
         # active lease on the resource is the wedge signature — a generation
         # nobody is reading — which is what a client dying mid-request leaves.
         view["busy"] = status["busy"]
+        # #801 step 1: the BACKGROUND-maintained answer to "can this be
+        # served", published beside the inline one it is meant to replace on
+        # discovery. Carries its own age, because a freshness field nobody
+        # reads is how `measured_over_s: 60` sat in this payload all evening
+        # while four seats read a windowed figure as an instant.
+        view["placement"] = mgr.pool_state()
         # Per-runner states, which carry layer progress while a swap is in
         # flight — the difference between "not ready" and "23/47 layers in".
         view["runners"] = {

@@ -43,6 +43,7 @@ from . import config, prompt_size, server
 from .manager import Backend
 
 failures = []
+skipped = []
 
 
 def step(n, msg):
@@ -53,6 +54,22 @@ def check(cond, msg):
     print(f"  {'PASS' if cond else 'FAIL'}  {msg}")
     if not cond:
         failures.append(msg)
+
+
+def skip(msg):
+    """An assertion that cannot run here, COUNTED and named.
+
+    Not `check(True, …)` and not silence. Four assertions below need the model
+    fixture, and before #920 they ran anyway on the estimate path and failed —
+    each naming its own cause ("estimate at 1.5 chars/token") while asserting
+    the template path. The obvious fix is to guard them, and the obvious guard
+    is the dangerous one: skipping without counting turns four failures into
+    four silent passes, and the run still prints "All checks passed". So a skip
+    is reported, tallied, and named in the summary, which is the only form in
+    which "this box cannot test that" is distinguishable from "that works".
+    """
+    print(f"  SKIP  {msg}")
+    skipped.append(msg)
 
 
 MODEL = "mlx-community/GLM-4.7-Flash-6bit"
@@ -66,9 +83,19 @@ def words(n_tokens):
 def main():
     step(1, "count a prompt with the model's own tokenizer")
     tok, longest, ctx = prompt_size._load(MODEL, config.EXO_MODELS_DIR)
-    if tok is None:
-        print(f"  SKIP: no tokenizer under {config.EXO_MODELS_DIR} for {MODEL}. "
-              f"The estimate path is still exercised in step 5.")
+    # ONE flag, derived once, shared by every step that needs the fixture.
+    # Step 1 guarded this and five later call sites did not (#920): they took
+    # the estimate path and asserted the template path, so a box without the
+    # model saw four failures that named the model store nowhere. Deriving it
+    # here rather than re-checking per step is deliberate — two guards for one
+    # dependency is how they drift apart.
+    have_fixture = tok is not None
+    if not have_fixture:
+        print(f"  SKIP: no tokenizer under {config.EXO_MODELS_DIR} for {MODEL}.")
+        print(f"        The template path cannot run on this box at all, so the four")
+        print(f"        assertions that pin it are skipped below and named in the summary.")
+        print(f"        Steps 2, 6 and 7 still run: the limit, the refusal and the")
+        print(f"        estimate fallback do not need the fixture.")
     else:
         n, how = prompt_size.count([{"role": "user", "content": words(1000)}],
                                    MODEL, config.EXO_MODELS_DIR, config.EXO_CHARS_PER_TOKEN)
@@ -99,8 +126,13 @@ def main():
         check(body["measured_tokens"] > body["limit_tokens"], "the body names the measurement")
         check("HOST" in body["note"] and "context window" in body["note"].lower(),
               "the body says the limit protects the host, not the context window")
-        check(body.get("model_context_length", 0) > config.EXO_MAX_PROMPT_TOKENS,
-              "the body names the model's real context window for contrast")
+        # The window comes off the fixture's config.json, so it is 0 without it.
+        if have_fixture:
+            check(body.get("model_context_length", 0) > config.EXO_MAX_PROMPT_TOKENS,
+                  "the body names the model's real context window for contrast")
+        else:
+            skip(f"the body names the model's real context window — needs {MODEL}'s "
+                 f"config.json under {config.EXO_MODELS_DIR}")
 
     step(3, "the 413 comes back over HTTP, and the pool was never touched")
     # Deliberately NOT the app's lifespan: starting it here would reap stray
@@ -183,8 +215,12 @@ def main():
     # rendered nothing and fell through to the serialised count — the blunt path,
     # in precisely the case the template was added for. Silent, because a
     # fallback that works looks like success.
-    check(how_tools == "chat template",
-          f"tools still count through the template, not the fallback ({how_tools})")
+    if have_fixture:
+        check(how_tools == "chat template",
+              f"tools still count through the template, not the fallback ({how_tools})")
+    else:
+        skip(f"tools still count through the template — needs {MODEL}'s "
+             f"chat_template.jinja ({how_tools} without it)")
     try:
         prompt_size.check(tiny, MODEL, limit=config.EXO_MAX_PROMPT_TOKENS,
                           completion_budget=0, models_dir=config.EXO_MODELS_DIR,
@@ -209,16 +245,27 @@ def main():
     ]
     n_convo, how_convo = prompt_size.count(convo, MODEL, config.EXO_MODELS_DIR,
                                            config.EXO_CHARS_PER_TOKEN)
-    check(how_convo == "chat template",
-          f"tool_calls with string arguments render ({how_convo}, {n_convo} tokens)")
+    if have_fixture:
+        check(how_convo == "chat template",
+              f"tool_calls with string arguments render ({how_convo}, {n_convo} tokens)")
+    else:
+        skip(f"tool_calls with string arguments render — needs {MODEL}'s "
+             f"chat_template.jinja ({how_convo} without it)")
     # Unparseable arguments are left alone and the fallback takes it: a wrong
     # count in the safe direction beats a fabricated one.
     broken = [dict(convo[1], tool_calls=[{"id": "c1", "type": "function", "function": {
         "name": "f", "arguments": "not json at all"}}])]
     _, how_broken = prompt_size.count(broken, MODEL, config.EXO_MODELS_DIR,
                                       config.EXO_CHARS_PER_TOKEN)
-    check(how_broken == "serialised",
-          f"arguments that will not parse fall back rather than guess ({how_broken})")
+    # "serialised" is the fallback BELOW the template, not the bottom one. Without
+    # a tokenizer there is no serialised path to reach — it is "estimate" — so
+    # this asserts a distinction the fixture creates.
+    if have_fixture:
+        check(how_broken == "serialised",
+              f"arguments that will not parse fall back rather than guess ({how_broken})")
+    else:
+        skip(f"unparseable arguments fall back to serialised — needs {MODEL}'s "
+             f"tokenizer; without it the fallback is {how_broken!r}, one step further down")
 
     step(6, "an absurd body is refused without being tokenized")
     huge = [{"role": "user", "content": "x" * (config.EXO_MAX_PROMPT_TOKENS * 600)}]
@@ -280,7 +327,18 @@ def main():
         for f in failures:
             print(f"    - {f}")
         sys.exit(1)
-    print("  All checks passed")
+    if skipped:
+        # Named, not just counted. "All checks passed" over four silent skips is
+        # the failure mode this guard was added to avoid, so the summary says
+        # what was not tested and why, and rc stays 0 because a missing fixture
+        # is an environment fact and not a defect in the gate (#920).
+        print(f"  All runnable checks passed, {len(skipped)} SKIPPED on this box:")
+        for m in skipped:
+            print(f"    - {m}")
+        print(f"  The template path is untested here. A box with {MODEL}")
+        print(f"  under EXO_MODELS_DIR runs all of it — wafer does.")
+    else:
+        print("  All checks passed")
 
 
 main()

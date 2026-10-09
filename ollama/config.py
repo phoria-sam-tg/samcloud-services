@@ -1252,6 +1252,14 @@ EXO_PLACEMENT_TIMEOUT_S = _env_int("EXO_PLACEMENT_TIMEOUT_S", 20)
 # a silent one about whether it could be placed.
 EXO_PLACEMENT_PROBE = _env_bool("EXO_PLACEMENT_PROBE", True)
 
+# Timeout for the two calls that CHANGE the pool: POST /instance and
+# DELETE /instance/{id}. Longer than the planner probe because both are
+# accepted asynchronously and the accept itself can be slow under load, and
+# because a timeout here is ambiguous in the expensive direction -- the request
+# may have landed. The guard uses 120s for the POST and 60s for the DELETE;
+# one number, the larger, since a late answer costs nothing on either.
+EXO_PLACE_TIMEOUT_S = _env_int("EXO_PLACE_TIMEOUT_S", 120)
+
 # Gap between the two `busy` samples the wedge guard takes before it declines.
 # One sample is an observation of a moving state; two a short interval apart
 # distinguish "a generation just finished" from "the slot is occupied and is

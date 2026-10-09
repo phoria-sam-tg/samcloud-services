@@ -405,6 +405,93 @@ class ExoClient:
             "unavailable_reason": reason,
         }
 
+    def placement_spec(self, model_id: str,
+                       min_nodes: Optional[int] = None) -> Optional[dict]:
+        """The planner's placement for `model_id`, or None if it will not plan one.
+
+        READ-ONLY. This is the first half of placing: exo computes which shards go
+        on which node, and that spec is what gets POSTed back.
+
+        REFUSALS ARRIVE AS A 200-SHAPED BODY, which is the trap here. exo answers
+        a refusal with `{"error": {"message": ...}}` and some paths with
+        `{"detail": ...}`, so a check for "is it a dict" passes an error as a
+        valid spec. The placement guard did exactly that and POSTed the error
+        body back as `{"instance": {"error": ...}}` -- 47 junk POSTs over 21h39m
+        on 2026-10-07/08, with the real reason only visible in the POST's own
+        failure. So both keys are rejected explicitly, and an empty dict too.
+        """
+        try:
+            params = {"model_id": model_id}
+            if min_nodes is not None:
+                params["min_nodes"] = min_nodes
+            r = self._http.get("/instance/placement", params=params,
+                               timeout=config.EXO_PLACEMENT_TIMEOUT_S)
+        except Exception:
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            spec = r.json()
+        except Exception:
+            return None
+        if not isinstance(spec, dict) or not spec:
+            return None
+        if "error" in spec or "detail" in spec:
+            return None
+        return spec
+
+    def place(self, spec: dict) -> Optional[str]:
+        """POST a planner spec back as an instance. Returns exo's command id.
+
+        **This is the only method on this client that commits memory**, and it is
+        deliberately dumb: it takes a spec it did not fetch and does not decide
+        whether placing is allowed. Lease-first is the caller's rule (Sam,
+        2026-10-09: *"the pool shouldn't hold any until it's gotten the lease and
+        spun up"*), and a transport that enforced policy would make that rule
+        invisible at the call site where it matters.
+
+        The body shape is `{"instance": spec}` -- not the bare spec.
+
+        SUCCESS IS A COMMAND ID, NOT A 200. exo accepts the POST and places
+        asynchronously, so a 200 means "queued"; the placement itself takes over a
+        minute to appear in `/state` and can fail there (#848: two CreateRunners
+        Complete, one ConnectToGroup Pending for 7m33s, never formed). A caller
+        must watch `/state` for readiness rather than treat this return as placed.
+        """
+        try:
+            r = self._http.post("/instance", json={"instance": spec},
+                                timeout=config.EXO_PLACE_TIMEOUT_S)
+        except Exception:
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            body = r.json()
+        except Exception:
+            return None
+        if not isinstance(body, dict):
+            return None
+        cid = body.get("commandId") or body.get("command_id")
+        return str(cid) if cid else None
+
+    def unplace(self, instance_id: str) -> bool:
+        """DELETE an instance. True only on a 200.
+
+        A FALSE HERE IS NOT "ALREADY GONE" -- it is "we do not know", and the
+        memory may still be held. The guard's own experience is that a delete can
+        be refused, and worse, that it can succeed while the runner survives it:
+        2026-09-27, instance 8cb72279 was deleted and slice pid 40072 kept
+        `[ring] Rank 0 accepting` because a runner blocked in a native accept runs
+        no Python and never observes its Shutdown. So confirm reclamation by
+        reading memory, never by this return value.
+        """
+        try:
+            r = self._http.delete(f"/instance/{instance_id}",
+                                  timeout=config.EXO_PLACE_TIMEOUT_S)
+        except Exception:
+            return False
+        return r.status_code == 200
+
     def placement_available(self, model_id: str) -> Optional[bool]:
         """Could exo place `model_id` right now? True / False / **None for unknown**.
 

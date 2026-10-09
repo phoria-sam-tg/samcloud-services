@@ -77,6 +77,15 @@ Project history and current state. This is a living document.
 - **Reply length is published beside every decode rate**, because the two
   reply-length classes overlap in rate (short 10.0–21.7 tok/s, long 13.6–24.2)
   and a consumer handed rates alone reads the confound as the signal.
+- **The meaning ships with the field, on `/service-docs`** (`samclaude-admin`,
+  #908) — a published field whose contract lives in separate prose will drift
+  from it, and this box has the precedent: `context_length`'s contract said
+  "consumers are told so on /service-docs", which is unenforceable because a
+  consumer that defaults never reads `/service-docs`. So `units` and
+  `interpretation` ride in the payload *and* both route docs ship in the same
+  change. The gate drives the handler rather than grepping the source — it is
+  an assertion about documentation, so it reads the documentation the API
+  actually serves.
 - **Two things the set is NOT.** Each `prefill_seconds` is a *running maximum*
   and only grows with n, so none of them is a worst case — the same sweep's
   density floor descended twelve times in twenty-seven observations and again

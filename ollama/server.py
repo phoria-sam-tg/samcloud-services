@@ -466,9 +466,36 @@ async def service_docs():
                     "free VRAM at load time. An ABSENT field means we do not "
                     "know it, which is not the same as unlimited."
                 ),
+                "deadlines": (
+                    "WHAT THIS BOX HAS BEEN MEASURED TO PREFILL INSIDE ITS OWN "
+                    "DEADLINE — a DIFFERENT question from `context_length`, and "
+                    "the ratio here is about 3x. The window is what the weights "
+                    "allow; these are measurements. A consumer that sizes a "
+                    "prompt budget from the window builds a request this box "
+                    "cannot serve. Carries `generate_timeout_s` plus "
+                    "`prefill_points` and `decode_points`: measured points, "
+                    "each with `n`, the date, the spread across its "
+                    "observations, and whether it came from seat traffic or a "
+                    "probe. NOT a rate and not a curve — the average rate "
+                    "declines with prompt size (104.3 tok/s at 8,903 real "
+                    "tokens against 66.6 at 112,682), so no scalar describes "
+                    "this box and a rate measured at small N is an upper bound "
+                    "at large N. Subtract your own reply reserve, invert, and "
+                    "see where the data stops. The figures are REAL tokens as "
+                    "the model's tokenizer counts them (prompt_eval_count); if "
+                    "your budget is an estimate, divide by your own over-count "
+                    "factor, which may be above or below 1 and is a property of "
+                    "your content rather than of this box. Two estimators on "
+                    "one prompt differed 1.79x. An EMPTY point set means "
+                    "unmeasured, never unlimited; `n` is published so you can "
+                    "tell which points are mutually comparable, because each is "
+                    "the slowest observation in its band and an extremum over "
+                    "7 draws is more extreme than one over 3."
+                ),
             },
             "GET /v1/models/{id}": {
-                "description": "OpenAI-compatible retrieve-model — one entry, with its context_length",
+                "description": ("OpenAI-compatible retrieve-model — one entry, "
+                                "with its context_length and its deadlines block"),
                 "auth": True,
                 "notes": (
                     "Same entry shape and same contract as /v1/models: 404 for "

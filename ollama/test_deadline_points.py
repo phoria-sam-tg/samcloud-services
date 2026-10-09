@@ -261,8 +261,56 @@ try:
 finally:
     server.mgr = real
 
+# ------------------------------------------------- the contract travels
+section("8. the meaning ships with the field, on /service-docs")
+
+# `samclaude-admin`, #908: a published field whose meaning lives in separate
+# prose WILL drift from it, and this box has the precedent — the
+# `context_length` contract said "consumers are told so on /service-docs",
+# which is unenforceable because a consumer that defaults never reads
+# /service-docs. So `units` and `interpretation` ride in the payload AND the
+# endpoint documentation ships in the same change.
+#
+# Driven through the handler rather than grepped out of the source: this is an
+# assertion about documentation, so it must read the documentation the API
+# actually serves, not the text that produces it.
+import asyncio as _asyncio  # noqa: E402
+
+_docs = _asyncio.run(server.service_docs())
+_eps = _docs.get("endpoints", {})
+check(isinstance(_eps, dict) and _eps, "/service-docs returns an endpoint map")
+
+_list_doc = (_eps.get("GET /v1/models") or {}).get("deadlines", "")
+check(bool(_list_doc), "GET /v1/models documents its `deadlines` block")
+
+# The four things a consumer gets wrong without being told, each asserted
+# against the served text rather than assumed from having written it.
+for needle, why in (
+        ("context_length",
+         "names the field it must NOT be confused with"),
+        ("3x", "and states the size of the gap between them"),
+        ("prompt_eval_count",
+         "names the units as real tokens, reproducibly"),
+        ("above or below",
+         "says a consumer's correction factor may go EITHER way"),
+        ("never unlimited",
+         "says an empty point set is unmeasured, not permission"),
+        ("upper bound",
+         "says a rate measured at small N bounds large N from above"),
+        ("`n`", "and tells a consumer why `n` is on every point"),
+):
+    check(needle in _list_doc, f"...{why}")
+
+check("not a rate" in _list_doc.lower() and "not a curve" in _list_doc.lower(),
+      "and refuses the two shapes most likely to be asked for")
+
+_ret = _eps.get("GET /v1/models/{id}") or {}
+check("deadlines" in (_ret.get("description", "") + str(_ret.get("notes", ""))),
+      "and the retrieve route's documentation mentions it too, since it "
+      "promises the same entry shape and the gate above proves it serves one")
+
 # ----------------------------------------------------------- reproducible
-section("8. the curation is reproducible, not asserted")
+section("9. the curation is reproducible, not asserted")
 
 root = Path(server.__file__).resolve().parent.parent
 tool = root / "deploy" / "deadline-points.py"

@@ -714,8 +714,34 @@ def main():
           "B being detected-but-thin is recorded, so nobody reads the merged "
           "state as closing #904's second half")
 
-    _self = open(os.path.join(os.path.dirname(__file__),
-                              "test_stream_deadlines.py")).read()
+    # THE ASSERTION MUST NOT BE INSIDE THE TEXT IT SEARCHES (#905).
+    #
+    # This reads its own file, to check that the suite still cites the origin of
+    # its detector conditions. Searching the WHOLE file makes that
+    # unfalsifiable: each literal looked for is written on the `check()` line
+    # doing the looking, so it is always present and the comment it guards could
+    # be deleted with the check still green.
+    #
+    # Measured by doing it, 2026-10-09: an ordinary tightening of the comment at
+    # line 609 (dropping one conjunction) left all 115 checks passing. All four
+    # of these assertions had that property.
+    #
+    # `claude-containers` predicted on #905 that prose-subject assertions fail
+    # CLOSED — loud and safe. That holds when the text read belongs to another
+    # file. It does NOT hold for a file reading itself: there the assertion is
+    # part of its own corpus and cannot fail at all.
+    #
+    # TWO THINGS ARE THEREFORE REQUIRED, and the first attempt at this fix only
+    # did one of them. The `check()` lines are excluded below — and the guarded
+    # phrases are NOT QUOTED anywhere in this comment, because the first version
+    # of it reproduced one in order to explain the mutation, which re-satisfied
+    # the assertion from the comment describing the fix. That is the mechanism
+    # under discussion, committed inside its own remedy. Refer to origins by
+    # line number here, never by quotation.
+    _self_full = open(os.path.join(os.path.dirname(__file__),
+                                   "test_stream_deadlines.py")).read()
+    _self = "\n".join(ln for ln in _self_full.split("\n")
+                      if not ln.lstrip().startswith(("check(", "and ", '"')))
     check("chat_completion_helpers.py:3219" in _self
           and "chat_completion_helpers.py:338" in _self
           and "2026-10-08" in _self,

@@ -43,6 +43,7 @@ Project history and current state. This is a living document.
   filtering the assertion to the tier, and found again in `test_prompt_size`.
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 ## 2026-10-09 — a generation now holds `in_flight`, so the cooldown cannot cut it (#907)
 
 - **18 unloads on 2026-10-08, every one 300-355s into an in-flight request.**
@@ -124,6 +125,30 @@ Project history and current state. This is a living document.
   `body.get("loaded_commit", "absent") is not None`: a pass asserting nothing,
   on the response of a request that failed.
 =======
+=======
+## 2026-10-09 — A file reading itself cannot fail, and the first fix proved it (#905)
+
+- **Four `"literal" in _self` assertions in `test_stream_deadlines` could not
+  fail.** The suite reads its own source to check that its detector conditions
+  still cite their origin — but each literal searched for is written on the
+  `check()` line doing the searching, so it is always present and the comment
+  it guards could be deleted with the check still green.
+- **Demonstrated by mutation:** an ordinary tightening of the comment at line
+  609 (dropping one conjunction) left all 115 checks passing.
+- This refines `claude-containers`' prediction on #905 that prose-subject
+  assertions fail **closed** — loud and safe. That holds when the text read
+  belongs to another file. It does not hold for a file reading itself, where the
+  assertion is part of its own corpus.
+- **And the first attempt at the fix reintroduced the defect it was fixing.**
+  Excluding the `check()` lines was necessary but not sufficient: the
+  explanatory comment *quoted* the guarded phrase in order to describe the
+  mutation, which re-satisfied the assertion from the comment explaining the
+  remedy. The mechanism under discussion, committed inside its own fix. Origins
+  are now referred to by line number, never by quotation.
+- Verified both ways: the corrected check **fails** on the same mutation
+  (114/115) and passes when it is restored (115/115).
+
+>>>>>>> 09cc84a (A file reading itself cannot fail, and the first fix proved it (#905))
 ## 2026-10-09 — Two of step 8's assertions were already vacuous (#904, #905)
 
 - **`test_stream_deadlines` step 8 asserted over source TEXT, and two of its six

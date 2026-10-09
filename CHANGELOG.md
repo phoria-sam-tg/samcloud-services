@@ -42,6 +42,34 @@ Project history and current state. This is a living document.
   test whose verdict depended on what this box happened to hold — fixed here by
   filtering the assertion to the tier, and found again in `test_prompt_size`.
 
+## 2026-10-09 — The seven httpx proxy calls carried both opposite bound defects (#911)
+
+- **#904 fixed the owned Ollama path and left the proxies untouched.** Three
+  streaming calls carried `timeout=None` — no bound at all, so a wedged upstream
+  hangs forever, the caller's own bound becomes the only one, and the gateway
+  emits no frame. Four non-streaming calls carried `timeout=300`, which is
+  #904's defect on a different transport.
+- **`httpx` `read` is a per-read-operation bound, so it is a SILENCE bound, and
+  a prefill emits no bytes** — the whole generation of a non-streaming request
+  sits inside one read. Measured on this box: 718.7s for a 62,777-token cold
+  prefill, 918.0s at 75,776, 1,691.0s at 112,682. Each exceeds 300s on its own.
+- **One of the four was hiding inside a `stream: true` branch**: the VLM tools
+  path collapses to a non-streaming upstream call, so a caller asking for a
+  stream was capped at 300s with nothing in the request to say so.
+- All seven now go through `server._proxy_timeout()`. `read` is the
+  whole-request ceiling, because anything tighter needs a prompt-scaled rate
+  and these paths have no exact token count — `prompt_size.count` degrades to
+  an estimate at 1.5 chars/token without a `tokenizer.json` (#906), and the
+  arming rule is that a deadline arms on a measurement and on an exact count.
+  `connect` carries the tight bound (10s) as the only one not waiting on
+  inference: these are 127.0.0.1 children this gateway started.
+- **The gate mutates the helper rather than grepping for the literal**, because
+  `server.py` now contains both offending strings in the docstring that explains
+  why they are gone — a grep would fail against the fix and pass against the
+  defect. 54 checks; a fake `httpx` is injected and every check reads the
+  timeout the code actually handed to the client. The site count is asserted at
+  **seven** so a new unbounded call cannot be added quietly.
+
 ## 2026-10-08 — The inter-token bound was my own regression, found live (#904)
 
 - **I shipped 60s and it aborted a third of real traffic.** Within six minutes

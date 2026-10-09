@@ -42,6 +42,32 @@ Project history and current state. This is a living document.
   test whose verdict depended on what this box happened to hold — fixed here by
   filtering the assertion to the tier, and found again in `test_prompt_size`.
 
+## 2026-10-09 — An instrument must not disturb what it measures (#905)
+
+- **New gate `test_gate_safety`.** It walks the AST of every `ollama/test_*.py`
+  and fails on any lifespan-starting context manager — `TestClient` or
+  `LifespanManager` used as a `with` target. Starlette runs an app's lifespan
+  only via `__enter__`, so the property is syntactic.
+- **Why:** this app's startup adopts whatever Ollama holds and its shutdown
+  unloads it, so `with TestClient(server.app)` on a live box evicts the
+  production model. It did, at 15:22, mid-service, while the real gateway held
+  a 118,272-token request. Every assertion in that gate passed.
+- **Nine of the ten gates were already safe and none was safe on purpose.**
+  `claude-containers` audited their own instruments on the same ticket and
+  reached the same conclusion about theirs: the absence of a lifespan was
+  accidental. So the rule is now checked rather than remembered.
+- **Not a grep, and here that is not a preference.** `test_loaded_commit` now
+  contains the exact string `with TestClient(server.app)` inside the comment
+  explaining why it must not do that, so a text search fails against the fix
+  and passes against the defect.
+- **The detector is tested on known violations first.** It fires on six
+  synthetic ones (async form, attribute form, nested in try/finally, one of
+  several with-items, `LifespanManager`) and stays silent on six clean ones
+  including the string-in-a-comment case — because a scanner reporting zero
+  problems is indistinguishable from one that cannot see. Validated end to end
+  against the real pre-fix file: the gate fails on it at line 189.
+  37 checks, no network.
+
 ## 2026-10-08 — The inter-token bound was my own regression, found live (#904)
 
 - **I shipped 60s and it aborted a third of real traffic.** Within six minutes

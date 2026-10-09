@@ -70,6 +70,17 @@ The gateway runs from `~/var/samcloud-services-deploy`, a deploy clone held on a
 detached HEAD at a named commit — not from your checkout. `deploy/README.md` has
 the why, `deploy/rollout.sh` fills it, and nothing restarts on a merge.
 
+**More than one agent works on this box, so work in a `git worktree`, not in the
+shared checkout: it can change branch under you.** On 2026-10-09 another session
+checked `~/code/samcloud-services` onto its own branch mid-edit; two files of
+uncommitted work were discarded, and the branch then carried that session's WIP
+commit, which came within a push of appearing in someone else's pull request
+under the wrong commit message (#914). Before pushing, **diff the file list
+against what you actually wrote** — `git diff --stat origin/main...HEAD`. Do not
+rely on `git log --format=%an`: the sessions sharing this box share one OS
+account, so a foreign commit carries an author identical to yours. `git log`
+shows what a branch adds and never that one of the additions is somebody else's.
+
 
 ```bash
 SC_TOKEN=<token> python -m uvicorn ollama.server:app --host 0.0.0.0 --port 8800

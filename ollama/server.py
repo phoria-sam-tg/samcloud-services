@@ -30,6 +30,7 @@ into a backend that cannot answer.
 
 import asyncio
 import os
+import sys
 import json
 import tempfile
 import time
@@ -80,6 +81,78 @@ AUTH_ENABLED = config.AUTH_ENABLED
 # first holding a credential for this box. It discloses model names and a
 # memory figure and takes no action.
 AUTH_EXEMPT_PATHS = {"/health", "/service-docs", "/warm"}
+
+
+def _read_loaded_commit() -> str | None:
+    """The commit this process IMPORTED, read once at import. None if unknowable.
+
+    WHY AT IMPORT. #904 left this box healthy for an hour while the next restart
+    would have 422'd every chat request: pid 898 had loaded its modules on Oct 5,
+    the clone was reset to `ff20347` on Oct 8, and nothing could compare the two
+    facts. `/health` was 200 throughout. Reading HEAD per request would report
+    the CLONE, which is the fact we already had — the whole value is in reporting
+    what was loaded, so the read has to happen while it is being loaded.
+
+    WHY NOT A SUBPROCESS. `git rev-parse` needs git on PATH and costs a fork at
+    startup; the two files it would read are right here. Handles the detached
+    HEAD a deploy clone sits on (HEAD holds the sha), a branch checkout (HEAD
+    holds `ref: refs/...`), and a worktree (`.git` is a file holding `gitdir:`).
+
+    ABSENT RATHER THAN GUESSED. A box running from a tarball has no commit, and
+    a plausible-looking one would be worse than nothing — the caller's whole
+    question is whether two shas match, and an invented left operand makes the
+    comparison lie rather than refuse. Every failure here returns None and the
+    field is omitted, never null: see `status()` for why absent beats null.
+    """
+    try:
+        root = Path(__file__).resolve().parent.parent
+        dotgit = root / ".git"
+        if dotgit.is_file():                      # worktree: "gitdir: <path>"
+            line = dotgit.read_text().strip()
+            if not line.startswith("gitdir:"):
+                return None
+            dotgit = Path(line.split(":", 1)[1].strip())
+            if not dotgit.is_absolute():
+                dotgit = (root / dotgit).resolve()
+        head = (dotgit / "HEAD").read_text().strip()
+        if head.startswith("ref:"):
+            ref = head.split(":", 1)[1].strip()
+            target = dotgit / ref
+            if target.exists():
+                head = target.read_text().strip()
+            else:                                  # packed-refs
+                for ln in (dotgit / "packed-refs").read_text().splitlines():
+                    if ln.endswith(" " + ref):
+                        head = ln.split(" ", 1)[0].strip()
+                        break
+                else:
+                    return None
+        return head if len(head) == 40 and all(
+            c in "0123456789abcdef" for c in head) else None
+    except Exception:
+        return None
+
+
+LOADED_COMMIT = _read_loaded_commit()
+
+
+def loaded_modules() -> list:
+    """Which `ollama.*` modules this process imported, dotted, read LIVE.
+
+    Deliberately not import-time, and that is the one thing to know about it:
+    `server.py` is mid-import when `LOADED_COMMIT` is taken, so `sys.modules` is
+    incomplete at that instant and an import-time snapshot would under-report.
+    So this response carries TWO CLOCKS — the commit from import, the module set
+    from now — and a reader comparing them should know which is which.
+
+    It exists because three of us hand-picked this set and all three were wrong.
+    `whisper_server.py` is on disk, non-test, and never imported: it is exec'd as
+    a script under WHISPER_PYTHON from the clone, per transcription. A heuristic
+    of "ollama/*.py minus test_*" reports a restart as behaviour-changing for a
+    file a restart does not deploy. `deploy/drift-report.py` therefore takes the
+    set as `--imported` and says UNKNOWN without it rather than guessing (#905).
+    """
+    return sorted(m for m in sys.modules if m == "ollama" or m.startswith("ollama."))
 
 
 class SamcloudAuthMiddleware(BaseHTTPMiddleware):
@@ -479,6 +552,21 @@ async def service_docs():
             "GET /status": {
                 "description": "Full status — backends, models, leases, resource utilisation",
                 "auth": True,
+                "loaded_commit": (
+                    "The 40-char commit this PROCESS imported, read once at "
+                    "import. ABSENT when it cannot be read (no checkout, a "
+                    "tarball deploy) — never null, because a null compares as "
+                    "a value and would read as drift. Compare it against "
+                    "`git -C <deploy clone> rev-parse HEAD` to see whether a "
+                    "restart would change behaviour (#905)."
+                ),
+                "loaded_modules": (
+                    "Dotted `ollama.*` names in sys.modules, read LIVE rather "
+                    "than at import — so this response carries two clocks, and "
+                    "the module set is the later one. Feed it to "
+                    "`deploy/drift-report.py --imported`; without it that tool "
+                    "says UNKNOWN rather than guessing which files matter."
+                ),
             },
             "POST /models/load": {
                 "description": "Load a model (pulls if needed, requests GPU lease)",
@@ -531,7 +619,32 @@ async def service_docs():
 
 @app.get("/status")
 async def status():
-    return await asyncio.to_thread(mgr.status)
+    """Manager status, plus what this process is RUNNING (#905).
+
+    `loaded_commit` is OMITTED, not null, when it cannot be read. A null would
+    serialise and compare as a value — `[ "$running" = "$staged" ]` against a
+    null is a mismatch that reads as drift, and a caller checking
+    `if "loaded_commit" in status` gets the truth either way. The rule is the
+    one `/v1/models` already applies to `context_length`: absent means unknown,
+    and the field's documentation says so rather than the value implying it.
+
+    Drift is one comparison from outside, and it has a DIRECTION — the left
+    operand is what is loaded, the right is what a restart would load:
+
+        running=$(curl -s localhost:8800/status | jq -r .loaded_commit)
+        staged=$(git -C ~/var/samcloud-services-deploy rev-parse HEAD)
+        deploy/drift-report.py "$running" "$staged" \\
+            --imported "$(curl -s localhost:8800/status | jq -r '.loaded_modules|join(",")')"
+
+    Reversing those operands reports a restart as a rollback and a rollback as a
+    restart, which is why `drift-report.py` names them rather than positioning
+    them silently.
+    """
+    out = await asyncio.to_thread(mgr.status)
+    if LOADED_COMMIT is not None:
+        out["loaded_commit"] = LOADED_COMMIT
+    out["loaded_modules"] = loaded_modules()
+    return out
 
 
 @app.get("/v1/models")

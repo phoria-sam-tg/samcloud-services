@@ -42,6 +42,71 @@ Project history and current state. This is a living document.
   test whose verdict depended on what this box happened to hold — fixed here by
   filtering the assertion to the tier, and found again in `test_prompt_size`.
 
+## 2026-10-09 — The deadline primitives are points, because every single figure was falsified (#908)
+
+- **`/v1/models` and `/v1/models/{id}` now carry a `deadlines` block**:
+  `generate_timeout_s`, plus measured `prefill_points` and `decode_points`, each
+  point with `n`, the date it was measured, the spread across its observations,
+  and whether it came from seat traffic or a probe. New `ollama/deadline_points.py`;
+  98 checks in `ollama/test_deadline_points.py`; `deploy/deadline-points.py`
+  regenerates the whole set from a gateway log so the curation is reproducible.
+- **Four single-figure shapes were proposed and all four were rejected on
+  measurement**, which is why this is a point set and not a number: a derived
+  `serveable` (the four defensible derivations spread 1.7x), a fitted curve
+  (`secs = aN + bN²`, worst residual **+40.2%** over 22 cold points), a scalar
+  rate (the average declines with size — 104.3 tok/s at 8,903 real tokens
+  against 66.6 at 112,682), and a decode reserve (the consumer's reply
+  distribution, which moved 5,087 → 7,223 tokens inside one hour). The gate
+  asserts each of those field names is **absent**, so re-adding one means
+  deleting the check that says why it went.
+- **The data came from a log sweep, not a probe.** The `Ollama timings` lines
+  #904 added already pair the gateway's estimate against Ollama's own
+  `prompt_eval_count`, so every completed request is a measurement. 83 pairs on
+  this box; the cold prefill band is tight and self-identifying at 87.3–104.9
+  tok/s, against 3 partial prefix reuses and 14 cache hits (up to 159,703
+  tok/s) which are excluded and **counted** rather than silently dropped.
+- **`context_length` and the points answer different questions, ratio ~3x.** The
+  window is what the weights allow (262,144 here); the points are what has been
+  measured to prefill inside the deadline. A consumer that sizes a prompt budget
+  from the window builds a request this box cannot serve — one shipped a
+  hand-picked 65,536 that this endpoint never served, which then read as
+  configured rather than wrong. Both fields are published so the gap is visible.
+- **An unmeasured model publishes `[]`, never a missing key.** Absence resolves
+  to a default in every consumer chain anyone has read, and the default is
+  always the largest number available.
+- **Reply length is published beside every decode rate**, because the two
+  reply-length classes overlap in rate (short 10.0–21.7 tok/s, long 13.6–24.2)
+  and a consumer handed rates alone reads the confound as the signal.
+- **The meaning ships with the field, on `/service-docs`** (`samclaude-admin`,
+  #908) — a published field whose contract lives in separate prose will drift
+  from it, and this box has the precedent: `context_length`'s contract said
+  "consumers are told so on /service-docs", which is unenforceable because a
+  consumer that defaults never reads `/service-docs`. So `units` and
+  `interpretation` ride in the payload *and* both route docs ship in the same
+  change. The gate drives the handler rather than grepping the source — it is
+  an assertion about documentation, so it reads the documentation the API
+  actually serves.
+- **Two things the set is NOT.** Each `prefill_seconds` is a *running maximum*
+  and only grows with n, so none of them is a worst case — the same sweep's
+  density floor descended twelve times in twenty-seven observations and again
+  within the hour. And band extrema over unequal `n` are not a curve: 31,955
+  (n=3) reads 11.025 ms/tok while the larger 39,782 (n=7) reads 10.635. The
+  convexity that lets a consumer bracket a deadline with a chord is asserted
+  only over the comparably-sampled tail from 44,905 up.
+
+## 2026-10-09 — The #905 gate was evicting the model it describes (#905)
+
+- **`with TestClient(app)` runs the app's lifespan**, and this app's startup
+  adopts whatever Ollama holds while its shutdown unloads it. So running the
+  #905 gate on a live box took the resident 27b from `keep_alive=-1` to an
+  `expires_at` three minutes in the past, mid-service, while the real gateway
+  was holding a 118,272-token request. Found by doing it, 15:22 on slice.
+- Construct `TestClient` bare instead — no lifespan, no adopt, no unload, which
+  is what every other TestClient in the package already does — and stub `mgr`,
+  which that same startup builds. The section asserts the handler's contract
+  (`loaded_commit` omitted-not-null, `loaded_modules` a dotted list) and that
+  contract does not involve a manager. 25 checks, was 24.
+
 ## 2026-10-08 — The inter-token bound was my own regression, found live (#904)
 
 - **I shipped 60s and it aborted a third of real traffic.** Within six minutes

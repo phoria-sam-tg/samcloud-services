@@ -261,13 +261,26 @@ restarting.
   route.
 - **`nodeIdentities` is not a ring size** (ticket #870) — it is the one per-node
   map `apply_node_timed_out` does not filter, so it remembers a departed node and
-  looks like the way to tell a short ring from a small one. It is also emptied by
-  an API-state reset plus an event-log rotation, which **every exo restart
-  performs**. Read live on slice at 00:24Z on 2026-09-30, 17 minutes after its own
-  node restarted and with wafer genuinely away: `topology.nodes` and
-  `nodeIdentities` both held slice alone, so the subtraction said the ring was
-  whole while a node was missing — and the decline then told a caller "the ring is
-  whole and no model is placed on it". `EXO_RING_MIN_NODES` has **no default**,
+  looks like the way to tell a short ring from a small one. **It is cleared by
+  `APIState.reset`, which fires on `is_new_master` — a node that has to PROMOTE
+  itself clears its identities; a node that was already master does not.** A
+  restart is one way to reach that branch and not the only one: measured on both
+  nodes 2026-10-09, slice logged `Node elected Master - maintaining self` six
+  times with `Resetting API State` **zero** times and kept both identities, while
+  wafer logged `promoting self` followed by the reset and kept only its own. Read
+  live on slice at 00:24Z on 2026-09-30, 17 minutes after its own node restarted
+  and with wafer genuinely away: `topology.nodes` and `nodeIdentities` both held
+  slice alone, so the subtraction said the ring was whole while a node was missing
+  — and the decline then told a caller "the ring is whole and no model is placed
+  on it".
+
+  **So which node can attribute a departure depends on which node was master, and
+  that is a hazard rather than a nicety.** If the departing node held master, the
+  survivor must promote, resets, and keeps only itself — so "who is missing" comes
+  back empty on the box that stayed, with no restart involved. Do not read "nobody
+  restarted" as "identities are reliable": that inference is what the `#870` guard's
+  identities-plus-configuration union exists to survive, and it is reachable by
+  election history alone. `EXO_RING_MIN_NODES` has **no default**,
   and setting it is what arms `pool_ring_short`; unset, the reason falls back and
   the message says in terms that whether the ring is whole is *not established*.
   Same shape as `FOREIGN_IDLE_MB`: a guessed value produces a confident wrong

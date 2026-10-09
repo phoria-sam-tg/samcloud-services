@@ -183,16 +183,47 @@ section("6. /status over the real ASGI app")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+# NO `with`, AND THE OMISSION IS LOAD-BEARING. TestClient runs the app's
+# lifespan only when used as a context manager, and this app's startup ADOPTS
+# whatever Ollama currently holds while its shutdown UNLOADS it. So
+# `with TestClient(server.app)` on a live box EVICTS THE PRODUCTION MODEL.
+#
+# Measured by doing it, 2026-10-09 15:22 on slice: the first version of this
+# file took the resident 27b from `keep_alive=-1` to an `expires_at` three
+# minutes in the past, mid-service, while the real gateway was holding a
+# 118,272-token request. A gate that cannot be run on the box it describes is
+# not a gate. Every other TestClient in this package is already constructed
+# bare; this file was the only one that was not.
+#
+# `mgr` is built in that same startup, so bare construction leaves it None and
+# the handler raises. It is stubbed rather than started: what this section
+# asserts is the HANDLER's contract — that `loaded_commit` is omitted-not-null
+# and `loaded_modules` is a dotted list — and that contract does not involve a
+# manager. Stubbing keeps the two failures separable, so a real manager fault
+# cannot show up here as a drift-reporting fault.
+class _StubMgr:
+    def status(self):
+        return {"models": [], "stub": True}
+
+
 body = None
 code = None
+real_mgr = server.mgr
 try:
-    with TestClient(server.app) as c:
-        r = c.get("/status")
-        code = r.status_code
-        check(code == 200, f"GET /status -> 200 (got {code})")
-        body = r.json()
+    server.mgr = _StubMgr()
+    c = TestClient(server.app)
+    r = c.get("/status")
+    code = r.status_code
+    check(code == 200, f"GET /status -> 200 (got {code})")
+    body = r.json()
 except Exception as e:
     check(False, f"GET /status raised {e!r}")
+finally:
+    server.mgr = real_mgr
+
+check(body is not None and body.get("stub") is True,
+      "the stub manager's own status is passed through, so the handler MERGES "
+      "rather than replaces")
 
 # GUARDED ON THE 200. The first version checked the body unconditionally and a
 # 401 error payload satisfied `body.get("loaded_commit", "absent") is not None`

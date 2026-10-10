@@ -105,3 +105,7 @@ WHISPER_ENABLED=0
 
 OLLAMA_BASE=http://localhost:11434
 SERVICE_PORT=8800
+
+# Hermes tool-use candidate window. Read back the served window and measure
+# generation memory; the native context ceiling alone does not prove fit.
+OLLAMA_NUM_CTX_MODELS=qwen3-coder:30b=65536

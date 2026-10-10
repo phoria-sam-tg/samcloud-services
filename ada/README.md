@@ -21,6 +21,13 @@ things to know before changing any of them:
 
 ## Deploying
 
+`qwen3-coder:30b` has a candidate `num_ctx` pin of 65,536 in `ada/env`.
+Read `/api/ps` after load to verify the served window; native model metadata
+is not an allocation measurement. Hermes must budget against that same window.
+Before inference, require `work_in_progress: false` and cross-check hardware
+memory. Sample memory during generation, not only after loading. The pin does
+not certify maximum-window fit or permit co-residency with a render.
+
 The gateway runs from the **deploy clone**, not from a working checkout — see
 `deploy/README.md` for why and for ada's one-time setup. The rollout is two
 steps and they are deliberately separate:
@@ -34,7 +41,8 @@ deploy/rollout.sh <commit>        # put the code in place; restarts nothing
 `restart-when-idle --check lease` takes an **exclusive** lease on
 `--resource`, and on a `shared` resource an exclusive take is refused while
 *any* share is held — including the gateway's own, for every model it has
-resident. So unload first. Proved on wafer 2026-09-29
+resident. Wait for active requests to finish, then unload idle residents before
+the restart. Proved on wafer 2026-09-29
 (claude-wafer-services): exclusive take → 200 with nothing resident, 409 with
 one model loaded, 200 again after unloading it.
 
@@ -47,16 +55,15 @@ a cold load and nothing else.
 install -m 600 /dev/null ~/.samcloud/ada.hdr
 printf 'Authorization: Bearer %s\n' "$(cat ~/.samcloud/token)" > ~/.samcloud/ada.hdr
 
-# 1. Unload whatever is resident, so the exclusive take can succeed.
-curl -s -H @"$HOME/.samcloud/ada.hdr" http://localhost:8800/models \
-  | python3 -c 'import json,sys; [print(n) for n in json.load(sys.stdin)["managed"]]' \
-  | while read -r m; do
-      curl -s -H @"$HOME/.samcloud/ada.hdr" -H 'Content-Type: application/json' \
-           -d "{\"model\": \"$m\", \"force\": true}" \
-           http://localhost:8800/models/unload
-    done
+# 1. Read authenticated state. Wait for active serving to finish; missing
+# in_flight is unknown, not zero. Do not force-unload active work.
+curl -fsS -H @"$HOME/.samcloud/ada.hdr" http://localhost:8800/status
+# When a named model is confirmed idle, unload it through /models/unload.
+# If traffic resumes, wait again rather than racing it.
 
-# 2. Restart once the resource is genuinely free.
+# 2. Restart once no models remain and the lease check can take the resource.
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
 restart-when-idle.sh --check lease --resource ada-wsl/gpu-0 \
   --action 'systemctl --user restart samcloud-model-gateway'
 ```

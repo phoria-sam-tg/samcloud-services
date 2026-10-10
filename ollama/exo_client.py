@@ -405,6 +405,169 @@ class ExoClient:
             "unavailable_reason": reason,
         }
 
+    def placement_spec(self, model_id: str,
+                       min_nodes: Optional[int] = None) -> Optional[dict]:
+        """The planner's placement for `model_id`, or None if it will not plan one.
+
+        READ-ONLY. This is the first half of placing: exo computes which shards go
+        on which node, and that spec is what gets POSTed back.
+
+        REFUSALS ARRIVE AS A 200-SHAPED BODY, which is the trap here. exo answers
+        a refusal with `{"error": {"message": ...}}` and some paths with
+        `{"detail": ...}`, so a check for "is it a dict" passes an error as a
+        valid spec. The placement guard did exactly that and POSTed the error
+        body back as `{"instance": {"error": ...}}` -- 47 junk POSTs over 21h39m
+        on 2026-10-07/08, with the real reason only visible in the POST's own
+        failure. So both keys are rejected explicitly, and an empty dict too.
+        """
+        try:
+            params = {"model_id": model_id}
+            if min_nodes is not None:
+                params["min_nodes"] = min_nodes
+            r = self._http.get("/instance/placement", params=params,
+                               timeout=config.EXO_PLACEMENT_TIMEOUT_S)
+        except Exception:
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            spec = r.json()
+        except Exception:
+            return None
+        if not isinstance(spec, dict) or not spec:
+            return None
+        if "error" in spec or "detail" in spec:
+            return None
+        return spec
+
+    def place(self, spec: dict) -> Optional[str]:
+        """POST a planner spec back as an instance. Returns exo's command id.
+
+        **This is the only method on this client that commits memory**, and it is
+        deliberately dumb: it takes a spec it did not fetch and does not decide
+        whether placing is allowed. Lease-first is the caller's rule (Sam,
+        2026-10-09: *"the pool shouldn't hold any until it's gotten the lease and
+        spun up"*), and a transport that enforced policy would make that rule
+        invisible at the call site where it matters.
+
+        The body shape is `{"instance": spec}` -- not the bare spec.
+
+        SUCCESS IS A COMMAND ID, NOT A 200. exo accepts the POST and places
+        asynchronously, so a 200 means "queued"; the placement itself takes over a
+        minute to appear in `/state` and can fail there (#848: two CreateRunners
+        Complete, one ConnectToGroup Pending for 7m33s, never formed). A caller
+        must watch `/state` for readiness rather than treat this return as placed.
+        """
+        try:
+            r = self._http.post("/instance", json={"instance": spec},
+                                timeout=config.EXO_PLACE_TIMEOUT_S)
+        except Exception:
+            return None
+        if r.status_code != 200:
+            return None
+        try:
+            body = r.json()
+        except Exception:
+            return None
+        if not isinstance(body, dict):
+            return None
+        cid = body.get("commandId") or body.get("command_id")
+        return str(cid) if cid else None
+
+    def unplace(self, instance_id: str) -> bool:
+        """DELETE an instance. True only on a 200.
+
+        A FALSE HERE IS NOT "ALREADY GONE" -- it is "we do not know", and the
+        memory may still be held. The guard's own experience is that a delete can
+        be refused, and worse, that it can succeed while the runner survives it:
+        2026-09-27, instance 8cb72279 was deleted and slice pid 40072 kept
+        `[ring] Rank 0 accepting` because a runner blocked in a native accept runs
+        no Python and never observes its Shutdown. So confirm reclamation by
+        reading memory, never by this return value.
+        """
+        try:
+            r = self._http.delete(f"/instance/{instance_id}",
+                                  timeout=config.EXO_PLACE_TIMEOUT_S)
+        except Exception:
+            return False
+        return r.status_code == 200
+
+    def placement_available(self, model_id: str) -> Optional[bool]:
+        """Could exo place `model_id` right now? True / False / **None for unknown**.
+
+        READ-ONLY: a GET at exo's own placement planner. This asks the question a
+        consumer actually has -- *can this be served* -- which `resident_model()`
+        cannot answer for a model that is not resident but could be.
+
+        THREE-VALUED ON PURPOSE, and that is the whole point of the signature. A
+        probe that fails returns `None`, never `False`: `False` would mean "exo
+        says there is no room" while the truth is "we did not find out", and a
+        consumer cannot tell those apart once they are the same value.
+
+        Only ONE 400 is an answer. `No cycles found with sufficient memory` is a
+        capacity verdict, so that is a real `False`; any other 400 is a question
+        we asked wrong, which is not the same as "no".
+
+        MEASURED 2026-10-10 on slice, with the 120B pool resident and 9,156 MB
+        free -- the pair matters, because the first reading alone reads as
+        "placement is impossible while the pool is resident" and that is false:
+
+            gpt-oss-120b-MXFP4-Q8        -> 400 No cycles found ...  -> False
+            Qwen2.5-VL-7B-Instruct-4bit  -> 200 {MlxRingInstance...} -> True
+
+        So a 400 here is a verdict about THIS model's footprint against the room
+        that is left, not a property of the pool being busy. Ported from PR #68
+        by services@1770, whose three-valued signature this keeps.
+        """
+        try:
+            r = self._http.get("/instance/placement",
+                               params={"model_id": model_id},
+                               timeout=config.EXO_PLACEMENT_TIMEOUT_S)
+        except Exception:
+            return None
+        try:
+            body = r.json()
+        except Exception:
+            return None
+        if r.status_code == 200:
+            # A 200 IS NOT A YES. `placement_spec()` documents that exo answers
+            # some refusals as a 200 carrying `{"error": {...}}` or
+            # `{"detail": …}` -- the shape that had the guard POST 47 error
+            # bodies back as placements. Same endpoint, so the same shape
+            # arrives here, and `bool({"error": …})` is True: the view would
+            # record `placeable`, the offer would promise a placement is coming,
+            # and the wait would never end. So a 200 is True only for a body
+            # that is actually a spec, and anything else falls through to the
+            # refusal rule below rather than being believed.
+            if isinstance(body, dict) and body and "error" not in body and "detail" not in body:
+                return True
+            return self._refusal_verdict(body)
+        if r.status_code == 400:
+            return self._refusal_verdict(body)
+        return None
+
+    @staticmethod
+    def _refusal_verdict(body) -> Optional[bool]:
+        """`False` for a capacity verdict, `None` for anything else.
+
+        Only ONE message is an answer. `No cycles found with sufficient memory`
+        says exo looked and there is no room; any other refusal is a question
+        asked wrong, a model it cannot find, or a shape we do not recognise --
+        none of which establishes that a placement is impossible. Returning
+        False for those would advertise `pool_unplaceable` on no evidence, which
+        is the mirror of the bug this exists to prevent.
+        """
+        msg = ""
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message") or ""
+            elif isinstance(err, str):
+                msg = err
+            if not msg and isinstance(body.get("detail"), str):
+                msg = body["detail"]
+        return False if "sufficient memory" in str(msg).lower() else None
+
     def resident_model(self) -> Optional[str]:
         """The model the pool is holding and ready to serve, or None.
 

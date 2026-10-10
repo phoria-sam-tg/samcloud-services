@@ -42,6 +42,87 @@ Project history and current state. This is a living document.
   test whose verdict depended on what this box happened to hold — fixed here by
   filtering the assertion to the tier, and found again in `test_prompt_size`.
 
+## 2026-10-09 — a generation now holds `in_flight`, so the cooldown cannot cut it (#907)
+
+- **18 unloads on 2026-10-08, every one 300-355s into an in-flight request.**
+  `check_cooldowns` respects `in_flight`; the flag was claimed on the
+  transcription path only. `touch()` stamps `last_used` once before the work, so
+  a 549s prefill reads as 549s idle and the model is unloaded under the request.
+- **Why it never bit before, and the coincidence is exact.** `COOLDOWN_SECONDS`
+  is 300 and the old `aiohttp ClientTimeout(total=300)` was 300. The timeout
+  killed every Ollama request at precisely the moment the cooldown first became
+  eligible, so nothing on that path ever survived to be reached. **#904's fix is
+  what exposed this** — which is why all 18 instances are dated the day it
+  shipped rather than spread over weeks. `claude-wafer-services` found both the
+  cause and the fix, one grep from the symptom.
+- **What it cost.** The unload releases the capacity lease and zeroes `own_mb`
+  while `device_inuse_mb` is unchanged, because Ollama will not evict a busy
+  runner. `foreign_mb = device_inuse - own` then reports the gateway's own model
+  as a stranger: 19,492 MB of phantom foreign tenant, measured. Requests still
+  completed, so it was never an outage — but another caller's placement decision
+  in that window sees a free pool that is not free.
+- **`ModelManager.serving()`** holds the claim and **re-stamps `last_used` at
+  release**, because a 549s request otherwise leaves the model eligible on the
+  very next tick — a model that just finished serving is the least idle thing on
+  the box. It deliberately does not touch `request_count`: relocating `touch()`
+  would change counting semantics, and :1306 stamps a failed request on purpose.
+- **Wrapped at the iterator, not inside the generator.** `_held_async` and
+  `_held_sync`. The handler returns the instant `StreamingResponse` is
+  constructed and the prefill has not begun, so a claim scoped to the handler is
+  released before the work starts. Wrapping the iterator also avoids
+  re-indenting the long try/except that emits #43's failure frames — and a first
+  attempt at that produced a 2-space body, valid Python and a trap for the next
+  editor, which is why it was reverted.
+- `ollama/test_in_flight.py`, 22 checks, no network. Every check advances a clock
+  and runs the real `check_cooldowns` against a generation that has not
+  finished — including that the bug reproduces without the claim, that a raising
+  generation does not leak it, that nesting counts, and that foreign work still
+  wins (admin's policy: work wins, but cutting a live request needs a measured
+  grace period, which is C2).
+
+## 2026-10-09 — /status says which commit it imported (#905)
+
+- **The gap #904 exposed.** The misbinding reached `main` and the staged deploy
+  clone while the live process kept serving correctly, because it had imported
+  its modules three days earlier. `/health` 200, `/warm` 200, real traffic
+  answered — and the next restart from any cause would have 422'd every chat
+  request. Nothing could compare *what is running* with *what is staged*, and an
+  uncredentialed probe could not see it either: auth sits in front of
+  validation, so an unauthenticated caller gets 401 before and after.
+- **`loaded_commit` on `/status`, read once at import.** From `.git` directly —
+  no subprocess, no git on PATH — handling a detached HEAD (a deploy clone), a
+  branch checkout, `packed-refs`, and a worktree whose `.git` is a file.
+  Per-request would report the CLONE, which is the fact we already had; the
+  whole value is in reporting what was *loaded*, so the read happens while it is
+  being loaded.
+- **Absent, never null.** A box with no checkout omits the key. A null
+  serialises and compares as a value, so `[ "$running" = "$staged" ]` against it
+  reads as drift, while a missing key lets `if "loaded_commit" in status` be
+  honest. Same rule `/v1/models` applies to `context_length` (#903).
+- **`loaded_modules` is read LIVE, and the field says so.** `server.py` is
+  mid-import when the commit is taken, so a `sys.modules` snapshot at that
+  instant under-reports. The response therefore carries two clocks — commit from
+  import, modules from now — which is stated rather than left to be discovered.
+- **Why the set is passed rather than derived.** Three of us hand-picked it and
+  all three were wrong. `ollama/whisper_server.py` is on disk, non-test, and
+  never imported: it is exec'd as a script under `WHISPER_PYTHON` from the clone,
+  per transcription. "ollama/*.py minus test_*" therefore reports a restart as
+  behaviour-changing for a file a restart does not deploy. `deploy/drift-report.py`
+  takes `--imported` from this field and says UNKNOWN without it.
+- **Drift has a direction.** Loaded on the left, staged on the right. Reversed,
+  a restart reads as a rollback.
+- `ollama/test_loaded_commit.py`, 24 checks, no network. It asserts nothing
+  about `server.py`'s source text — a file that documents its own history
+  contains every string it ever got wrong, which is how three assertions in
+  `test_stream_deadlines.py` came to be satisfied by their own comments. Every
+  check here calls a function or drives the ASGI app.
+- **Two defects in the test, found by running it.** `AUTH_ENABLED` was set
+  *after* `server` imported, so every `/status` check got 401 — the same
+  import-ordering mistake the feature exists to expose. And the body checks ran
+  unguarded, so a 401 error payload satisfied
+  `body.get("loaded_commit", "absent") is not None`: a pass asserting nothing,
+  on the response of a request that failed.
+
 ## 2026-10-08 — The inter-token bound was my own regression, found live (#904)
 
 - **I shipped 60s and it aborted a third of real traffic.** Within six minutes

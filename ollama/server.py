@@ -127,9 +127,22 @@ def _read_loaded_commit() -> str | None:
     what was loaded, so the read has to happen while it is being loaded.
 
     WHY NOT A SUBPROCESS. `git rev-parse` needs git on PATH and costs a fork at
-    startup; the two files it would read are right here. Handles the detached
-    HEAD a deploy clone sits on (HEAD holds the sha), a branch checkout (HEAD
-    holds `ref: refs/...`), and a worktree (`.git` is a file holding `gitdir:`).
+    startup; the files it would read are right here. Handles the detached HEAD a
+    deploy clone sits on (HEAD holds the sha), a branch checkout (HEAD holds
+    `ref: refs/...`), and a worktree (`.git` is a file holding `gitdir:`).
+
+    A LINKED WORKTREE KEEPS ITS BRANCH REFS SOMEWHERE ELSE, which is the one
+    layout this got wrong. `.git` points at `.../.git/worktrees/<name>`, whose
+    HEAD is per-worktree — but `refs/heads/...` is NOT: it lives in the common
+    directory named by that gitdir's `commondir` file. Searching only the
+    worktree gitdir finds no ref and correctly returns None, so the reader was
+    silent in exactly the layout contributors work in, while production's
+    detached-HEAD deploy clone kept working and hid it. Measured 2026-10-09 in
+    `samcloud-services-wt/inflight-907`: HEAD held
+    `ref: refs/heads/samclaude-services/in-flight-907-rebase`, that path was
+    absent under the worktree gitdir and present under `commondir` (`../..`).
+    So refs are looked for in the worktree gitdir FIRST (per-worktree refs win,
+    which is what git does) and then in the common dir.
 
     ABSENT RATHER THAN GUESSED. A box running from a tarball has no commit, and
     a plausible-looking one would be worse than nothing — the caller's whole
@@ -150,16 +163,32 @@ def _read_loaded_commit() -> str | None:
         head = (dotgit / "HEAD").read_text().strip()
         if head.startswith("ref:"):
             ref = head.split(":", 1)[1].strip()
-            target = dotgit / ref
-            if target.exists():
-                head = target.read_text().strip()
-            else:                                  # packed-refs
-                for ln in (dotgit / "packed-refs").read_text().splitlines():
-                    if ln.endswith(" " + ref):
-                        head = ln.split(" ", 1)[0].strip()
+            # Per-worktree refs first, then the common dir a linked worktree
+            # keeps its branches in. Same order git resolves them in.
+            roots = [dotgit]
+            commondir = dotgit / "commondir"
+            if commondir.is_file():
+                cd = Path(commondir.read_text().strip())
+                roots.append(cd if cd.is_absolute() else (dotgit / cd).resolve())
+            head = None
+            for base in roots:
+                target = base / ref
+                if target.is_file():
+                    head = target.read_text().strip()
+                    break
+            if head is None:
+                for base in roots:                 # packed-refs
+                    packed = base / "packed-refs"
+                    if not packed.is_file():
+                        continue
+                    for ln in packed.read_text().splitlines():
+                        if ln.endswith(" " + ref):
+                            head = ln.split(" ", 1)[0].strip()
+                            break
+                    if head is not None:
                         break
-                else:
-                    return None
+            if head is None:
+                return None
         return head if len(head) == 40 and all(
             c in "0123456789abcdef" for c in head) else None
     except Exception:

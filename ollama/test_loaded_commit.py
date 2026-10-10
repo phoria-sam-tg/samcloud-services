@@ -110,6 +110,73 @@ with tempfile.TemporaryDirectory() as t:
         return _read()
     check(_in(t, worktree) == SHA, "worktree (.git is a file) -> follows gitdir")
 
+# A LINKED WORKTREE ON A BRANCH keeps HEAD per-worktree and refs/heads in the
+# COMMON dir, named by the gitdir's `commondir` file. The case above passes with
+# a detached HEAD (the sha is in HEAD itself), which is what a deploy clone has
+# and is why this gap stayed hidden: production worked, and the reader was blind
+# in exactly the layout contributors use. Measured 2026-10-09 in
+# samcloud-services-wt/inflight-907.
+with tempfile.TemporaryDirectory() as t:
+    def wt_branch_loose(root):
+        common = root / "maingit"
+        (common / "refs" / "heads" / "feature").parent.mkdir(parents=True)
+        (common / "refs" / "heads" / "feature").write_text(OTHER + "\n")
+        wt = common / "worktrees" / "wt1"
+        wt.mkdir(parents=True)
+        (wt / "HEAD").write_text("ref: refs/heads/feature\n")
+        (wt / "commondir").write_text("../..\n")
+        (root / ".git").write_text(f"gitdir: {wt}\n")
+        return _read()
+    check(_in(t, wt_branch_loose) == OTHER,
+          "worktree on a branch -> ref resolved from commondir, not the gitdir")
+
+with tempfile.TemporaryDirectory() as t:
+    def wt_branch_packed(root):
+        common = root / "maingit"
+        common.mkdir()
+        (common / "packed-refs").write_text(
+            "# pack-refs with: peeled fully-peeled sorted \n"
+            f"{OTHER} refs/heads/feature\n")
+        wt = common / "worktrees" / "wt1"
+        wt.mkdir(parents=True)
+        (wt / "HEAD").write_text("ref: refs/heads/feature\n")
+        (wt / "commondir").write_text("../..\n")
+        (root / ".git").write_text(f"gitdir: {wt}\n")
+        return _read()
+    check(_in(t, wt_branch_packed) == OTHER,
+          "...and from the commondir's packed-refs when there is no loose file")
+
+with tempfile.TemporaryDirectory() as t:
+    def wt_branch_missing(root):
+        common = root / "maingit"
+        common.mkdir()
+        wt = common / "worktrees" / "wt1"
+        wt.mkdir(parents=True)
+        (wt / "HEAD").write_text("ref: refs/heads/gone\n")
+        (wt / "commondir").write_text("../..\n")
+        (root / ".git").write_text(f"gitdir: {wt}\n")
+        return _read()
+    check(_in(t, wt_branch_missing) is None,
+          "...and a ref in neither place is still None, not a guess")
+
+# A per-worktree ref must WIN over a same-named one in the common dir, which is
+# the order git resolves in. Getting this backwards would report another
+# worktree's commit as this process's own.
+with tempfile.TemporaryDirectory() as t:
+    def wt_local_wins(root):
+        common = root / "maingit"
+        (common / "refs" / "heads").mkdir(parents=True)
+        (common / "refs" / "heads" / "feature").write_text(SHA + "\n")
+        wt = common / "worktrees" / "wt1"
+        (wt / "refs" / "heads").mkdir(parents=True)
+        (wt / "refs" / "heads" / "feature").write_text(OTHER + "\n")
+        (wt / "HEAD").write_text("ref: refs/heads/feature\n")
+        (wt / "commondir").write_text("../..\n")
+        (root / ".git").write_text(f"gitdir: {wt}\n")
+        return _read()
+    check(_in(t, wt_local_wins) == OTHER,
+          "a per-worktree ref wins over the common dir's same-named ref")
+
 section("2. absent rather than guessed — every failure returns None")
 
 with tempfile.TemporaryDirectory() as t:

@@ -50,6 +50,8 @@ from . import capacity
 from . import config
 from . import prompt_size
 from .manager import (
+    backend_serves,
+    backend_is_exclusive,
     ModelManager, Backend, VLM_PORT, VLM_MODELS, hf_model_installed,
     match_vlm_model, match_gguf_model, match_exo_tier,
     WHISPER_MODELS, WHISPER_ALIASES, WHISPER_DEFAULT, match_whisper_model,
@@ -777,6 +779,12 @@ async def list_models_openai():
                 "created": now,
                 "owned_by": owned_by,
                 "status": status,
+                # #931. `owned_by` is the backend, and until now a consumer had
+                # to know that `mlx-whisper` cannot answer a chat and that `exo`
+                # is a mutex. Both are published rather than inferred; OpenAI
+                # SDKs ignore unknown fields, same as `status` and `memory_mb`.
+                "serves": backend_serves(owned_by),
+                "exclusive": backend_is_exclusive(owned_by),
             }
             if memory_mb is not None:
                 entry["memory_mb"] = memory_mb
@@ -1124,9 +1132,16 @@ def _pool_unavailable_503(e: Exception) -> HTTPException:
                 reason = pool["reason"]
                 note = pool.get("detail")
             offer = mgr.offering()
+            # FILTERED ON CAPABILITY, not just on "not the pool" (#931).
+            # This is a chat decline, and before this it offered both whisper
+            # models — `mlx-whisper` serves one route and cannot answer a chat
+            # at all. Two of eight suggestions could not serve the request type
+            # they were answering, which is worse than a list a caller picks
+            # from: `alternatives` is the gateway RECOMMENDING a substitute.
             alternatives = [
                 m["name"] for m in offer["resident"] + offer["loadable"]
                 if m.get("backend") != Backend.EXO.value
+                and "chat" in (m.get("serves") or [])
             ]
         except Exception as inner:
             # A decline must not fail. Losing the sharper reason costs a caller
@@ -1151,9 +1166,11 @@ def _pool_unavailable_503(e: Exception) -> HTTPException:
     if alternatives:
         detail["alternatives"] = alternatives
         detail["alternatives_note"] = (
-            "models this gateway can serve right now, offered as information: "
-            "nothing is substituted for the tier you asked for, so falling back "
-            "is your choice and needs a second request naming one of these"
+            "models this gateway can serve a CHAT with right now, offered as "
+            "information: nothing is substituted for the tier you asked for, so "
+            "falling back is your choice and needs a second request naming one "
+            "of these. Transcription-only models are excluded — they cannot "
+            "answer this request at all (#931)"
         )
     return HTTPException(status_code=503, detail=detail)
 

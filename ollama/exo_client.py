@@ -525,18 +525,48 @@ class ExoClient:
                                timeout=config.EXO_PLACEMENT_TIMEOUT_S)
         except Exception:
             return None
+        try:
+            body = r.json()
+        except Exception:
+            return None
         if r.status_code == 200:
-            try:
-                return bool(r.json())
-            except Exception:
-                return None
+            # A 200 IS NOT A YES. `placement_spec()` documents that exo answers
+            # some refusals as a 200 carrying `{"error": {...}}` or
+            # `{"detail": …}` -- the shape that had the guard POST 47 error
+            # bodies back as placements. Same endpoint, so the same shape
+            # arrives here, and `bool({"error": …})` is True: the view would
+            # record `placeable`, the offer would promise a placement is coming,
+            # and the wait would never end. So a 200 is True only for a body
+            # that is actually a spec, and anything else falls through to the
+            # refusal rule below rather than being believed.
+            if isinstance(body, dict) and body and "error" not in body and "detail" not in body:
+                return True
+            return self._refusal_verdict(body)
         if r.status_code == 400:
-            try:
-                msg = (r.json().get("error") or {}).get("message") or ""
-            except Exception:
-                return None
-            return False if "sufficient memory" in msg.lower() else None
+            return self._refusal_verdict(body)
         return None
+
+    @staticmethod
+    def _refusal_verdict(body) -> Optional[bool]:
+        """`False` for a capacity verdict, `None` for anything else.
+
+        Only ONE message is an answer. `No cycles found with sufficient memory`
+        says exo looked and there is no room; any other refusal is a question
+        asked wrong, a model it cannot find, or a shape we do not recognise --
+        none of which establishes that a placement is impossible. Returning
+        False for those would advertise `pool_unplaceable` on no evidence, which
+        is the mirror of the bug this exists to prevent.
+        """
+        msg = ""
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message") or ""
+            elif isinstance(err, str):
+                msg = err
+            if not msg and isinstance(body.get("detail"), str):
+                msg = body["detail"]
+        return False if "sufficient memory" in str(msg).lower() else None
 
     def resident_model(self) -> Optional[str]:
         """The model the pool is holding and ready to serve, or None.

@@ -204,6 +204,16 @@ def main():
          "400 `sufficient memory` -> False, a real capacity verdict"),
         (400, {"error": {"message": "unknown model_id"}}, None,
          "a DIFFERENT 400 -> None; we asked the question wrong"),
+        # A 200 IS NOT A YES. exo answers some refusals 200-with-an-error-body —
+        # the shape that had the placement guard POST 47 error bodies back as
+        # placements. `bool({"error": ...})` is True, so before this the probe
+        # advertised `placeable` and the offer promised a placement that was
+        # never coming, with no row in this matrix to catch it.
+        (200, {"error": {"message": "No cycles found with sufficient memory"}}, False,
+         "200 carrying a capacity refusal -> False, NOT True"),
+        (200, {"detail": "x"}, None,
+         "200 carrying a detail refusal -> None, NOT True"),
+        (200, [1, 2], None, "200 carrying a list -> None, not a truthy yes"),
         (503, {"detail": "nope"}, None, "503 -> None"),
         (200, None, None, "200 with an empty body -> None"),
     ]:

@@ -357,6 +357,14 @@ class ModelManager:
     # should be resident, cached because it changes about never and the watch
     # loop would otherwise hit the registry every poll. See `_pool_desired_model`.
     _pool_desired: Optional[tuple] = field(default=None, repr=False)
+    # Leases whose RELEASE failed: `{lease_id: (first_failed_monotonic, ttl_s)}`.
+    # A release that did not happen is not a release, and dropping the id makes
+    # it permanent -- see `_release_lease_quietly` (#938). The TTL is carried per
+    # entry because the give-up clock has to be THAT lease's own: every caller
+    # here releases a MODEL lease under LEASE_TTL (3600s), while the pool's
+    # bound is EXO_LEASE_MAX_TOTAL_S (1800s), and using the pool's number gave
+    # up at the half-way point of the window this exists to outlast.
+    _unreleased: dict = field(default_factory=dict, repr=False)
     # Trailing window of capacity readings, `(monotonic_ts, reading)`, oldest
     # first. The offer is computed over this rather than over one sample — see
     # `offer_reading`. Appended by every read, so it fills from ordinary
@@ -1826,13 +1834,80 @@ class ModelManager:
                 defaults.update(overrides)
         return defaults
 
-    def _release_lease_quietly(self, lease_id: Optional[str]):
+    def _release_lease_quietly(self, lease_id: Optional[str],
+                               ttl_seconds: Optional[int] = None):
+        """Release, and REMEMBER the id if it did not happen (#938).
+
+        A release that fails used to be logged and dropped, which makes the
+        failure permanent: the registry goes on accounting the memory for the
+        whole TTL while this process believes it let go. Measured 2026-10-09 on
+        slice -- `DELETE /leases/lease_40ceb8ea4112d095` answered **502** at
+        22:36:21Z, one second inside the 0.12.81 deploy's registry restart, and
+        the lease read `active` with 17,505 MB for a model that was unloaded
+        thirteen minutes later. `claude-services-slice/gpu-0` then showed TWO
+        active leases totalling 34,838 MB for one 18 GB model.
+
+        THE WINDOW IS ~1s AND THAT IS WHY IT NEEDS A RETRY RATHER THAN CARE.
+        Every deploy restarts the registry, so this recurs by design; the damage
+        is proportional to the lease TTL (3600s here) rather than to the outage.
+        The only other call caught in that same second was a periodic stats push,
+        which the next tick overwrote -- in a cutover, periodic calls self-heal
+        and one-shot state transitions orphan. This is a one-shot.
+        """
         if not lease_id:
             return
+        if self._release_lease_once(lease_id):
+            return
+        if lease_id not in self._unreleased:
+            ttl = ttl_seconds if ttl_seconds is not None else config.LEASE_TTL
+            self._unreleased[lease_id] = (time.monotonic(), ttl)
+            log.warning(f"Lease {lease_id} release failed; queued for retry "
+                        f"up to its {ttl}s TTL ({len(self._unreleased)} pending)")
+
+    def _release_lease_once(self, lease_id: str) -> bool:
+        """True when the lease is GONE -- released now, or already not there.
+
+        A 404 counts as success: the question is whether the registry still
+        accounts for it, and "no such lease" answers that. Treating 404 as a
+        failure would retry forever against a lease that cannot be released.
+        """
         try:
             self.sc.release_lease(lease_id)
+            log.info(f"Released lease {lease_id}")
+            return True
         except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 404:
+                log.info(f"Lease {lease_id} already gone (404) — nothing to release")
+                return True
             log.warning(f"Lease release error: {e}")
+            return False
+
+    def _retry_unreleased(self):
+        """Re-attempt the releases that failed. Called from the renewal loop.
+
+        GIVES UP AT THAT LEASE'S OWN TTL, deliberately. Past its TTL the lease has
+        expired on its own and the registry is no longer accounting for it, so a
+        further attempt is noise rather than repair -- and a queue that never
+        drains would grow for the life of the process. Dropping it is logged at
+        warning, because an entry reaching that age means every retry inside a
+        whole TTL failed, which is a different fault from the cutover this is for.
+        """
+        if not self._unreleased:
+            return
+        now = time.monotonic()
+        for lease_id, (first_failed, ttl) in list(self._unreleased.items()):
+            if self._release_lease_once(lease_id):
+                del self._unreleased[lease_id]
+                log.info(f"Lease {lease_id} released on retry after "
+                         f"{int(now - first_failed)}s")
+            elif now - first_failed > ttl:
+                del self._unreleased[lease_id]
+                log.warning(
+                    f"Giving up releasing {lease_id} after "
+                    f"{int(now - first_failed)}s — past its own {ttl}s TTL, so "
+                    f"the registry has expired it; every retry inside one TTL "
+                    f"failed")
 
     # -- Common operations --
 
@@ -2509,13 +2584,11 @@ class ModelManager:
             else:
                 self._kill_stray_vlm()
 
-        # Release lease
+        # Release lease. Through `_release_lease_quietly` so a failure is
+        # REMEMBERED rather than logged and dropped (#938) — `del self.models[...]`
+        # below is unconditional, so this is the last moment the id exists.
         if mm.lease_id:
-            try:
-                self.sc.release_lease(mm.lease_id)
-                log.info(f"Released lease {mm.lease_id}")
-            except Exception as e:
-                log.warning(f"Lease release error: {e}")
+            self._release_lease_quietly(mm.lease_id)
 
         del self.models[model_name]
         return {
@@ -2928,6 +3001,12 @@ class ModelManager:
                 self._renew_leases()
             except Exception as e:
                 log.warning(f"Lease renewal error: {e}")
+            # Same loop rather than a new task: it already wakes on the lease
+            # clock, which is the clock a stuck release cares about (#938).
+            try:
+                self._retry_unreleased()
+            except Exception as e:
+                log.warning(f"Unreleased-lease retry error: {e}")
 
     def _renew_leases(self):
         """Re-take MODEL leases to prevent expiry: ACQUIRE, then release.

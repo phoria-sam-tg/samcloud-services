@@ -87,6 +87,7 @@ python -m ollama.test_stream_deadlines   # Silence is bounded, elapsed time is n
 python -m ollama.test_route_bindings     # Every path resolves to its own handler (no network)
 python -m ollama.test_loaded_commit      # /status reports the commit it imported (no network)
 python -m ollama.test_in_flight         # A generation holds in_flight; cooldown cannot cut it (no network)
+python -m unittest -v ollama.test_ollama_finish_reason  # Output truncation survives both chat paths (no network)
 
 # Older tests, from inside ollama/ — these lease and load for real.
 cd ollama && python test_lifecycle.py   # Full lease cycle

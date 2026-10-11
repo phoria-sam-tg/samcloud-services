@@ -323,6 +323,21 @@ the deliberate exception: on startup the gateway re-applies the *instance's own*
 window, so a gateway restart cannot bounce a model mid-job to change a number.
 The configured window takes effect on the next real load.
 
+## Ollama completion reasons
+
+On `/v1/chat/completions`, both streamed and collected Ollama responses preserve
+native `done_reason: "length"` as OpenAI `finish_reason: "length"`. This means
+the output limit was reached, not that the answer or tool call is complete;
+`length` takes precedence even when tool-call content was emitted. Normal stops
+still return `stop`, or `tool_calls` when tools were emitted. Older responses
+without a reason retain that existing fallback.
+
+Clients must not treat an output-limit stop as a completed summary or action.
+Stock Hermes' compaction guard relies on this distinction. This does not certify
+summary quality, change output/context limits, or change the deadline error
+frames below. Offline route-level regression: `python -m unittest -v
+ollama.test_ollama_finish_reason`.
+
 ## Streaming deadlines
 
 **A timeout is only meaningful relative to every other timeout on the path, and

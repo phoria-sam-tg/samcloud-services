@@ -274,6 +274,56 @@ def main():
     check(len(warned) == 1 and "1.54x" in warned[0],
           f"warns once, on the gap that matters ({len(warned)} warning(s))")
 
+    # ---------------------------------------------------------------- #906
+    step(9, "A 413 says whether its count was exact (#906)")
+
+    check(prompt_size.is_exact("chat template"),
+          "the tokenizer path is exact")
+    check(prompt_size.is_exact("chat template (tools inline)"),
+          "and stays exact however the method string is extended")
+    for m in ("serialised", "estimate at 1.5 chars/token",
+              "unmeasured: body far over any possible limit", "", None):
+        check(not prompt_size.is_exact(m),
+              f"{m!r} is NOT exact — everything but the tokenizer guesses upward")
+
+    est = prompt_size.PromptTooLarge(
+        32000, 12288, "estimate at 1.5 chars/token", 8192,
+        "res", "some-model", 262144).as_dict()
+    exact = prompt_size.PromptTooLarge(
+        32000, 12288, "chat template", 8192,
+        "res", "some-model", 262144).as_dict()
+
+    check(est["count_is_exact"] is False,
+          "an estimated refusal says so STRUCTURALLY, not only in prose — a "
+          "caller should not have to parse `counted_with`")
+    check(exact["count_is_exact"] is True, "an exact refusal says so too")
+    check(isinstance(est["count_is_exact"], bool),
+          "and it is a bool, so it cannot be read as a token figure")
+
+    # The direction matters more than the magnitude: the limit is in REAL
+    # tokens (measured against peak host memory) while the figure compared to
+    # it is an estimate that over-counts, so the refusal errs toward refusing
+    # work the host could have done. A caller told only "too long" cannot know
+    # which way to act.
+    check("ESTIMATE" in est["message"],
+          "the message names it an estimate in words a human will see")
+    check("conservative" in est["message"] and "lower" in est["message"],
+          "and states the DIRECTION — the real count is lower, so the refusal "
+          "is conservative rather than possibly wrong either way")
+    check("real tokens" in est["message"],
+          "and that the LIMIT is in real tokens, which is the mismatch")
+    check("measure your own" in est["message"],
+          "and refuses to hand over a correction factor: the factor is a "
+          "property of the caller's content, not of this host (#906)")
+    check("2.61" not in est["message"] and "2.45" not in est["message"],
+          "specifically, NO measured factor is published — it was measured on "
+          "a different model's tokenizer and is not transferable")
+
+    check("ESTIMATE" not in exact["message"],
+          "and an exact refusal carries none of that caveat")
+    check(len(exact["message"]) < len(est["message"]),
+          "so the exact message stays short — the caveat is added, not always on")
+
     print(f"\n{'='*60}")
     if failures:
         print(f"  {len(failures)} FAILED:")

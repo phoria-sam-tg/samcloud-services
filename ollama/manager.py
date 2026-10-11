@@ -2526,16 +2526,41 @@ class ModelManager:
         Nothing here needs a lock: `in_flight` is mutated only from the event
         loop, and a load runs in a thread but never touches it.
         """
-        mm = self.models.get(model_name)
-        if mm is None:
+        if self.claim(model_name) is None:
             yield
             return
-        mm.in_flight += 1
         try:
             yield
         finally:
-            mm.in_flight -= 1
-            mm.last_used = time.time()
+            self.release(model_name)
+
+    def claim(self, model_name: str):
+        """Take an `in_flight` claim. Returns the model, or None if unknown.
+
+        Split out of `serving()` because a claim whose lifetime is a `with`
+        block cannot express the one case that matters: a blocking generation
+        running in a worker thread, where the awaiting coroutine can be
+        cancelled while the worker keeps using the model (#959, codex). That
+        caller needs to take and release at two points it chooses, and it must
+        be the SAME counter the cooldown reads — so it lives here rather than
+        being open-coded against `mm.in_flight` in the route.
+
+        CALL FROM THE EVENT LOOP ONLY, as `serving()` does: `in_flight` is a
+        read-modify-write and `check_cooldowns` reads it from the loop.
+        """
+        mm = self.models.get(model_name)
+        if mm is None:
+            return None
+        mm.in_flight += 1
+        return mm
+
+    def release(self, model_name: str) -> None:
+        """Drop a claim and re-stamp `last_used`. Loop only, as `claim`."""
+        mm = self.models.get(model_name)
+        if mm is None:
+            return
+        mm.in_flight -= 1
+        mm.last_used = time.time()
 
     def ensure_running(self, model_name: str) -> bool:
         """Check if an Ollama model is actually running. Reload if dropped."""

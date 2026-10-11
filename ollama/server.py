@@ -128,6 +128,36 @@ def _held_sync(model_name: str, gen):
             yield item
 
 
+async def _run_claimed(model_name: str, fn):
+    """Run blocking `fn` in a worker, claiming the model for the WORKER's life.
+
+    The claim cannot be a `with` block around the await. Cancelling an
+    `asyncio.to_thread` await does NOT stop the worker it started — so a caller
+    that disconnects mid-generation would unwind the `with`, drop `in_flight`
+    to zero, and leave the model reading idle while a thread was still driving
+    a generation through it. `check_cooldowns` would then be free to unload and
+    release the lease under live work, which is #907 reopened through a door
+    the fix for #959 opened. codex named this boundary before it shipped; it is
+    the one part of the offload that is not mechanical.
+
+    So: claim on the loop, start the work as a task, and release from a done
+    callback that fires when the WORKER finishes — whatever happened to
+    whoever was awaiting it. `shield` is what keeps the cancellation off the
+    task: the awaiting handler still raises `CancelledError` promptly, which is
+    correct, and the generation it paid for is still accounted for until it
+    actually ends.
+
+    `claim`/`release` rather than `mm.in_flight` directly, so the cooldown and
+    this read one counter. Both run on the loop: the callback is a loop
+    callback, which is what makes this safe without a lock.
+    """
+    claimed = mgr.claim(model_name) is not None
+    task = asyncio.ensure_future(asyncio.to_thread(fn))
+    if claimed:
+        task.add_done_callback(lambda _f: mgr.release(model_name))
+    return await asyncio.shield(task)
+
+
 def _read_loaded_commit() -> str | None:
     """The commit this process IMPORTED, read once at import. None if unknowable.
 
@@ -2023,9 +2053,8 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                         }
                 return content, calls, counts
 
-            with mgr.serving(mm.name):
-                full_content, tool_calls, usage = await asyncio.to_thread(
-                    _collect)
+            full_content, tool_calls, usage = await _run_claimed(
+                mm.name, _collect)
             message = {"role": "assistant", "content": full_content}
             if tool_calls:
                 message["tool_calls"] = _fix_tool_calls(tool_calls)
@@ -2491,9 +2520,9 @@ async def completions(req: CompletionRequest):
             # lease and unload the model mid-generation, and on the whole-box
             # measurement that cost 18 unloads in a day on the chat route
             # alone. Same bug, same fix, one route later.
-            with mgr.serving(mm.name):
-                chunks = await asyncio.to_thread(
-                    lambda: list(mgr.ollama.generate(mm.name, req.prompt)))
+            chunks = await _run_claimed(
+                mm.name,
+                lambda: list(mgr.ollama.generate(mm.name, req.prompt)))
             return chunks[-1] if chunks else {}
 
     elif mm.backend == Backend.LLAMA:

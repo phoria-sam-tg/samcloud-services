@@ -88,6 +88,11 @@ class FakeManager:
 
     # --- the real methods under test
     serving = mgr_mod.ModelManager.serving
+    # `serving` is these two now (#959): the worker-thread caller needs to take
+    # and release at points a `with` block cannot express, so the counter lives
+    # in one pair of methods and `serving` is the convenience over them.
+    claim = mgr_mod.ModelManager.claim
+    release = mgr_mod.ModelManager.release
     check_cooldowns = mgr_mod.ModelManager.check_cooldowns
     touch = mgr_mod.ModelManager.touch
 

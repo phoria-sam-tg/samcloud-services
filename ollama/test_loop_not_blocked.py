@@ -9,12 +9,16 @@ slice 2026-10-11 22:37Z with one `max_tokens:2` request in flight: four
 `/warm` and four `/health` probes, all `http=000` on a 6s timeout, from a
 process that had answered `/health` in 0.07s thirty seconds earlier.
 
-It presents as a dead service that cannot be restarted. uvicorn's SIGTERM
-handler is a loop callback too, so `kill -TERM` is a no-op for the length of
-the generation (measured: survived 120s, cleared by SIGKILL) and launchd's
-KeepAlive never fires. The registry meanwhile reads `online`, because the
-health reporter is also a loop task: it does not report a failure, it stops
-reporting at all.
+It presents as a service that is alive and cannot be reached, and it DELAYS
+its own restart: uvicorn's signal handler is a loop callback too, so a
+`kill -TERM` sent during a blocked generation is not processed while the
+generation runs. Measured: 24 `/health` probes over 120s all `http=000` with
+the process still up. It is a delay and not a veto — corrected from an earlier
+claim of mine that SIGTERM was a no-op cleared only by SIGKILL. Admin's read
+of the box shows the graceful shutdown ran at 22:41:34Z once the loop freed,
+and launchd's KeepAlive did bring the service back. The registry meanwhile
+reads `online` throughout, because the health reporter is a loop task as well:
+it does not report a failure, it stops reporting at all.
 
 WHY A TICK COUNT. The assertion cannot be "the handler returns quickly" — it
 must not, the generation is genuinely slow. What distinguishes a fix from the
@@ -86,17 +90,33 @@ class FakeMgr:
         self.models = {FakeModel.name: FakeModel()}
         self.claims = []             # (event, in_flight, thread name)
 
-    @contextmanager
-    def serving(self, name):
-        """Records WHERE it is entered, which is half the point of the fix."""
+    def claim(self, name):
+        """Records WHERE it is taken, which is half the point of the fix."""
         import threading
         self.claims.append(("enter", threading.current_thread().name))
-        self.models[name].in_flight += 1
+        mm = self.models.get(name)
+        if mm is None:
+            return None
+        mm.in_flight += 1
+        return mm
+
+    def release(self, name):
+        import threading
+        mm = self.models.get(name)
+        if mm is None:
+            return
+        mm.in_flight -= 1
+        self.claims.append(("exit", threading.current_thread().name))
+
+    @contextmanager
+    def serving(self, name):
+        if self.claim(name) is None:
+            yield
+            return
         try:
             yield
         finally:
-            self.models[name].in_flight -= 1
-            self.claims.append(("exit", threading.current_thread().name))
+            self.release(name)
 
 
 async def drive(req):
@@ -157,6 +177,63 @@ def main():
               f"both on the event loop's thread, not the worker ({threads})")
         check(fake.models[FakeModel.name].in_flight == 0,
               "and nothing is left claimed")
+    finally:
+        pass
+
+    # ---------------------------------------------------------------
+    # A cancelled caller must not make the model look idle (codex, #959).
+    #
+    # Cancelling an `asyncio.to_thread` await does not stop the worker. The
+    # first version of this fix scoped the claim to a `with` block around the
+    # await, so a client that hung up mid-generation dropped `in_flight` to 0
+    # while a thread was still driving the model — `check_cooldowns` would then
+    # be free to unload and release the lease under live work. That is #907
+    # reopened through the door #959's fix opened.
+    fake2 = FakeMgr()
+    server.mgr = fake2
+
+    async def _resolve2(name):
+        return fake2.models[FakeModel.name]
+    server._resolve_model = _resolve2
+    try:
+        req2 = server.ChatRequest(
+            model="qwen3.8:27b-mlx",
+            messages=[{"role": "user", "content": "say OK"}],
+            max_tokens=2, stream=False,
+        )
+
+        async def cancel_midway():
+            task = asyncio.create_task(server.chat_completions(req2))
+            await asyncio.sleep(BLOCK_S / 5)          # worker is running
+            task.cancel()
+            t0 = time.monotonic()
+            try:
+                await task
+                raised = "nothing"
+            except asyncio.CancelledError:
+                raised = "CancelledError"
+            unwind = time.monotonic() - t0
+            during = fake2.models[FakeModel.name].in_flight
+            # Now let the worker actually finish.
+            await asyncio.sleep(BLOCK_S * 1.5)
+            return raised, unwind, during, fake2.models[FakeModel.name].in_flight
+
+        raised, unwind, during, after = asyncio.run(cancel_midway())
+        print(f"  cancelled caller: raised {raised} in {unwind:.3f}s, "
+              f"in_flight during={during} after={after}")
+        check(raised == "CancelledError",
+              "the handler still cancels promptly for the caller")
+        check(unwind < BLOCK_S / 2,
+              f"and does not wait out the worker to do it ({unwind:.3f}s)")
+        check(during == 1,
+              f"the claim SURVIVES the cancellation while the worker runs "
+              f"(in_flight={during})")
+        check(after == 0,
+              f"and is released when the worker actually ends "
+              f"(in_flight={after})")
+        threads = {t for _, t in fake2.claims}
+        check(threads == {"MainThread"},
+              f"both ends still on the loop's thread ({threads})")
     finally:
         server.mgr, server._resolve_model = real_mgr, real_resolve
         prompt_size.count = real_count

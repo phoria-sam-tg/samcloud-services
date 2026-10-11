@@ -806,6 +806,29 @@ class ModelManager:
                 "memory_mb": mm.memory_mb,
                 "idle_seconds": int(now - mm.last_used),
                 "request_count": mm.request_count,
+                # Generations open on this model RIGHT NOW (#959), because the
+                # two fields above CANNOT answer "can this backend serve me"
+                # and read reassuring when the answer is no. `touch()` stamps
+                # `last_used` and counts the request BEFORE the work, so a
+                # model mid-prefill looks progressively MORE idle with a frozen
+                # count. Measured on slice 2026-10-10: claude-containers read
+                # `idle_seconds` 959 -> 1147 across 3 minutes of real time with
+                # `request_count` pinned at 83, while the runner held 99% of a
+                # core and a 2-token completion timed out at 10.1s. Both
+                # numbers were correct and the pair was misleading.
+                #
+                # The gateway already knew: `serving()` holds this for the
+                # cooldown's sake (#907). Only the offer was silent. A consumer
+                # deciding where to route reads `in_flight` beside
+                # `idle_seconds` and can tell "idle 1147s because nothing came"
+                # from "busy for 1147s", which is the whole question.
+                #
+                # NOT a health verdict, and deliberately not one: it counts
+                # what WE dispatched, so it is blind to another tenant of the
+                # same runner for the same reason `foreign_mb` is (#861). A
+                # caller that needs "is this thing alive" still has to send a
+                # bounded completion — see the probe note on #959.
+                "in_flight": mm.in_flight,
                 # What this instance is serving RIGHT NOW, so a consumer sizes
                 # against the window it will actually get rather than one we
                 # declared (#903). None means we could not read it, which is

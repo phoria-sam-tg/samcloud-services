@@ -452,6 +452,38 @@ def main():
         check(o["loadable"] == [],
               f"so the offer stays withdrawn ({[m['name'] for m in o['loadable']]})")
 
+    step(17, "the offer says whether a resident model is BUSY (#959)")
+    # `idle_seconds` and `request_count` are both stamped before the work, so
+    # on their own they read reassuring while a generation is grinding:
+    # measured on slice 2026-10-10, idle_seconds 959 -> 1147 across 3 minutes
+    # with request_count frozen at 83, a core at 99% and a 2-token completion
+    # timing out. Nothing in the payload could tell a consumer which it was.
+    with Fixture() as f:
+        now = time.time()
+        f.mgr.models["a"] = ManagedModel(
+            name="a", backend=Backend.OLLAMA, memory_mb=3000,
+            lease_id=None, port=11434, loaded_at=now, last_used=now - 1147)
+        res = {m["name"]: m for m in f.mgr.offering()["resident"]}
+        print(f"  idle -> idle_seconds={res['a']['idle_seconds']} "
+              f"in_flight={res['a']['in_flight']}")
+        check(res["a"]["in_flight"] == 0, "nothing in flight reads 0")
+        # The discriminator: the SAME stale last_used, one generation open.
+        with f.mgr.serving("a"):
+            res = {m["name"]: m for m in f.mgr.offering()["resident"]}
+            print(f"  busy -> idle_seconds={res['a']['idle_seconds']} "
+                  f"in_flight={res['a']['in_flight']}")
+            check(res["a"]["in_flight"] == 1,
+                  "a generation in flight reads 1")
+            check(res["a"]["idle_seconds"] > 1000,
+                  f"while idle_seconds still climbs "
+                  f"({res['a']['idle_seconds']}) — which is why the pair "
+                  f"needed a third field, not a correction")
+        res = {m["name"]: m for m in f.mgr.offering()["resident"]}
+        check(res["a"]["in_flight"] == 0, "released when the generation ends")
+        check(res["a"]["idle_seconds"] < 5,
+              f"and last_used is re-stamped at release "
+              f"({res['a']['idle_seconds']}s)")
+
     print(f"\n{'='*60}")
     print(f"  {checks} checks run")
     if failures:

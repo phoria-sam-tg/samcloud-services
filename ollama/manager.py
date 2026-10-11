@@ -62,6 +62,57 @@ class Backend(str, Enum):
     # generation and proxies. See exo_client.py.
     EXO = "exo"
 
+
+# WHAT EACH BACKEND CAN BE ASKED FOR, as data rather than as a comment (#931).
+#
+# The facts were already written down -- the enum above says whisper "serves ONE
+# route and cannot answer a chat", and that exo is held under an exclusive lease
+# -- but they were published nowhere, so every consumer had to hardcode them
+# from the backend string. Two did not, and read `/warm`'s entries as chat
+# candidates: both whisper models were offered as alternatives to a chat
+# completion, on the one surface that is a RECOMMENDATION rather than a list.
+#
+# ONE TABLE, because the alternative is the failure this repo just paid for
+# twice: when two places encode the same rule they drift, and the second is a
+# copy of the first's assumptions. Every surface that lists or recommends reads
+# from here.
+BACKEND_SERVES = {
+    Backend.OLLAMA: ("chat",),
+    Backend.LLAMA: ("chat",),
+    Backend.VLM: ("chat", "vision"),
+    Backend.WHISPER: ("transcription",),
+    Backend.EXO: ("chat",),
+}
+
+# Backends whose model is held under an EXCLUSIVE claim, so taking it stops
+# every other caller rather than sharing the box. Published because a chooser
+# cannot see it: `think` sorts first under any `memory_mb or 0` fallback (its
+# size is absent, and 0 when resident), so "pick the smallest" reaches for the
+# one mutex on the box. Naming it is what both near-misses needed.
+BACKEND_EXCLUSIVE = {Backend.EXO}
+
+
+def backend_serves(backend) -> list:
+    """What `backend` can be asked for. Unknown backends serve nothing.
+
+    An unrecognised backend returns `[]` rather than assuming chat: a consumer
+    filtering on "chat" then skips it, which is the safe direction. Guessing
+    chat for something we do not recognise is how an unservable entry gets
+    recommended, which is the bug.
+    """
+    try:
+        return list(BACKEND_SERVES.get(Backend(backend), ()))
+    except Exception:
+        return []
+
+
+def backend_is_exclusive(backend) -> bool:
+    """True when taking this backend's model excludes every other caller."""
+    try:
+        return Backend(backend) in BACKEND_EXCLUSIVE
+    except Exception:
+        return False
+
 VLM_PORT = config.VLM_PORT
 VLM_HOST = config.VLM_HOST
 VLM_PYTHON = config.VLM_PYTHON
@@ -761,6 +812,11 @@ class ModelManager:
                 # not the same as "no limit" — a caller must not take it as
                 # permission to send an unbounded prompt.
                 "context_length": mm.context_length,
+                # #931: what it can be asked for, and whether taking it
+                # excludes everyone. Both were knowable only by hardcoding the
+                # backend string.
+                "serves": backend_serves(mm.backend),
+                "exclusive": backend_is_exclusive(mm.backend),
             }
             for name, mm in self.models.items()
             if mm.backend != Backend.EXO
@@ -814,7 +870,9 @@ class ModelManager:
         for name, (backend, need) in sorted(
             candidates.items(), key=lambda kv: kv[1][1], reverse=True
         ):
-            entry = {"name": name, "backend": backend, "need_mb": need}
+            entry = {"name": name, "backend": backend, "need_mb": need,
+                     "serves": backend_serves(backend),
+                     "exclusive": backend_is_exclusive(backend)}
             if name in prospective_ctx:
                 entry["context_length"] = prospective_ctx[name]
             if working:
@@ -995,7 +1053,13 @@ class ModelManager:
         tier = config.EXO_TIERS[0] if config.EXO_TIERS else None
         if not tier:
             return None
-        entry = {"name": tier, "backend": Backend.EXO.value}
+        entry = {"name": tier, "backend": Backend.EXO.value,
+                 # #931: the tier is the one EXCLUSIVE thing on the box, and a
+                 # chooser cannot see that — its size is absent here and 0 on
+                 # `/warm`, so it sorts first under any `memory_mb or 0`
+                 # fallback and "pick the smallest" reaches for the mutex.
+                 "serves": backend_serves(Backend.EXO),
+                 "exclusive": True}
         view = self._pool_view
         age = None if view is None else time.monotonic() - view[0]
         if view is None or age > config.EXO_POOL_VIEW_MAX_AGE_S:

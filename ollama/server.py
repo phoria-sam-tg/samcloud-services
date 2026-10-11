@@ -1075,8 +1075,8 @@ def _prompt_too_large_413(e: "prompt_size.PromptTooLarge") -> HTTPException:
     a 100k-token prompt safe.
     """
     log.warning(
-        f"Refused a prompt for the pool: {e.tokens} tokens by {e.method}, "
-        f"limit {e.limit} (#837)"
+        f"Refused a prompt for {e.resource_id}: {e.tokens} tokens by "
+        f"{e.method}, limit {e.limit}"
     )
     return HTTPException(status_code=413, detail=e.as_dict())
 
@@ -1921,6 +1921,42 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
         except Exception as e:
             log.warning(f"Could not size the prompt for {mm.name} ({e}); the "
                         f"first-token deadline will not be armed")
+
+        # The backstop (#959). Armed only when OLLAMA_MAX_PROMPT_TOKENS is set;
+        # `config` carries why it defaults off and what to arm it with.
+        #
+        # HERE, which is the load-bearing part: after the count and BEFORE the
+        # backend is touched. A refusal has to cost nothing — the whole point is
+        # that a prompt this host cannot prefill cheaply should not occupy the
+        # one exclusive slot to find that out. Same placement and same reasoning
+        # as the pool's #837 gate, which refuses before taking a lease.
+        #
+        # `n_prompt is None` means the count degraded entirely, and then this
+        # does NOT refuse: the count is explicitly allowed to fail (see above),
+        # and turning a counting failure into a 413 would refuse real traffic
+        # for a reason that has nothing to do with its size.
+        if config.OLLAMA_MAX_PROMPT_TOKENS and n_prompt is not None:
+            if n_prompt > config.OLLAMA_MAX_PROMPT_TOKENS:
+                raise _prompt_too_large_413(prompt_size.PromptTooLarge(
+                    n_prompt, config.OLLAMA_MAX_PROMPT_TOKENS, how,
+                    req.max_tokens or 0, config.SC_RESOURCE_ID, mm.name,
+                    mm.context_length,
+                    note=(
+                        "THIS LIMIT PROTECTS ONE EXCLUSIVE INFERENCE SLOT, NOT "
+                        "THE MODEL'S CONTEXT WINDOW. "
+                        f"{mm.name} advertises a "
+                        f"{mm.context_length or 'much larger'}-token context "
+                        "and this host will serve it — slowly, and alone. "
+                        "Prefill here is bimodal on the runner's prefix cache: "
+                        "a prompt that matches the cached prefix costs seconds, "
+                        "one that does not prefills at ~90 tok/s and no other "
+                        "caller is served for the duration. A bigger-window "
+                        "model would not help. A shorter prompt will, and so "
+                        "will one that EXTENDS the previous turn rather than "
+                        "rewriting its head — a rewrite near the head throws "
+                        "the whole cached prefix away and costs full price."
+                    ),
+                ))
 
         if req.stream:
             async def stream():

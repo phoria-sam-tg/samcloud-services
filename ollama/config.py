@@ -1168,6 +1168,39 @@ EXO_MAX_TOKENS = _env_int("EXO_MAX_TOKENS", 8192)
 # of 47 layers with 36 GB total, and was measured at 14.0 GB available with
 # 17.0 of 18.4 GB of swap already in use while this ran. A limit sized only off
 # slice is not automatically safe for wafer.
+# The same question for the LOCAL ollama path, and the answer is a different
+# shape because the failure is (#959).
+#
+# WHY IT EXISTS. Prefill on this box is bimodal on the runner's prefix cache,
+# not on prompt size: measured 2026-10-12, a 43,281-token prompt that MATCHED
+# its cached prefix prefilled in 1.6s, and a 57,308-token prompt that matched
+# only 427 tokens took 644.7s. Uncached prefill is ~90 tok/s (90.6 and 88.9 on
+# two days; 97.3 sustained off the runner's progress lines), and the slot is
+# exclusive — one caller's miss put 745s of queue in front of another's turn,
+# 97% of that request's wall. So the cost to protect against is a full
+# uncached prefill, and its size is the prompt.
+#
+# WHY IT DEFAULTS OFF, unlike the pool's limit above. The pool's ceiling guards
+# a host that a large prompt can PANIC (#837), so refusing is strictly better
+# than trying. Here the box degrades instead: it serves the prompt, slowly, and
+# makes everyone queue. A gate that refuses traffic the seats legitimately send
+# is worse than no gate — so this arms only when a compression cap is agreed on
+# the caller side and this can sit above it as a backstop.
+#
+# THE NUMBER TO ARM IT WITH, when that lands: ~1.33x the agreed cap, so normal
+# traffic never reaches it. Against the 27,000 cap recommended to
+# claude-containers on #959, that is 36,000. Two reasons it is a backstop and
+# not the policy: a caller-side record can drift (a 70,000 cap sat in one for
+# two days), and a hand-placed config in a volume does not declare itself at
+# all — neither can be fixed from here, and both arrive as a prompt.
+#
+# IT ALSO HAS TO ACCOMMODATE A GATEWAY SWITCH. Moving a live seat between
+# gateways is itself one full uncached prefill on the destination
+# (claude-containers, #959): the warm prefix stays on the box the conversation
+# left. A seat arriving under a 27,000 cap lands at or below it, so 36,000
+# accepts a failover; a gate set tight against the cap would refuse one.
+OLLAMA_MAX_PROMPT_TOKENS = max(0, _env_int("OLLAMA_MAX_PROMPT_TOKENS", 0))
+
 EXO_MAX_PROMPT_TOKENS = _env_int("EXO_MAX_PROMPT_TOKENS", 12288)
 
 # Where to find the resident model's own `tokenizer.json`, so the prompt is

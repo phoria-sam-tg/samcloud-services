@@ -160,6 +160,108 @@ def main():
     finally:
         server.mgr, server._resolve_model = real_mgr, real_resolve
 
+    step(9, "the ollama backstop: off by default, refuses before the slot (#959)")
+    # The local path's version of this gate, and it differs in two ways that
+    # matter. It defaults OFF — the pool's limit guards a host a big prompt can
+    # panic, while this box merely degrades, so a gate refusing legitimate
+    # traffic would be worse than none. And when armed it has to refuse before
+    # the runner is touched, because the thing being protected is one exclusive
+    # inference slot: a 57,308-token prompt that misses the prefix cache holds
+    # it for 644.7s at ~90 tok/s, which was measured putting 745s of queue in
+    # front of another seat's turn.
+    chats = {"n": 0}
+
+    class SpyOllama:
+        """Records whether the runner was reached, and answers if it was.
+
+        It must NOT raise on being called: an exception inside the route
+        propagates through TestClient and aborts the run before any check
+        prints, which turns "the gate let it through" into a crash rather than
+        a failed assertion. Counting is the assertion.
+        """
+
+        def chat(self, *a, **k):
+            chats["n"] += 1
+            return iter([{"message": {"content": "ok"}, "done": True,
+                          "prompt_eval_count": 1, "eval_count": 1}])
+
+    class SpyOllamaManager:
+        ollama = SpyOllama()
+        models = {}
+
+        def claim(self, name):
+            return None
+
+        def release(self, name):
+            pass
+
+    class StubOllamaModel:
+        backend = Backend.OLLAMA
+        name = MODEL
+        context_length = 262144
+
+    real_mgr, real_resolve = server.mgr, server._resolve_model
+    real_limit = config.OLLAMA_MAX_PROMPT_TOKENS
+    server.mgr = SpyOllamaManager()
+
+    async def stub_resolve_ollama(model_name):
+        return StubOllamaModel()
+
+    server._resolve_model = stub_resolve_ollama
+    try:
+        client = TestClient(server.app)
+        big = [{"role": "user", "content": words(40000)}]
+
+        # Off by default: the same prompt that will be refused below is passed
+        # straight through to the backend. The spy raising IS the assertion —
+        # it proves the gate did not intercept.
+        config.OLLAMA_MAX_PROMPT_TOKENS = 0
+        r = client.post("/v1/chat/completions",
+                        json={"model": MODEL, "messages": big, "max_tokens": 16})
+        check(r.status_code != 413,
+              f"unset -> no refusal ({r.status_code}); the knob is opt-in")
+        check(chats["n"] == 1,
+              f"and the request did reach the backend ({chats['n']} calls)")
+
+        # Armed, at the backstop value recommended on #959.
+        chats["n"] = 0
+        config.OLLAMA_MAX_PROMPT_TOKENS = 36000
+        r = client.post("/v1/chat/completions",
+                        json={"model": MODEL, "messages": big, "max_tokens": 16})
+        check(r.status_code == 413, f"armed -> HTTP 413 (got {r.status_code})")
+        detail = (r.json() or {}).get("detail", {})
+        check(detail.get("error") == "prompt_too_large",
+              f"same error code as the pool's gate ({detail.get('error')})")
+        check(detail.get("limit_tokens") == 36000,
+              f"the limit is readable by the client ({detail.get('limit_tokens')})")
+        check(detail.get("model_context_length") == 262144,
+              f"and it names the model's real window, so the obvious wrong move "
+              f"— go find a longer-context model — is closed off "
+              f"({detail.get('model_context_length')})")
+        note = detail.get("note", "")
+        check("EXCLUSIVE INFERENCE SLOT" in note,
+              "the note describes THIS host's constraint, the single slot")
+        check("exo" not in note and "panic" not in note,
+              "and not the pool's kernel panic, which did not happen here")
+        check("EXTENDS the previous turn" in note,
+              "and it names the cheap shape, not just the expensive one")
+        check(chats["n"] == 0,
+              f"THE POINT: the runner was never touched ({chats['n']} calls) — "
+              f"a refusal that had to occupy the slot to say no would cost the "
+              f"very thing it protects")
+
+        # Under the limit, armed, still passes.
+        chats["n"] = 0
+        r = client.post("/v1/chat/completions", json={
+            "model": MODEL, "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 16})
+        check(r.status_code != 413,
+              f"a small prompt is unaffected while armed ({r.status_code})")
+        check(chats["n"] == 1, "and reaches the backend")
+    finally:
+        server.mgr, server._resolve_model = real_mgr, real_resolve
+        config.OLLAMA_MAX_PROMPT_TOKENS = real_limit
+
     step(4, "tool definitions count toward the limit")
     tiny = [{"role": "user", "content": "hi"}]
     fat_tools = [{

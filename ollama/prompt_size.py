@@ -76,7 +76,8 @@ class PromptTooLarge(Exception):
     """
 
     def __init__(self, tokens: int, limit: int, method: str, completion_budget: int,
-                 resource_id: str, model: str, context_length: Optional[int] = None):
+                 resource_id: str, model: str, context_length: Optional[int] = None,
+                 note: Optional[str] = None):
         self.tokens = tokens
         self.limit = limit
         self.method = method
@@ -84,6 +85,13 @@ class PromptTooLarge(Exception):
         self.resource_id = resource_id
         self.model = model
         self.context_length = context_length
+        # Why the limit exists, in the words of the path that raised. The
+        # default below is the pool's, and it is specific: a kernel panic on
+        # two named machines. Reused unchanged on the local path it would tell
+        # a caller refused by THIS box about exo and a panic that did not
+        # happen here — a refusal that misdescribes its own cause sends the
+        # reader to fix the wrong thing (#959).
+        self.note = note
         super().__init__(
             f"prompt is {tokens} tokens ({method}), over this host's limit of {limit} "
             f"(a {completion_budget}-token answer would be added to the same cache)"
@@ -108,7 +116,7 @@ class PromptTooLarge(Exception):
             # The note is part of the contract, not decoration: a caller that reads
             # only "too long" will go looking for a longer-context model, and there
             # is one — this same model, which advertises 202,752 tokens.
-            "note": (
+            "note": self.note or (
                 "THIS LIMIT PROTECTS THE HOST, NOT THE MODEL'S CONTEXT WINDOW. "
                 f"{self.model} advertises a "
                 f"{self.context_length or 'much larger'}-token context and exo will "

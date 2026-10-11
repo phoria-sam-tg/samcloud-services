@@ -108,10 +108,20 @@ async def _held_async(model_name: str, gen):
 
 
 def _held_sync(model_name: str, gen):
-    """`_held_async` for the blocking collection loop. Same claim, same reason.
+    """`_held_async` for a blocking collection loop. NO PRODUCTION CALLER.
 
-    The non-streaming path blocks for the generation's whole length — up to
-    549s of measured prefill on this box, well past COOLDOWN_SECONDS.
+    DO NOT reach for this from a coroutine. It was the non-streaming chat
+    route's claim until #959, where the problem turned out to be the iteration
+    itself: a blocking generator driven from an `async def` handler runs the
+    whole generation on the event loop, and every other route — `/health`
+    included — goes dark for its length. Measured: 8 probes, all `http=000`,
+    while one `max_tokens:2` request ran. That route now claims on the loop and
+    iterates in a thread; see it for the full reasoning.
+
+    Kept, rather than deleted, for the shape it still describes correctly: a
+    caller already running OFF the loop (a threadpool route, a worker) that
+    needs the same claim. `test_in_flight` holds it to that. Adding a caller
+    back on the loop is the bug, not the helper.
     """
     with mgr.serving(model_name):
         for item in gen:
@@ -1964,25 +1974,58 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
             return StreamingResponse(_held_async(mm.name, stream()),
                                      media_type="text/event-stream")
         else:
-            # Non-streaming: collect full response via native API
-            full_content = ""
-            tool_calls = None
-            usage = {}
-            for chunk in _held_sync(
-                    mm.name,
-                    mgr.ollama.chat(mm.name, ollama_messages, **ollama_kwargs)):
-                if "message" in chunk:
-                    full_content += chunk["message"].get("content", "")
-                    if chunk["message"].get("tool_calls"):
-                        tool_calls = chunk["message"]["tool_calls"]
-                if chunk.get("done"):
-                    _log_ollama_timings(mm.name, chunk, n_prompt)
-                    usage = {
-                        "prompt_tokens": chunk.get("prompt_eval_count", 0),
-                        "completion_tokens": chunk.get("eval_count", 0),
-                        "total_tokens": (chunk.get("prompt_eval_count", 0) +
-                                         chunk.get("eval_count", 0)),
-                    }
+            # Non-streaming: collect the whole reply IN A THREAD (#959).
+            #
+            # `OllamaClient.chat` is a BLOCKING generator and this handler is
+            # `async def`, so iterating it here ran the entire generation on the
+            # event loop. One non-streaming request therefore took the whole
+            # gateway dark for its full length — not just itself. Every route
+            # went with it, `/health` included, because there was no loop left
+            # to answer them on.
+            #
+            # MEASURED, deliberately, on slice 2026-10-11 22:37Z. One request
+            # with `stream:false` and `max_tokens:2`, then eight probes over
+            # 30s while it ran:
+            #
+            #     GET /warm    x4   http=000  (6s timeout, each)
+            #     GET /health  x4   http=000  (6s timeout, each)
+            #
+            # `/health` returns a four-key dict and touches no backend; 30s
+            # earlier it answered in 0.07s. That is what identifies this as the
+            # loop and not the backend. It is also exactly the shape
+            # claude-containers reported an hour before — "socket accepted, no
+            # reply, process at 0.0% CPU, nothing restarts it because it never
+            # exits" — and why the registry still read `online` throughout: the
+            # process was healthy and unable to speak.
+            #
+            # THE CLAIM STAYS ON THE LOOP. `serving()` is entered and exited
+            # here rather than inside the thread, because its docstring rests on
+            # `in_flight` being mutated from the event loop alone — a
+            # read-modify-write from a worker thread races `check_cooldowns`,
+            # which is #907's unload-under-a-live-request in a form a test would
+            # almost never catch. So the claim spans the await; only the
+            # iteration moves. This is why `_held_sync` is not used here.
+            def _collect():
+                content, calls, counts = "", None, {}
+                for chunk in mgr.ollama.chat(
+                        mm.name, ollama_messages, **ollama_kwargs):
+                    if "message" in chunk:
+                        content += chunk["message"].get("content", "")
+                        if chunk["message"].get("tool_calls"):
+                            calls = chunk["message"]["tool_calls"]
+                    if chunk.get("done"):
+                        _log_ollama_timings(mm.name, chunk, n_prompt)
+                        counts = {
+                            "prompt_tokens": chunk.get("prompt_eval_count", 0),
+                            "completion_tokens": chunk.get("eval_count", 0),
+                            "total_tokens": (chunk.get("prompt_eval_count", 0) +
+                                             chunk.get("eval_count", 0)),
+                        }
+                return content, calls, counts
+
+            with mgr.serving(mm.name):
+                full_content, tool_calls, usage = await asyncio.to_thread(
+                    _collect)
             message = {"role": "assistant", "content": full_content}
             if tool_calls:
                 message["tool_calls"] = _fix_tool_calls(tool_calls)
@@ -2438,7 +2481,19 @@ async def completions(req: CompletionRequest):
                     yield json.dumps(chunk) + "\n"
             return StreamingResponse(stream(), media_type="application/x-ndjson")
         else:
-            chunks = list(mgr.ollama.generate(mm.name, req.prompt))
+            # In a thread, for the reason the chat route carries in full
+            # (#959): `generate` blocks, this handler is `async def`, and
+            # iterating it here took every other route down with it.
+            #
+            # The `serving()` claim is NEW on this route, not moved. This path
+            # never held `in_flight` at all, so #907's unload-under-a-live
+            # request was still open here — `check_cooldowns` could release the
+            # lease and unload the model mid-generation, and on the whole-box
+            # measurement that cost 18 unloads in a day on the chat route
+            # alone. Same bug, same fix, one route later.
+            with mgr.serving(mm.name):
+                chunks = await asyncio.to_thread(
+                    lambda: list(mgr.ollama.generate(mm.name, req.prompt)))
             return chunks[-1] if chunks else {}
 
     elif mm.backend == Backend.LLAMA:

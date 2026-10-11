@@ -806,6 +806,29 @@ class ModelManager:
                 "memory_mb": mm.memory_mb,
                 "idle_seconds": int(now - mm.last_used),
                 "request_count": mm.request_count,
+                # Generations open on this model RIGHT NOW (#959), because the
+                # two fields above CANNOT answer "can this backend serve me"
+                # and read reassuring when the answer is no. `touch()` stamps
+                # `last_used` and counts the request BEFORE the work, so a
+                # model mid-prefill looks progressively MORE idle with a frozen
+                # count. Measured on slice 2026-10-10: claude-containers read
+                # `idle_seconds` 959 -> 1147 across 3 minutes of real time with
+                # `request_count` pinned at 83, while the runner held 99% of a
+                # core and a 2-token completion timed out at 10.1s. Both
+                # numbers were correct and the pair was misleading.
+                #
+                # The gateway already knew: `serving()` holds this for the
+                # cooldown's sake (#907). Only the offer was silent. A consumer
+                # deciding where to route reads `in_flight` beside
+                # `idle_seconds` and can tell "idle 1147s because nothing came"
+                # from "busy for 1147s", which is the whole question.
+                #
+                # NOT a health verdict, and deliberately not one: it counts
+                # what WE dispatched, so it is blind to another tenant of the
+                # same runner for the same reason `foreign_mb` is (#861). A
+                # caller that needs "is this thing alive" still has to send a
+                # bounded completion — see the probe note on #959.
+                "in_flight": mm.in_flight,
                 # What this instance is serving RIGHT NOW, so a consumer sizes
                 # against the window it will actually get rather than one we
                 # declared (#903). None means we could not read it, which is
@@ -2503,16 +2526,41 @@ class ModelManager:
         Nothing here needs a lock: `in_flight` is mutated only from the event
         loop, and a load runs in a thread but never touches it.
         """
-        mm = self.models.get(model_name)
-        if mm is None:
+        if self.claim(model_name) is None:
             yield
             return
-        mm.in_flight += 1
         try:
             yield
         finally:
-            mm.in_flight -= 1
-            mm.last_used = time.time()
+            self.release(model_name)
+
+    def claim(self, model_name: str):
+        """Take an `in_flight` claim. Returns the model, or None if unknown.
+
+        Split out of `serving()` because a claim whose lifetime is a `with`
+        block cannot express the one case that matters: a blocking generation
+        running in a worker thread, where the awaiting coroutine can be
+        cancelled while the worker keeps using the model (#959, codex). That
+        caller needs to take and release at two points it chooses, and it must
+        be the SAME counter the cooldown reads — so it lives here rather than
+        being open-coded against `mm.in_flight` in the route.
+
+        CALL FROM THE EVENT LOOP ONLY, as `serving()` does: `in_flight` is a
+        read-modify-write and `check_cooldowns` reads it from the loop.
+        """
+        mm = self.models.get(model_name)
+        if mm is None:
+            return None
+        mm.in_flight += 1
+        return mm
+
+    def release(self, model_name: str) -> None:
+        """Drop a claim and re-stamp `last_used`. Loop only, as `claim`."""
+        mm = self.models.get(model_name)
+        if mm is None:
+            return
+        mm.in_flight -= 1
+        mm.last_used = time.time()
 
     def ensure_running(self, model_name: str) -> bool:
         """Check if an Ollama model is actually running. Reload if dropped."""

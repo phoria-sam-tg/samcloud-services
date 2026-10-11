@@ -7,6 +7,21 @@ registry actually returns (captured 2026-09-20), not against the shapes the
 API index documents — the two differ, and that difference is the point.
 
 Run: cd ollama && python test_exo_lease.py
+
+THIS SUITE DEPENDS ON THE httpx VERSION, and until 2026-10-12 it did not say
+so. The streaming cases below feed `data: …` frames through `chat_collect` and
+`chat_stream`, so what they assert is partly how httpx splits an SSE body into
+lines -- behaviour that changed between 0.23 and 0.24. Run under httpx 0.23.3
+(python 3.10, no venv, `-I` against the interpreter's site-packages) it produced
+**three opaque assertion failures**, which read as "the tree is broken on main"
+rather than "this environment is below the floor the repo declares". Two of us
+then held different beliefs about whether main was green for twenty minutes.
+
+`requirements.txt` already carried the answer -- `httpx>=0.24.0` -- so the floor
+is not a new fact, it was simply not checked where it mattered. The preflight
+below reads that file rather than hardcoding the number, so there is one
+statement of it and this cannot drift from the install the service actually
+gets (`samclaude-admin`, #801).
 """
 
 import contextlib
@@ -28,6 +43,69 @@ import ollama.manager as _mgr_mod                            # noqa: E402
 import ollama.manager as manager_mod                          # noqa: E402
 _mgr_mod.EXO_WEDGE_RECHECK_S = 0.01
 from ollama.samcloud import SamcloudClient                  # noqa: E402
+
+
+def _httpx_floor_from_requirements():
+    """The `httpx>=X` floor the repo declares, or None if it declares none.
+
+    Read rather than hardcoded: duplicating the number is how the check and the
+    install drift apart, which is the same failure this repo paid for in
+    `placement_available` vs `placement_spec` -- two places encoding one rule.
+    """
+    req = Path(__file__).resolve().parent.parent / "requirements.txt"
+    try:
+        for line in req.read_text().splitlines():
+            line = line.strip()
+            if line.lower().startswith("httpx") and ">=" in line:
+                return line.split(">=", 1)[1].split(",")[0].strip()
+    except Exception:
+        return None
+    return None
+
+
+def _version_tuple(v):
+    """`"0.23.3"` -> `(0, 23, 3)`. Trailing non-numeric parts are dropped."""
+    out = []
+    for part in str(v).split("."):
+        digits = ""
+        for ch in part:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        out.append(int(digits))
+    return tuple(out)
+
+
+def _check_httpx_floor():
+    """Refuse loudly below the declared floor, rather than failing three SSE cases.
+
+    EXITS NON-ZERO INSTEAD OF SKIPPING. An unsupported environment cannot
+    validate this behaviour, and a suite that printed "passed" there would be
+    the answer-shaped non-answer -- a green line standing in for a check that
+    never ran. Loud and refusing is the only honest third option.
+    """
+    import httpx
+    floor = _httpx_floor_from_requirements()
+    have = getattr(httpx, "__version__", None)
+    if not floor or not have:
+        return
+    if _version_tuple(have) < _version_tuple(floor):
+        print(f"\n  REFUSING TO RUN: httpx {have} is below this repo's declared "
+              f"floor of {floor} (requirements.txt).")
+        print("  The streaming cases here assert how httpx splits an SSE body "
+              "into lines, which")
+        print("  changed between 0.23 and 0.24 — under an older httpx they fail "
+              "opaquely and read")
+        print("  as a broken tree. Install the pinned requirements, or run from "
+              "the service's venv.")
+        print(f"  Measured 2026-10-12: httpx 0.23.3 gave three such failures on "
+              f"a tree identical to main.\n")
+        sys.exit(3)
+
+
+_check_httpx_floor()
 
 
 class _IdleExo:

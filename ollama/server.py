@@ -1894,7 +1894,24 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
         # model, which holds its own weights), and anything else is swallowed.
         n_prompt = None
         try:
-            n_prompt, how = prompt_size.count(
+            # Off the loop (#974). #959's offload moved the two blocking
+            # CLIENTS and left this, and #959's own test cannot see it: it
+            # stubs `prompt_size.count` to `lambda *a, **kw: (19, "stub")`, so
+            # the call that still runs on the loop is the one replaced by an
+            # instant lambda. That test's own warning — "a fast stub would pass
+            # the tick test for the wrong reason" — applied to a different call
+            # than the one it guards.
+            #
+            # MEASURED COST, because this is small and should not be sold as an
+            # outage: since #906's exact path went live this renders the chat
+            # template and runs the tokenizer over the whole prompt, and on
+            # this box that is 32-114 ms for 20k-60k tokens (380 ms on the
+            # first call, which includes loading the tokenizer). So it blocks
+            # every other request for about a tenth of a second per large turn
+            # — real, and two orders of magnitude off the five-minute hang
+            # #959 fixed. Worth moving; not worth hurrying.
+            n_prompt, how = await asyncio.to_thread(
+                prompt_size.count,
                 req.messages, mm.name,
                 models_dir=str(config.MODELS_DIR),
                 chars_per_token=config.OLLAMA_CHARS_PER_TOKEN,

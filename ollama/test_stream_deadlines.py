@@ -424,17 +424,75 @@ def main():
           "total=None is not 'no ceiling' (#97: the single inference slot)")
 
     step(9, "structural: no terminal path leaves the caller without [DONE]")
+    # STRUCTURAL, because the text slice this replaces did not bound what it
+    # claimed to. It took `split("if mm.backend == Backend.OLLAMA:")[1]` up to
+    # the first `return StreamingResponse(...)` — but the start marker occurs
+    # TWICE in server.py and the end marker FOUR times, so the slice ran 355
+    # lines and contained `Backend.EXO`. It was counting `[DONE]` across two
+    # backends' branches.
+    #
+    # That is not academic: the count assertion below used to read `== 4` and
+    # passed, while the EXO generator's `except Exception` emitted no terminal
+    # event and no `[DONE]` at all — the silent-drop case #43 fixed on this
+    # path, alive on the other one, invisible because the instrument spanned
+    # both and summed them. Then main added paths, the sum reached 6, and the
+    # gate went red for a reason unrelated to the defect it was missing.
+    #
+    # So `body` is now the ollama generator's own source, located by walking
+    # the AST rather than by matching text that is not a boundary.
+    import ast as _ast
     srv = open(os.path.join(os.path.dirname(__file__), "server.py")).read()
-    body = srv.split("if mm.backend == Backend.OLLAMA:", 1)[1].split(
-        "return StreamingResponse(stream(), media_type=\"text/event-stream\")", 1)[0]
+    _tree = _ast.parse(srv)
+
+    def _streams_with_handlers():
+        """Each `stream()` generator that has except handlers, by line."""
+        out = {}
+        for _n in _ast.walk(_tree):
+            if (isinstance(_n, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+                    and _n.name == "stream"):
+                hs = [h for h in _ast.walk(_n)
+                      if isinstance(h, _ast.ExceptHandler)]
+                if hs:
+                    out[_n.lineno] = (_n, hs)
+        return out
+
+    _streams = _streams_with_handlers()
+    check(len(_streams) >= 2,
+          f"found {len(_streams)} streaming generators with handlers — the "
+          f"ollama one and at least one sibling, so the assertion below is "
+          f"not vacuous")
+
+    # EVERY terminal path emits [DONE], per generator, except a cancelled
+    # client — there is nobody left to send it to, which is why
+    # asyncio.CancelledError is the one legitimate silence.
+    for _ln, (_fn, _hs) in sorted(_streams.items()):
+        for _h in _hs:
+            _typ = _ast.unparse(_h.type) if _h.type else "bare except"
+            _done = sum(1 for _y in _ast.walk(_h)
+                        if isinstance(_y, _ast.Yield) and _y.value is not None
+                        and "[DONE]" in _ast.unparse(_y.value))
+            if _typ == "asyncio.CancelledError":
+                check(_done == 0,
+                      f"stream@{_ln}: {_typ} stays silent — the caller is gone")
+            else:
+                check(_done >= 1,
+                      f"stream@{_ln}: {_typ} ends the stream with [DONE] "
+                      f"(got {_done}) — otherwise a failure is indistinguishable "
+                      f"from a short generation")
+
+    _ollama = min(_streams) if _streams else None
+    body = _ast.get_source_segment(srv, _streams[_ollama][0]) or ""
+    check("OllamaStalled" in body,
+          "the first such generator is the ollama one, located structurally")
     for exc in ("OllamaStalled", "OllamaRequestTimeout"):
         check(f"except {exc} as e:" in body,
               f"the ollama stream handler catches {exc}")
-    # Four terminal yields: done, stalled, timeout, generic error. Counted,
-    # not merely present — a presence check passes on a duplicate.
+    # The ollama generator's own count, on a slice that is now actually its
+    # body: a normal finish plus three error paths. Counted rather than merely
+    # present, because a presence check passes on a duplicate.
     check(body.count('yield "data: [DONE]\\n\\n"') == 4,
-          f"exactly 4 [DONE] emissions: finish, stall, timeout, error "
-          f"(got {body.count('yield (data: [DONE]'.replace('(', chr(34)))})")
+          f"exactly 4 [DONE] in the OLLAMA generator: finish, stall, timeout, "
+          f"error (got {body.count(chr(34).join([chr(121)+chr(105)+chr(101)+chr(108)+chr(100)+chr(32), chr(100)+chr(97)+chr(116)+chr(97)+chr(58)+chr(32)]))})")
     # The three causes are now passed to the one emitter rather than spelled
     # out per branch, so assert the CALLS, not the literals.
     check(body.count('"model_stalled", e.detail') == 1
@@ -495,9 +553,22 @@ def main():
     check(bool(frames) and frames.index(A) < frames.index(B),
           "A is emitted FIRST, so it raises in the chunk loop before B is read")
 
+    # Structural for the same reason as step 9: this slice had the identical
+    # defect — two occurrences of the start marker, four of the end marker, so
+    # it spanned the EXO branch too and its `[DONE]` count was a sum over two
+    # generators.
+    import ast as _ast2
     srv_s = open(os.path.join(os.path.dirname(__file__), "server.py")).read()
-    ob = srv_s.split("if mm.backend == Backend.OLLAMA:", 1)[1].split(
-        'return StreamingResponse(stream(), media_type="text/event-stream")', 1)[0]
+    _t2 = _ast2.parse(srv_s)
+    _cands = sorted(
+        (n.lineno, n) for n in _ast2.walk(_t2)
+        if isinstance(n, (_ast2.FunctionDef, _ast2.AsyncFunctionDef))
+        and n.name == "stream"
+        and any(isinstance(h, _ast2.ExceptHandler) for h in _ast2.walk(n)))
+    ob = _ast2.get_source_segment(srv_s, _cands[0][1]) if _cands else ""
+    check("OllamaStalled" in ob and "Backend.EXO" not in ob,
+          "the ollama generator's own source, and it does NOT span the exo "
+          "branch — which the text slice it replaces did")
     for bad in ('"finish_reason": "stalled"', '"finish_reason": "timeout"'):
         check(bad not in ob,
               f'no {bad} — an unrecognised reason degrades to "assume normal", '

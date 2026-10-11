@@ -2154,6 +2154,22 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                     yield "data: [DONE]\n\n"
                 except Exception as e:
                     log.warning(f"Pool stream error for {mm.name}: {e}")
+                    # SAME REASONING AS ExoRequestFailed ABOVE, which this handler did
+                    # not follow: headers are already sent, so an unexpected error here
+                    # closed the stream with NO terminal event and NO `[DONE]`. A caller
+                    # cannot tell that from a short generation — the silent-drop case #43
+                    # fixed on the owned path, surviving here because the assertion
+                    # written to catch it (step 9 of test_stream_deadlines) counted
+                    # `[DONE]` over a TEXT SLICE spanning two backends, so it never
+                    # measured this branch at all.
+                    #
+                    # Matches its siblings (an inline error event) rather than importing
+                    # the owned path's `_failure_frames` shape into this generator.
+                    yield "data: " + json.dumps({
+                        "error": {"message": f"{type(e).__name__}: {e}",
+                                  "type": "stream_error"},
+                    }) + "\n\n"
+                    yield "data: [DONE]\n\n"
                 finally:
                     # Covers a clean finish, an error, and a client that walked
                     # away mid-generation (CancelledError unwinds through here).

@@ -1794,6 +1794,19 @@ def _log_ollama_timings(model: str, chunk: dict, counted: Optional[int] = None):
         log.info(f"Ollama timings for {model}: " + "; ".join(bits))
 
 
+def _ollama_finish_reason(chunk: dict, has_tool_calls: bool) -> str:
+    """Preserve output-limit termination, including a partial tool call.
+
+    A length stop is not a complete answer. In particular, Hermes refuses to
+    checkpoint a truncated compaction summary only when this signal survives
+    the native-Ollama -> OpenAI translation. Keep the older missing-reason
+    fallback, but never overwrite an explicit length with stop/tool_calls.
+    """
+    if chunk.get("done_reason") == "length":
+        return "length"
+    return "tool_calls" if has_tool_calls else "stop"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest, http_request: Request = None):
     mm = await _resolve_model(req.model)
@@ -1864,7 +1877,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                             saw_tool_calls = True
                         if chunk.get("done"):
                             _log_ollama_timings(mm.name, chunk, n_prompt)
-                            finish = "tool_calls" if saw_tool_calls else "stop"
+                            finish = _ollama_finish_reason(chunk, saw_tool_calls)
                             yield "data: " + json.dumps({
                                 "choices": [{"delta": {}, "finish_reason": finish}]
                             }) + "\n\n"
@@ -1951,6 +1964,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
             full_content = ""
             tool_calls = None
             usage = {}
+            done_chunk = {}
             for chunk in _held_sync(
                     mm.name,
                     mgr.ollama.chat(mm.name, ollama_messages, **ollama_kwargs)):
@@ -1959,6 +1973,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
                     if chunk["message"].get("tool_calls"):
                         tool_calls = chunk["message"]["tool_calls"]
                 if chunk.get("done"):
+                    done_chunk = chunk
                     _log_ollama_timings(mm.name, chunk, n_prompt)
                     usage = {
                         "prompt_tokens": chunk.get("prompt_eval_count", 0),
@@ -1969,7 +1984,7 @@ async def chat_completions(req: ChatRequest, http_request: Request = None):
             message = {"role": "assistant", "content": full_content}
             if tool_calls:
                 message["tool_calls"] = _fix_tool_calls(tool_calls)
-            finish_reason = "tool_calls" if tool_calls else "stop"
+            finish_reason = _ollama_finish_reason(done_chunk, bool(tool_calls))
             return {
                 "choices": [{
                     "message": message,
